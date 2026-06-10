@@ -11,7 +11,7 @@ Pi 4.
 
 ## Try it
 
-**Live demo:** <https://veil.henryratterman.com> — a real instance running
+**Live demo:** <https://os.henryratterman.com> — a real instance running
 in your browser. Click around, paint something, open the browser, watch
 the clock. (Resets every 30 minutes.)
 

@@ -687,7 +687,10 @@ impl Wm {
             back.draw_string(bx + (72 - label.len() * 8) / 2, ty + 12, label, TASKBAR_TEXT, None);
             bx += 78;
         }
-        back.draw_string(600, ty + 12, "VEIL OS desktop  [M6 input / M7 windows / M8 paint]", 0xff60_7888, None);
+        // Status text sits just past the last launcher button (its x scales
+        // with the number of launchers so they never overlap).
+        let sx = 70 + launchers().len() * 78 + 16;
+        back.draw_string(sx, ty + 12, "VEIL OS — from-scratch AArch64", 0xff60_7888, None);
 
         // Cursor, always on top.
         for (row, line) in CURSOR.iter().enumerate() {

@@ -42,6 +42,7 @@ mod semihosting;
 mod syscall;
 mod timer;
 mod uart;
+mod viewer;
 mod virtio;
 mod wm;
 

@@ -9,7 +9,7 @@
 //! Geometry constants are mirrored in scripts/drive_gui.py — keep in sync.
 
 use crate::fb::Framebuffer;
-use crate::{browser, clock, fs, keymap, kprintln, net, netdev, scheduler, timer};
+use crate::{browser, clock, fs, keymap, kprintln, net, netdev, scheduler, timer, viewer};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -30,16 +30,19 @@ const TASKBAR_TEXT: u32 = 0xffe8_eef4;
 
 /// Launchable apps: (window title, button/icon label). Chat is filtered
 /// out when no NIC is attached.
-const LAUNCHERS: [(&str, &str); 6] = [
+// Viewer is appended last so adding it doesn't shift the existing button
+// indices (the proof drivers depend on edit=0..chat=5).
+const LAUNCHERS: [(&str, &str); 7] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
     ("paint", "Paint"),
     ("shell", "Shell"),
     ("chat", "Chat"),
+    ("viewer", "Viewer"),
 ];
-const ICON_COLORS: [u32; 6] = [
-    0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0,
+const ICON_COLORS: [u32; 7] = [
+    0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff4090_88,
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -97,6 +100,7 @@ pub enum App {
     Editor(EditorState),
     Clock(clock::ClockState),
     Chat { name: String, input: String, lines: Vec<String> },
+    Viewer(viewer::ViewerState),
 }
 
 pub struct Window {
@@ -217,6 +221,12 @@ impl Wm {
                 );
                 kprintln!("CHAT: window open as '{name}' (udp broadcast :7777)");
             }
+            "viewer" => {
+                let st = viewer::ViewerState::new();
+                let title = st.current_name();
+                self.add_window(&title, 220, 80, 560, 460, App::Viewer(st));
+                kprintln!("VIEWER: window open");
+            }
             _ => {}
         }
         self.dirty = true;
@@ -243,7 +253,7 @@ impl Wm {
             }
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
-            | App::Clock(_) | App::Chat { .. } => {}
+            | App::Clock(_) | App::Chat { .. } | App::Viewer(_) => {}
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -256,6 +266,9 @@ impl Wm {
         }
         if matches!(win.app, App::Chat { .. }) {
             render_chat(&mut win);
+        }
+        if matches!(win.app, App::Viewer(_)) {
+            viewer::render(&mut win);
         }
         self.windows.push(win);
         self.dirty = true;
@@ -297,9 +310,13 @@ impl Wm {
     }
 
     fn on_key(&mut self, code: u16) {
-        // Browser scroll keys (arrows/page) have no character translation.
+        // Browser scroll keys / viewer arrow keys have no character form.
         if let Some(win) = self.windows.last_mut() {
             if matches!(win.app, App::Browser(_)) && browser::key(win, code) {
+                self.dirty = true;
+                return;
+            }
+            if matches!(win.app, App::Viewer(_)) && viewer::key(win, code) {
                 self.dirty = true;
                 return;
             }

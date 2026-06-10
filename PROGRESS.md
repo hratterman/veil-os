@@ -1,6 +1,6 @@
 # Veil OS — progress
 
-Contract: `os-build-spec.md` (M1–M17) + `os-build-spec-v2.md` (M18–M22).
+Contract: `os-build-spec.md` (M1–M17) + `os-build-spec-v2.md` (M18–M24).
 Gated milestones; each passes only on observed proof.
 
 ## Milestones
@@ -30,6 +30,7 @@ Gated milestones; each passes only on observed proof.
 | M20 | Two-instance LAN chat | PASSED 2026-06-10 | `scripts/m20_test.sh` (reflector-hub bridge); all 14 checks green, both directions, exact font pixels |
 | M21 | GitHub release + hosted demo | PASSED 2026-06-10 | github.com/hratterman/veil-os public; hosted demo live at https://os.henryratterman.com (curl 200, serves noVNC) |
 | M22 | Paint-save verify + polish | PASSED 2026-06-10 | paint reboot pixel-verified; site updated through M21 (browser-rendered); full regression suite green |
+| M23 | Image viewer | PASSED 2026-06-10 | `scripts/m23_test.sh` (CHECK.PNG checker pixels; Right→DOG.PNG photo, image changes; Left returns) |
 
 ## M19b notes (2026-06-10)
 

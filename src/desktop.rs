@@ -32,6 +32,7 @@ pub fn run(screen: Framebuffer, fdt: &dtb::Fdt) {
     kprintln!("SHELL_OK: shell app available (help, ls, cat, echo, spin, paint)");
     kprintln!("M11_OK");
     kprintln!("CLOCK_OK: 4 faces (wall/digital/chrono/stopwatch), 100ms sweep");
+    kprintln!("VIEWER_OK: PNG image viewer (arrow-key navigation, scaled to fit)");
 
     // Quiet 50 Hz tick: wakes this loop AND drives preemptive scheduling
     // of user tasks spawned from the shell (the tick handler raises

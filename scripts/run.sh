@@ -46,15 +46,9 @@ fi
 
 cd "$DIR"
 
-# 6. Build user-space binaries first (kernel embeds them)
-echo "Building user-space binaries..."
-if [ -d user ]; then
-  cargo build --manifest-path user/Cargo.toml --target aarch64-unknown-none --release 2>&1 | tail -3
-fi
-
-# 7. Build kernel
-echo "Building kernel (this takes ~30s the first time)..."
-cargo build --target aarch64-unknown-none 2>&1 | tail -5
+# 6. Build user-space binaries + kernel (build.sh handles objcopy ELF -> .bin)
+echo "Building (this takes ~30s the first time)..."
+bash scripts/build.sh 2>&1 | tail -5
 
 # 7. Disk image
 scripts/mkdisk.sh >/dev/null

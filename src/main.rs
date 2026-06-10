@@ -39,6 +39,7 @@ mod pi4;
 mod png;
 mod scheduler;
 mod semihosting;
+mod snd;
 mod syscall;
 mod timer;
 mod uart;
@@ -103,6 +104,8 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
             }
         }
     }
+
+    milestone24(&fdt);
 
     if let Some((screen, scene_mode)) = milestone5(&fdt) {
         if scene_mode {
@@ -270,6 +273,21 @@ fn milestone19b() {
             kprintln!("M19b_OK");
         }
         None => kprintln!("NTP: no sync (network unreachable); clock uses time-since-boot"),
+    }
+}
+
+/// M24: virtio-sound bring-up. Initializes the device if present (the
+/// App::Audio window then plays via a kernel task). In `opt/veil.mode=audio`
+/// it plays the on-disk test tone synchronously and emits AUDIO_OK — the
+/// headless proof path.
+fn milestone24(fdt: &dtb::Fdt) {
+    if !snd::init(fdt) {
+        kprintln!("SND_SKIP: no virtio-sound device");
+        return;
+    }
+    kprintln!("SND_OK: virtio-sound output ready (44100 Hz, 16-bit stereo)");
+    if read_mode(fdt).as_deref() == Some(b"audio") {
+        snd::play_file("TONE.WAV");
     }
 }
 

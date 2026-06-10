@@ -53,7 +53,7 @@ behavior — pixels on screen, packets on the wire, files on disk.
 | M21 | Release + hosted demo | This page; the browser-playable instance |
 | M22 | Polish | Paint persistence verified, regression suite green |
 | M23 | Image viewer | Browse PNGs from disk |
-| M24 | Audio | Native WAV playback over Intel HDA |
+| M24 | Audio | Native WAV playback over virtio-sound |
 
 ## Build from source
 

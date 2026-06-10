@@ -32,6 +32,8 @@ done
 for f in assets/photos/*.png; do
     cp "$f" "$MNT/$(basename "$f" | tr a-z A-Z)"
 done
+# M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
+python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
 sync
 hdiutil detach "$(echo "$MNT" | sed 's|/Volumes/.*||; s|^|/dev/null|')" >/dev/null 2>&1 || \
     hdiutil detach "$MNT" >/dev/null

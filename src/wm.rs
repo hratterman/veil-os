@@ -9,7 +9,7 @@
 //! Geometry constants are mirrored in scripts/drive_gui.py — keep in sync.
 
 use crate::fb::Framebuffer;
-use crate::{browser, clock, fs, keymap, kprintln, net, netdev, scheduler, timer, viewer};
+use crate::{browser, clock, fs, keymap, kprintln, net, netdev, scheduler, snd, timer, viewer};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -32,7 +32,7 @@ const TASKBAR_TEXT: u32 = 0xffe8_eef4;
 /// out when no NIC is attached.
 // Viewer is appended last so adding it doesn't shift the existing button
 // indices (the proof drivers depend on edit=0..chat=5).
-const LAUNCHERS: [(&str, &str); 7] = [
+const LAUNCHERS: [(&str, &str); 8] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
@@ -40,9 +40,11 @@ const LAUNCHERS: [(&str, &str); 7] = [
     ("shell", "Shell"),
     ("chat", "Chat"),
     ("viewer", "Viewer"),
+    ("audio", "Audio"),
 ];
-const ICON_COLORS: [u32; 7] = [
-    0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff4090_88,
+const ICON_COLORS: [u32; 8] = [
+    0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff40_9088,
+    0xffc0_6090,
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -101,6 +103,14 @@ pub enum App {
     Clock(clock::ClockState),
     Chat { name: String, input: String, lines: Vec<String> },
     Viewer(viewer::ViewerState),
+    Audio(AudioState),
+}
+
+pub struct AudioState {
+    file: String,
+    start_tick: u64,  // tick playback last started
+    last_secs: u64,   // last elapsed value drawn (redraw cadence)
+    was_playing: bool,
 }
 
 pub struct Window {
@@ -227,6 +237,16 @@ impl Wm {
                 self.add_window(&title, 220, 80, 560, 460, App::Viewer(st));
                 kprintln!("VIEWER: window open");
             }
+            "audio" => {
+                let st = AudioState {
+                    file: String::from("TONE.WAV"),
+                    start_tick: 0,
+                    last_secs: u64::MAX,
+                    was_playing: false,
+                };
+                self.add_window("audio", 360, 300, 300, 130, App::Audio(st));
+                kprintln!("AUDIO: window open (TONE.WAV)");
+            }
             _ => {}
         }
         self.dirty = true;
@@ -253,7 +273,7 @@ impl Wm {
             }
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
-            | App::Clock(_) | App::Chat { .. } | App::Viewer(_) => {}
+            | App::Clock(_) | App::Chat { .. } | App::Viewer(_) | App::Audio(_) => {}
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -269,6 +289,9 @@ impl Wm {
         }
         if matches!(win.app, App::Viewer(_)) {
             viewer::render(&mut win);
+        }
+        if matches!(win.app, App::Audio(_)) {
+            render_audio(&mut win);
         }
         self.windows.push(win);
         self.dirty = true;
@@ -517,6 +540,12 @@ impl Wm {
                         clock::click(win, rx, ry);
                         self.dirty = true;
                     }
+                    App::Audio(_) => {
+                        if audio_click(win, rx, ry) {
+                            scheduler::spawn_kernel("audio", snd::audio_task);
+                        }
+                        self.dirty = true;
+                    }
                     _ => {}
                 }
             }
@@ -584,6 +613,9 @@ impl Wm {
         let now = timer::ticks();
         for win in &mut self.windows {
             if matches!(win.app, App::Clock(_)) && clock::tick(win, now) {
+                self.dirty = true;
+            }
+            if matches!(win.app, App::Audio(_)) && audio_tick(win, now) {
                 self.dirty = true;
             }
         }
@@ -953,6 +985,83 @@ fn render_chat(win: &mut Window) {
     }
     let prompt = format!("{name}> {input}_");
     fb.draw_string(6, win.ch - 20, &prompt, CHAT_PROMPT, None);
+}
+
+// --- audio player (M24) ----------------------------------------------------
+// One window: filename, a Play/Stop button, and an elapsed-seconds readout.
+// The button toggles snd playback (which runs on a kernel task so the ~3s
+// stream doesn't block this loop).
+
+const AUDIO_BTN_W: isize = 90;
+const AUDIO_BTN_H: isize = 30;
+
+fn audio_btn_rect(cw: usize, ch: usize) -> (usize, usize, usize, usize) {
+    let x = (cw - AUDIO_BTN_W as usize) / 2;
+    let y = ch - AUDIO_BTN_H as usize - 12;
+    (x, y, AUDIO_BTN_W as usize, AUDIO_BTN_H as usize)
+}
+
+fn render_audio(win: &mut Window) {
+    let (cw, ch) = (win.cw, win.ch);
+    let (file, start) = {
+        let App::Audio(st) = &win.app else { return };
+        (st.file.clone(), st.start_tick)
+    };
+    let playing = snd::is_playing();
+    let elapsed = if playing { (timer::ticks().saturating_sub(start)) / clock::HZ } else { 0 };
+    let fb = win.canvas_fb();
+    fb.clear(0xff1a_1e24);
+    fb.draw_string(12, 14, &file, 0xffe8_eef4, None);
+    let secs = format!("elapsed  {}:{:02}", elapsed / 60, elapsed % 60);
+    fb.draw_string(12, 40, &secs, 0xff80_e0a0, None);
+    let status = if playing { "playing" } else { "stopped" };
+    fb.draw_string(cw - status.len() * 8 - 12, 40, status, 0xff90_a0b0, None);
+    let (bx, by, bw, bh) = audio_btn_rect(cw, ch);
+    let (label, bg) = if playing { ("STOP", 0xff80_3030) } else { ("PLAY", 0xff20_6030) };
+    fb.fill_rect(bx, by, bw, bh, bg);
+    fb.draw_string(bx + bw / 2 - 16, by + 7, label, 0xffff_ffff, None);
+}
+
+/// Content click: toggle Play/Stop. Returns true if a new stream should be
+/// spawned (the caller starts the kernel task).
+fn audio_click(win: &mut Window, rx: isize, ry: isize) -> bool {
+    let (cw, ch) = (win.cw, win.ch);
+    let (bx, by, bw, bh) = audio_btn_rect(cw, ch);
+    let on_btn = rx >= bx as isize && rx < (bx + bw) as isize
+        && ry >= by as isize && ry < (by + bh) as isize;
+    let mut spawn = false;
+    if on_btn {
+        if snd::is_playing() {
+            snd::stop();
+            kprintln!("AUDIO: stop");
+        } else if let App::Audio(st) = &mut win.app {
+            st.start_tick = timer::ticks();
+            snd::request(&st.file);
+            kprintln!("AUDIO: play {}", st.file);
+            spawn = true;
+        }
+    }
+    render_audio(win);
+    spawn
+}
+
+/// Per-frame: redraw while the elapsed second changes or play state flips.
+fn audio_tick(win: &mut Window, now: u64) -> bool {
+    let playing = snd::is_playing();
+    let (start, last, was) = {
+        let App::Audio(st) = &win.app else { return false };
+        (st.start_tick, st.last_secs, st.was_playing)
+    };
+    let secs = if playing { now.saturating_sub(start) / clock::HZ } else { 0 };
+    if secs == last && playing == was {
+        return false;
+    }
+    if let App::Audio(st) = &mut win.app {
+        st.last_secs = secs;
+        st.was_playing = playing;
+    }
+    render_audio(win);
+    true
 }
 
 fn chat_key(win: &mut Window, ch: char) {

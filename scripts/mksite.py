@@ -42,7 +42,7 @@ own DNS query)</li>
 <li>Paint - palette, brushes, a canvas that survives reboot</li>
 <li>Browser - this site, over our own loopback TCP</li>
 <li>Chat - every running Veil instance joins one room over real UDP</li>
-<li>Image viewer and a WAV audio player driving Intel HDA</li>
+<li>Image viewer and a WAV audio player (PCM to virtio-sound)</li>
 </ul>
 <p>It also boots on a real Raspberry Pi 4, not just QEMU.</p>
 <pre>BOOT_OK: veil kernel alive</pre>
@@ -78,9 +78,9 @@ the next began.</p>
 <li>a clock with NTP-synced real local time</li>
 <li>global chat between independent Veil instances over UDP</li>
 <li>a public GitHub release and this browser-playable hosted demo</li>
+<li>a PNG image viewer (arrow keys to browse the disk)</li>
+<li>a native WAV audio player streaming PCM to a virtio-sound device</li>
 </ol>
-<p>Two more are landing: a PNG image viewer and a native WAV audio
-player over Intel HDA.</p>
 <p>Run it yourself on a Mac:</p>
 <pre>brew install qemu &amp;&amp; git clone https://github.com/hratterman/veil-os &amp;&amp; cd veil-os &amp;&amp; scripts/demo.sh</pre>
 <p><a href="index.htm">back home</a></p>

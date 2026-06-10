@@ -31,6 +31,7 @@ Gated milestones; each passes only on observed proof.
 | M21 | GitHub release + hosted demo | PASSED 2026-06-10 | github.com/hratterman/veil-os public; hosted demo live at https://os.henryratterman.com (curl 200, serves noVNC) |
 | M22 | Paint-save verify + polish | PASSED 2026-06-10 | paint reboot pixel-verified; site updated through M21 (browser-rendered); full regression suite green |
 | M23 | Image viewer | PASSED 2026-06-10 | `scripts/m23_test.sh` (CHECK.PNG checker pixels; Right→DOG.PNG photo, image changes; Left returns) |
+| M24 | Audio (WAV) | PASSED 2026-06-10 | `scripts/m24_test.sh` (virtio-sound streams 3s tone clean, AUDIO_OK); GUI `drive_m24.py`; audible via demo.sh (coreaudio) — human check |
 
 ## M19b notes (2026-06-10)
 
@@ -101,6 +102,27 @@ delivery is symmetric. Also hardened `net.rs` `on_frame` to drop
 self-MAC-sourced frames (a hub/mcast loops a sender's own broadcast back;
 genuine loopback never hits the wire). m20_test frees stale UDP ports on
 start for back-to-back runs.
+
+## M23/M24 notes (2026-06-10)
+
+M23: `src/viewer.rs` (App::Viewer) — opens every .PNG on FAT16 alphabetically,
+decodes with the existing `png` module, nearest-neighbour aspect-fit, filename
+in the title, left/right arrows cycle. Launcher appended last so proof-driver
+button indices are unchanged. mkdisk seeds generated PNGs + real photos
+(dog/forest/mountain decode fine: 8-bit RGB).
+
+M24: **spec said Intel HDA, but that is PCI-only and this kernel has no PCIe
+stack (HDA BAR sits in the >2^38 PCI window needing a T0SZ=16/L0 MMU change).
+User chose virtio-sound over the existing virtio-mmio transport instead.**
+`src/snd.rs`: virtio-snd (dev id 25), 4 queues, control protocol
+(SET_PARAMS/PREPARE/START/STOP), tx ring of 8 period buffers refilled on
+completion. **Key gotcha: a TCG vCPU busy-waiting on the used ring (RAM reads)
+never yields to QEMU's audio timer → hang; an MMIO touch (`irq_ack`) each spin
+forces a vCPU exit so the device makes progress.** WAV parser (RIFF, 16-bit
+stereo 44100). App::Audio window (filename/Play-Stop/elapsed) runs playback on
+a kernel task so the 3s stream doesn't block the desktop. mkdisk generates
+TONE.WAV (`scripts/mkwav.py`, 440Hz 3s). demo.sh uses `-audiodev coreaudio`,
+m24_test/serve_vnc use `none`.
 
 ## Post-M20 UX overhaul (no milestone — 2026-06-10)
 

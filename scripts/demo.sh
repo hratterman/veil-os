@@ -24,6 +24,8 @@ exec qemu-system-aarch64 \
     -device virtio-blk-device,drive=hd0 \
     -netdev user,id=net0 \
     -device virtio-net-device,netdev=net0 \
+    -audiodev coreaudio,id=snd0 \
+    -device virtio-sound-device,audiodev=snd0 \
     -display cocoa \
     -no-reboot -semihosting \
     -kernel "$KERNEL"

@@ -32,6 +32,8 @@ exec qemu-system-aarch64 \
     -device virtio-blk-device,drive=hd0 \
     -netdev user,id=net0 \
     -device virtio-net-device,netdev=net0 \
+    -audiodev none,id=snd0 \
+    -device virtio-sound-device,audiodev=snd0 \
     -vnc 127.0.0.1:10 \
     -no-reboot -semihosting \
     -kernel "$KERNEL"

@@ -7,7 +7,9 @@
 # A wrapper (launchd KeepAlive) restarts this if QEMU exits, and a 30-min
 # timer (reset_vnc.sh) kills it so KeepAlive relaunches a clean desktop.
 set -u
-export PATH="$HOME/.cargo/bin:$PATH"
+# Full PATH for launchd (its default omits Homebrew + cargo): qemu lives in
+# /opt/homebrew/bin, the Rust toolchain in ~/.cargo/bin.
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 cd "$(dirname "$0")/.."
 
 # Rebuild the disk fresh each launch so every demo session starts clean.

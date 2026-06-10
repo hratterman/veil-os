@@ -1,0 +1,5 @@
+# Linker scripts are injected per-package via build.rs (config rustflags
+# arrays would merge across nested crates and apply the kernel's script to
+# user binaries).
+[build]
+target = "aarch64-unknown-none"

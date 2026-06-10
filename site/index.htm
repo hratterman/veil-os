@@ -1,0 +1,22 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="hero">
+<img src="logo.png">
+<h1>Veil OS</h1>
+<p>This page is served by an operating system written from scratch:
+its own kernel, its own TCP/IP stack, its own HTTP server, off its own
+FAT16 filesystem driver.</p>
+</div>
+<h2>What you are touching right now</h2>
+<ul>
+<li>a virtio-net driver moving raw ethernet frames</li>
+<li>ARP, IPv4 and ICMP (it answers ping)</li>
+<li>a hand-written TCP state machine - the handshake that delivered
+this page was ours on one side</li>
+<li>an HTTP/1.1 server running as a preemptively scheduled kernel task</li>
+</ul>
+<p>More: <a href="page2.htm">how this was built</a></p>
+<pre>BOOT_OK: veil kernel alive</pre>
+</body>
+</html>

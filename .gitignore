@@ -1,0 +1,19 @@
+# Build output
+/target/
+/user/target/
+
+# Generated disk image and screenshots
+/disk.img
+/shots/
+*.ppm
+*.png.tmp
+
+# Editor / OS cruft
+.DS_Store
+
+# Local harness / session automation (not part of Veil OS)
+.claude/
+scripts/claude_keepalive.sh
+scripts/watch_claude.sh
+scripts/veil_watcher.sh
+scripts/veil_babysitter.sh

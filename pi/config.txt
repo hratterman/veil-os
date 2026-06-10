@@ -1,0 +1,9 @@
+# Veil OS on the Raspberry Pi 4.
+arm_64bit=1
+kernel=kernel8.img
+# PL011 on GPIO 14/15 (the Bluetooth modem normally owns it).
+dtoverlay=disable-bt
+enable_uart=1
+init_uart_clock=48000000
+# Plain framebuffer scanout, no firmware overscan surprises.
+disable_overscan=1

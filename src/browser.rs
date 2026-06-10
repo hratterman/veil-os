@@ -1,0 +1,866 @@
+//! M16: the on-OS browser. Fetches pages from the OS's own HTTP server
+//! over the OS's own TCP stack (loopback — both halves of every
+//! connection are ours), parses, lays out and paints them in a window,
+//! and navigates when a link is clicked.
+//!
+//! THE SUPPORTED GRAMMAR (deliberately bounded; the line is held here):
+//!
+//! HTML elements: html, head (skipped), body, h1-h6, p, a (href), ul, ol,
+//!   li, img (src, PNG only), div, span, br, pre, link (stylesheet ref).
+//!   Unknown tags render as inline containers. Entities: amp lt gt quot
+//!   apos nbsp #NNN. Comments and doctypes are skipped. li/p implicitly
+//!   close on a sibling opener; br/img/link/meta/hr are void.
+//!
+//! CSS: `tag`, `.class` and `tag.class` selectors (comma groups allowed;
+//!   descendants/ids/pseudo-classes are ignored). Properties: color,
+//!   background-color, font-size (rounded to whole multiples of the 16px
+//!   font: 1x, 2x, ...), margin / padding (single px value, or per-side
+//!   -top/-right/-bottom/-left), width (px), display (block|inline|none).
+//!   Colors: #rgb, #rrggbb, and a small name table. class > tag
+//!   specificity, later rules win within a tier. color/font-size inherit.
+//!
+//! Layout: block boxes stack vertically (no margin collapsing); inline
+//!   content flows into bottom-aligned line boxes with word wrap. pre is
+//!   verbatim, unwrapped. Documents render into a full-page buffer
+//!   (capped at MAX_DOC_H rows), so scrolling is a row copy.
+
+use crate::fb::Framebuffer;
+use crate::wm::Window;
+use crate::{css, html, kprintln, net, png, scheduler, timer};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+pub const TOPBAR: usize = 20;
+const MAX_DOC_H: usize = 3000;
+const FETCH_TIMEOUT: u64 = 500; // 10 s at the 50 Hz tick
+const BAR_BG: u32 = 0xffc8_ccd4;
+const BAR_TEXT: u32 = 0xff20_2830;
+
+static M16_DONE: AtomicBool = AtomicBool::new(false);
+
+pub struct BrowserState {
+    pub path: String,
+    page: Vec<u32>, // page_w * doc_h, the fully rendered document
+    page_w: usize,
+    doc_h: usize,
+    links: Vec<LinkBox>,
+    scroll: usize,
+    page_bg: u32,
+}
+
+struct LinkBox {
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    href: String,
+}
+
+impl BrowserState {
+    pub fn new() -> BrowserState {
+        BrowserState {
+            path: String::from("/"),
+            page: vec![0xffff_ffff; 1],
+            page_w: 1,
+            doc_h: 1,
+            links: Vec::new(),
+            scroll: 0,
+            page_bg: 0xffff_ffff,
+        }
+    }
+}
+
+// --- HTTP client over our own TCP, via loopback --------------------------------
+
+fn write_all(h: net::Handle, mut data: &[u8]) {
+    while !data.is_empty() {
+        let n = net::tcp_write(h, data);
+        data = &data[n..];
+        if !data.is_empty() {
+            scheduler::yield_now();
+        }
+    }
+}
+
+fn read_to_eof(h: net::Handle, cap: usize) -> Vec<u8> {
+    let deadline = timer::ticks() + FETCH_TIMEOUT;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        match net::tcp_read(h, &mut tmp) {
+            net::TcpRead::Data(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() > cap {
+                    return buf;
+                }
+            }
+            net::TcpRead::Empty => {
+                if timer::ticks() > deadline {
+                    return buf;
+                }
+                scheduler::yield_now();
+            }
+            net::TcpRead::Eof => return buf,
+        }
+    }
+}
+
+/// GET `path` from our own HTTP server. Returns (status, content-type,
+/// body). One retry in case the connect raced service startup.
+fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
+    let ip = net::local_ip()?;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            for _ in 0..10 {
+                scheduler::yield_now();
+            }
+        }
+        let Some(h) = net::tcp_connect(ip, 80) else { continue };
+        let req = format!("GET {path} HTTP/1.1\r\nHost: veil\r\nConnection: close\r\n\r\n");
+        write_all(h, req.as_bytes());
+        let resp = read_to_eof(h, 1 << 20);
+        net::tcp_close(h);
+        let Some(split) = resp.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = core::str::from_utf8(&resp[..split]).unwrap_or("");
+        let status: u32 = head
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let ctype = head
+            .lines()
+            .find_map(|l| {
+                let (name, val) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("content-type")
+                    .then(|| String::from(val.trim()))
+            })
+            .unwrap_or_default();
+        let body = resp[split + 4..].to_vec();
+        kprintln!("BROWSER: GET {path} -> {status} {ctype} ({} bytes)", body.len());
+        return Some((status, ctype, body));
+    }
+    kprintln!("BROWSER: GET {path} failed (no response)");
+    None
+}
+
+/// "page2.htm" -> "/page2.htm"; absolute paths pass through.
+fn resolve_href(href: &str) -> String {
+    let href = href.split(['#', '?']).next().unwrap_or("");
+    if href.starts_with('/') {
+        String::from(href)
+    } else {
+        format!("/{href}")
+    }
+}
+
+// --- style ----------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Display {
+    Block,
+    Inline,
+    None,
+}
+
+#[derive(Clone)]
+struct Style {
+    color: u32,
+    bg: Option<u32>,
+    scale: usize,
+    margin: [isize; 4],  // top right bottom left
+    padding: [isize; 4],
+    display: Display,
+    width: Option<isize>,
+    underline: bool,
+    pre: bool,
+}
+
+const ROOT_STYLE: Style = Style {
+    color: 0xff10_1418,
+    bg: None,
+    scale: 1,
+    margin: [0; 4],
+    padding: [0; 4],
+    display: Display::Block,
+    width: None,
+    underline: false,
+    pre: false,
+};
+
+fn parse_color(v: &str) -> Option<u32> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        let d = |c: u8| (c as char).to_digit(16);
+        let h = hex.as_bytes();
+        return match h.len() {
+            3 => Some(
+                0xff00_0000
+                    | d(h[0])? * 0x11 << 16
+                    | d(h[1])? * 0x11 << 8
+                    | d(h[2])? * 0x11,
+            ),
+            6 => Some(
+                0xff00_0000
+                    | (d(h[0])? << 4 | d(h[1])?) << 16
+                    | (d(h[2])? << 4 | d(h[3])?) << 8
+                    | (d(h[4])? << 4 | d(h[5])?),
+            ),
+            _ => None,
+        };
+    }
+    match v.to_ascii_lowercase().as_str() {
+        "black" => Some(0xff00_0000),
+        "white" => Some(0xffff_ffff),
+        "red" => Some(0xffe0_3030),
+        "green" => Some(0xff30_a050),
+        "blue" => Some(0xff30_60e0),
+        "yellow" => Some(0xffe0_d030),
+        "orange" => Some(0xffe0_a040),
+        "gray" | "grey" => Some(0xff80_8890),
+        _ => None,
+    }
+}
+
+fn parse_px(v: &str) -> Option<isize> {
+    v.trim().trim_end_matches("px").trim().parse().ok()
+}
+
+fn apply_decl(s: &mut Style, prop: &str, val: &str) {
+    match prop {
+        "color" => {
+            if let Some(c) = parse_color(val) {
+                s.color = c;
+            }
+        }
+        "background-color" => s.bg = parse_color(val),
+        "font-size" => {
+            if let Some(px) = parse_px(val) {
+                s.scale = (((px + 8) / 16).max(1) as usize).min(4);
+            }
+        }
+        "margin" => {
+            if let Some(px) = parse_px(val) {
+                s.margin = [px; 4];
+            }
+        }
+        "margin-top" => s.margin[0] = parse_px(val).unwrap_or(s.margin[0]),
+        "margin-right" => s.margin[1] = parse_px(val).unwrap_or(s.margin[1]),
+        "margin-bottom" => s.margin[2] = parse_px(val).unwrap_or(s.margin[2]),
+        "margin-left" => s.margin[3] = parse_px(val).unwrap_or(s.margin[3]),
+        "padding" => {
+            if let Some(px) = parse_px(val) {
+                s.padding = [px; 4];
+            }
+        }
+        "padding-top" => s.padding[0] = parse_px(val).unwrap_or(s.padding[0]),
+        "padding-right" => s.padding[1] = parse_px(val).unwrap_or(s.padding[1]),
+        "padding-bottom" => s.padding[2] = parse_px(val).unwrap_or(s.padding[2]),
+        "padding-left" => s.padding[3] = parse_px(val).unwrap_or(s.padding[3]),
+        "width" => s.width = parse_px(val),
+        "display" => {
+            s.display = match val.trim() {
+                "none" => Display::None,
+                "inline" => Display::Inline,
+                "block" => Display::Block,
+                _ => s.display,
+            }
+        }
+        _ => {}
+    }
+}
+
+/// UA defaults for `node`, then matching stylesheet rules (tag tier, then
+/// class tier; later rules win within a tier). color/font-size/underline
+/// inherit from the parent.
+fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
+    let tag = node.tag().unwrap_or("");
+    let class = node.attr("class");
+    let mut s = Style {
+        color: inherited.color,
+        bg: None,
+        scale: inherited.scale,
+        margin: [0; 4],
+        padding: [0; 4],
+        display: Display::Inline,
+        width: None,
+        underline: inherited.underline,
+        pre: inherited.pre,
+    };
+    match tag {
+        "html" => s.display = Display::Block,
+        "body" => {
+            s.display = Display::Block;
+            s.margin = [8; 4];
+        }
+        "div" => s.display = Display::Block,
+        "p" => {
+            s.display = Display::Block;
+            s.margin[0] = 8;
+            s.margin[2] = 8;
+        }
+        "h1" => {
+            s.display = Display::Block;
+            s.scale = 2;
+            s.margin[0] = 16;
+            s.margin[2] = 16;
+        }
+        "h2" | "h3" | "h4" | "h5" | "h6" => {
+            s.display = Display::Block;
+            s.margin[0] = 12;
+            s.margin[2] = 12;
+        }
+        "ul" | "ol" => {
+            s.display = Display::Block;
+            s.margin[0] = 8;
+            s.margin[2] = 8;
+            s.padding[3] = 28;
+        }
+        "li" => {
+            s.display = Display::Block;
+            s.margin[2] = 2;
+        }
+        "pre" => {
+            s.display = Display::Block;
+            s.margin[0] = 8;
+            s.margin[2] = 8;
+            s.pre = true;
+        }
+        "a" => {
+            s.color = 0xff20_50c0;
+            s.underline = true;
+        }
+        "head" | "title" | "script" | "style" | "meta" | "link" => s.display = Display::None,
+        _ => {} // span, img, unknown: inline containers
+    }
+    for tier in 0..2 {
+        for r in sheet {
+            if r.rank() == tier && r.matches(tag, class) {
+                for (p, v) in &r.decls {
+                    apply_decl(&mut s, p, v);
+                }
+            }
+        }
+    }
+    s
+}
+
+// --- layout ---------------------------------------------------------------------
+
+enum Item {
+    Rect { x: isize, y: isize, w: isize, h: isize, color: u32 },
+    Text { x: isize, y: isize, s: String, color: u32, scale: usize },
+    Image { x: isize, y: isize, idx: usize },
+}
+
+enum Frag {
+    Word { s: String, color: u32, scale: usize, link: Option<String>, underline: bool },
+    Space { scale: usize },
+    Img { idx: usize, w: isize, h: isize },
+    Br,
+}
+
+fn frag_w(f: &Frag) -> isize {
+    match f {
+        Frag::Word { s, scale, .. } => s.len() as isize * 8 * *scale as isize,
+        Frag::Space { scale } => 8 * *scale as isize,
+        Frag::Img { w, .. } => *w,
+        Frag::Br => 0,
+    }
+}
+
+fn frag_h(f: &Frag) -> isize {
+    match f {
+        Frag::Word { scale, .. } | Frag::Space { scale } => 16 * *scale as isize,
+        Frag::Img { h, .. } => *h,
+        Frag::Br => 16,
+    }
+}
+
+struct Ctx<'a> {
+    sheet: &'a [css::Rule],
+    imgs: &'a [(String, png::Image)],
+    items: Vec<Item>,
+    links: Vec<LinkBox>,
+    img_spots: Vec<(usize, isize, isize)>, // (imgs idx, x, y) for the proof log
+}
+
+/// Whitespace-collapsing text -> word/space frags.
+fn collect_text(t: &str, style: &Style, link: &Option<String>, buf: &mut Vec<Frag>) {
+    let mut word = String::new();
+    let flush = |word: &mut String, buf: &mut Vec<Frag>| {
+        if !word.is_empty() {
+            buf.push(Frag::Word {
+                s: core::mem::take(word),
+                color: style.color,
+                scale: style.scale,
+                link: link.clone(),
+                underline: style.underline,
+            });
+        }
+    };
+    for c in t.chars() {
+        if c.is_ascii_whitespace() {
+            flush(&mut word, buf);
+            if !matches!(buf.last(), Some(Frag::Space { .. }) | None) {
+                buf.push(Frag::Space { scale: style.scale });
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, buf);
+}
+
+/// Flatten an inline subtree into frags.
+fn collect_inline(
+    ctx: &Ctx,
+    node: &html::Node,
+    style: &Style,
+    link: &Option<String>,
+    buf: &mut Vec<Frag>,
+) {
+    match node {
+        html::Node::Text(t) => collect_text(t, style, link, buf),
+        html::Node::Element { tag, children, .. } => {
+            let link = match tag.as_str() {
+                "a" => node.attr("href").map(resolve_href).or_else(|| link.clone()),
+                _ => link.clone(),
+            };
+            match tag.as_str() {
+                "br" => buf.push(Frag::Br),
+                "img" => {
+                    let src = node.attr("src").map(resolve_href).unwrap_or_default();
+                    match ctx.imgs.iter().position(|(s, _)| *s == src) {
+                        Some(idx) => {
+                            let img = &ctx.imgs[idx].1;
+                            buf.push(Frag::Img {
+                                idx,
+                                w: img.w as isize,
+                                h: img.h as isize,
+                            });
+                        }
+                        None => collect_text("[img]", style, &link, buf),
+                    }
+                }
+                _ => {
+                    for c in children {
+                        let cs = match c {
+                            html::Node::Element { .. } => resolve(ctx.sheet, c, style),
+                            html::Node::Text(_) => style.clone(),
+                        };
+                        if cs.display != Display::None {
+                            collect_inline(ctx, c, &cs, &link, buf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Place one line box, bottom-aligning its frags. Returns the new y.
+fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> isize {
+    let lh = line.iter().map(|(_, f)| frag_h(f)).max().unwrap_or(16);
+    for (dx, f) in line {
+        let fh = frag_h(&f);
+        let fy = y + lh - fh;
+        match f {
+            Frag::Word { s, color, scale, link, underline } => {
+                let fw = s.len() as isize * 8 * scale as isize;
+                if underline {
+                    ctx.items.push(Item::Rect {
+                        x: x + dx,
+                        y: fy + 16 * scale as isize - scale as isize,
+                        w: fw,
+                        h: scale as isize,
+                        color,
+                    });
+                }
+                if let Some(href) = link {
+                    ctx.links.push(LinkBox {
+                        x: x + dx,
+                        y: fy,
+                        w: fw,
+                        h: 16 * scale as isize,
+                        href,
+                    });
+                }
+                ctx.items.push(Item::Text { x: x + dx, y: fy, s, color, scale });
+            }
+            Frag::Img { idx, .. } => {
+                ctx.img_spots.push((idx, x + dx, fy));
+                ctx.items.push(Item::Image { x: x + dx, y: fy, idx });
+            }
+            Frag::Space { .. } | Frag::Br => {}
+        }
+    }
+    y + lh
+}
+
+/// Word-wrap buffered frags into line boxes at x with width w.
+fn flush_inline(ctx: &mut Ctx, buf: &mut Vec<Frag>, x: isize, w: isize, mut y: isize) -> isize {
+    if buf.is_empty() {
+        return y;
+    }
+    let mut line: Vec<(isize, Frag)> = Vec::new();
+    let mut cx = 0isize;
+    for f in core::mem::take(buf) {
+        if matches!(f, Frag::Br) {
+            if line.is_empty() {
+                y += 16;
+            } else {
+                y = place_line(ctx, core::mem::take(&mut line), x, y);
+            }
+            cx = 0;
+            continue;
+        }
+        if matches!(f, Frag::Space { .. }) && line.is_empty() {
+            continue; // never start a line with a space
+        }
+        let fw = frag_w(&f);
+        if cx + fw > w && !line.is_empty() {
+            y = place_line(ctx, core::mem::take(&mut line), x, y);
+            cx = 0;
+            if matches!(f, Frag::Space { .. }) {
+                continue;
+            }
+        }
+        line.push((cx, f));
+        cx += fw;
+    }
+    if !line.is_empty() {
+        y = place_line(ctx, line, x, y);
+    }
+    y
+}
+
+/// Lay out one block element. Returns the y below it (margins included).
+fn layout_block(
+    ctx: &mut Ctx,
+    node: &html::Node,
+    inherited: &Style,
+    x: isize,
+    w: isize,
+    mut y: isize,
+    marker: Option<String>,
+) -> isize {
+    let style = resolve(ctx.sheet, node, inherited);
+    if style.display == Display::None {
+        return y;
+    }
+    y += style.margin[0];
+    let bx = x + style.margin[3];
+    let bw = style
+        .width
+        .unwrap_or(w - style.margin[3] - style.margin[1])
+        .max(16);
+    let bg_at = ctx.items.len();
+    let cx = bx + style.padding[3];
+    let cw = (bw - style.padding[3] - style.padding[1]).max(16);
+    let top = y;
+    let mut cy = y + style.padding[0];
+
+    if let Some(m) = marker {
+        let mw = m.len() as isize * 8;
+        ctx.items.push(Item::Text {
+            x: (cx - mw).max(0),
+            y: cy,
+            s: m,
+            color: style.color,
+            scale: 1,
+        });
+    }
+
+    if style.pre {
+        // Verbatim: no wrap, no whitespace collapsing.
+        let mut text = String::new();
+        node.text(&mut text);
+        for line in text.trim_matches('\n').lines() {
+            ctx.items.push(Item::Text {
+                x: cx,
+                y: cy,
+                s: String::from(line),
+                color: style.color,
+                scale: style.scale,
+            });
+            cy += 16 * style.scale as isize;
+        }
+    } else {
+        cy = layout_children(ctx, node, &style, cx, cw, cy);
+    }
+
+    let bottom = cy + style.padding[2];
+    if let Some(bg) = style.bg {
+        ctx.items.insert(
+            bg_at,
+            Item::Rect { x: bx, y: top, w: bw, h: bottom - top, color: bg },
+        );
+    }
+    bottom + style.margin[2]
+}
+
+/// Lay out an element's children: inline runs flow, blocks recurse.
+fn layout_children(
+    ctx: &mut Ctx,
+    node: &html::Node,
+    style: &Style,
+    x: isize,
+    w: isize,
+    mut y: isize,
+) -> isize {
+    let mut buf: Vec<Frag> = Vec::new();
+    let mut ol_count = 0usize;
+    for child in node.children() {
+        let cstyle = match child {
+            html::Node::Element { .. } => resolve(ctx.sheet, child, style),
+            html::Node::Text(_) => style.clone(),
+        };
+        if cstyle.display == Display::None {
+            continue;
+        }
+        let is_block = matches!(child, html::Node::Element { .. })
+            && cstyle.display == Display::Block;
+        if !is_block {
+            collect_inline(ctx, child, &cstyle, &None, &mut buf);
+            continue;
+        }
+        y = flush_inline(ctx, &mut buf, x, w, y);
+        let marker = match (node.tag(), child.tag()) {
+            (Some("ul"), Some("li")) => Some(String::from("* ")),
+            (Some("ol"), Some("li")) => {
+                ol_count += 1;
+                Some(format!("{ol_count}. "))
+            }
+            _ => None,
+        };
+        y = layout_block(ctx, child, style, x, w, y, marker);
+    }
+    flush_inline(ctx, &mut buf, x, w, y)
+}
+
+// --- navigation -------------------------------------------------------------------
+
+/// Fetch `path` + its stylesheet + images, lay the page out at the
+/// window's content width, render it into the page buffer, and repaint.
+pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
+    let path = resolve_href(path);
+    kprintln!("BROWSER: navigating to {path}");
+    let Some((status, ctype, body)) = http_get(&path) else {
+        render_message(win, &path, "fetch failed: no response from server");
+        return;
+    };
+    if !ctype.to_ascii_lowercase().contains("text/html") {
+        render_message(win, &path, &format!("not html: {ctype} ({status})"));
+        return;
+    }
+    let doc = html::parse(&String::from_utf8_lossy(&body));
+
+    // Stylesheets: <link rel="stylesheet" href=...> anywhere in the doc.
+    let mut sheet: Vec<css::Rule> = Vec::new();
+    let mut link_nodes = Vec::new();
+    doc.find_all("link", &mut link_nodes);
+    for l in link_nodes {
+        let rel = l.attr("rel").unwrap_or_default();
+        if !rel.eq_ignore_ascii_case("stylesheet") {
+            continue;
+        }
+        let Some(href) = l.attr("href") else { continue };
+        if let Some((200, _, css_body)) = http_get(&resolve_href(href)) {
+            sheet.extend(css::parse(&String::from_utf8_lossy(&css_body)));
+        }
+    }
+
+    // Images: fetch + decode each unique PNG src.
+    let mut imgs: Vec<(String, png::Image)> = Vec::new();
+    let mut img_nodes = Vec::new();
+    doc.find_all("img", &mut img_nodes);
+    for node in img_nodes {
+        let Some(src) = node.attr("src").map(resolve_href) else { continue };
+        if imgs.iter().any(|(s, _)| *s == src) {
+            continue;
+        }
+        if let Some((200, _, data)) = http_get(&src) {
+            match png::decode(&data) {
+                Some(img) => {
+                    kprintln!("BROWSER: decoded {src} ({}x{} px)", img.w, img.h);
+                    imgs.push((src, img));
+                }
+                None => kprintln!("BROWSER: {src} is not a PNG this browser can decode"),
+            }
+        }
+    }
+
+    // Layout at the window's content width.
+    let view_w = win.cw;
+    let body_node = doc.find("body").unwrap_or(&doc);
+    let body_style = resolve(&sheet, body_node, &ROOT_STYLE);
+    let page_bg = body_style.bg.unwrap_or(0xffff_ffff);
+    let mut ctx = Ctx {
+        sheet: &sheet,
+        imgs: &imgs,
+        items: Vec::new(),
+        links: Vec::new(),
+        img_spots: Vec::new(),
+    };
+    let end_y = layout_block(&mut ctx, body_node, &ROOT_STYLE, 0, view_w as isize, 0, None);
+    let doc_h = (end_y.max(1) as usize).min(MAX_DOC_H);
+    if end_y as usize > MAX_DOC_H {
+        kprintln!("BROWSER: document truncated at {MAX_DOC_H}px (was {end_y})");
+    }
+
+    // Paint the whole document into the page buffer.
+    let mut page = vec![page_bg; view_w * doc_h];
+    let pfb = unsafe { Framebuffer::new(page.as_mut_ptr(), view_w, doc_h, view_w * 4) };
+    for item in &ctx.items {
+        match item {
+            &Item::Rect { x, y, w, h, color } => {
+                if w > 0 && h > 0 {
+                    pfb.fill_rect(x.max(0) as usize, y.max(0) as usize, w as usize, h as usize, color);
+                }
+            }
+            Item::Text { x, y, s, color, scale } => {
+                if *y >= 0 {
+                    pfb.draw_string_scaled((*x).max(0) as usize, *y as usize, s, *color, *scale);
+                }
+            }
+            &Item::Image { x, y, idx } => {
+                let img = &imgs[idx].1;
+                pfb.blit(x, y, &img.pixels, img.w, img.h);
+            }
+        }
+    }
+
+    // Proof breadcrumbs: where things ended up, in document coordinates.
+    for &(idx, x, y) in &ctx.img_spots {
+        let (src, img) = &imgs[idx];
+        kprintln!("BROWSER: img '{src}' at ({x}, {y}) {}x{}", img.w, img.h);
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for l in &ctx.links {
+        if !seen.contains(&l.href.as_str()) {
+            seen.push(&l.href);
+            kprintln!(
+                "BROWSER: link '{}' at ({}, {}) {}x{}",
+                l.href, l.x, l.y, l.w, l.h
+            );
+        }
+    }
+    kprintln!(
+        "BROWSER: rendered {path} - {} items, {} links, doc {}x{}",
+        ctx.items.len(),
+        ctx.links.len(),
+        view_w,
+        doc_h
+    );
+
+    let crate::wm::App::Browser(st) = &mut win.app else { return };
+    st.path = path;
+    st.page = page;
+    st.page_w = view_w;
+    st.doc_h = doc_h;
+    st.links = ctx.links;
+    st.scroll = 0;
+    st.page_bg = page_bg;
+    paint_view(win);
+
+    if by_click && !M16_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!(
+            "BROWSER_OK: link click fetched over our TCP from our HTTP server, laid out, painted"
+        );
+        kprintln!("M16_OK");
+    }
+}
+
+/// A one-line stand-in page for fetch/parse failures.
+fn render_message(win: &mut Window, path: &str, msg: &str) {
+    kprintln!("BROWSER: error page for {path}: {msg}");
+    let (cw, text) = (win.cw, format!("veil browser: {msg}"));
+    let crate::wm::App::Browser(st) = &mut win.app else { return };
+    st.path = String::from(path);
+    st.page = vec![0xffff_ffff; cw * 64];
+    st.page_w = cw;
+    st.doc_h = 64;
+    st.links = Vec::new();
+    st.scroll = 0;
+    st.page_bg = 0xffff_ffff;
+    let pfb = unsafe { Framebuffer::new(st.page.as_mut_ptr(), cw, 64, cw * 4) };
+    pfb.draw_string(8, 8, &text, 0xffa0_2020, None);
+    paint_view(win);
+}
+
+// --- window plumbing -----------------------------------------------------------
+
+/// Repaint the canvas: visible page rows below a URL bar.
+pub fn paint_view(win: &mut Window) {
+    let (cw, ch) = (win.cw, win.ch);
+    let bar = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        let view_h = ch - TOPBAR;
+        for row in 0..view_h {
+            let sy = st.scroll + row;
+            let dst = &mut win.canvas[(TOPBAR + row) * cw..(TOPBAR + row) * cw + cw];
+            if sy < st.doc_h && st.page_w == cw {
+                dst.copy_from_slice(&st.page[sy * cw..sy * cw + cw]);
+            } else {
+                dst.fill(st.page_bg);
+            }
+        }
+        let ip = net::local_ip().unwrap_or([0; 4]);
+        let pct = if st.doc_h > view_h {
+            st.scroll * 100 / (st.doc_h - view_h)
+        } else {
+            100
+        };
+        format!("http://{}{}  [{pct}%]", net::fmt_ip(&ip), st.path)
+    };
+    let fb = win.canvas_fb();
+    fb.fill_rect(0, 0, cw, TOPBAR, BAR_BG);
+    fb.draw_string(6, 2, &bar, BAR_TEXT, None);
+}
+
+/// Canvas-relative click -> link href, if one was hit.
+pub fn link_at(win: &Window, rx: isize, ry: isize) -> Option<String> {
+    let crate::wm::App::Browser(st) = &win.app else { return None };
+    if ry < TOPBAR as isize {
+        return None;
+    }
+    let (dx, dy) = (rx, ry - TOPBAR as isize + st.scroll as isize);
+    st.links
+        .iter()
+        .find(|l| dx >= l.x && dx < l.x + l.w && dy >= l.y && dy < l.y + l.h)
+        .map(|l| l.href.clone())
+}
+
+/// Arrow/page keys scroll. Returns true if the key was consumed.
+pub fn key(win: &mut Window, code: u16) -> bool {
+    const KEY_UP: u16 = 103;
+    const KEY_PGUP: u16 = 104;
+    const KEY_DOWN: u16 = 108;
+    const KEY_PGDN: u16 = 109;
+    let view_h = win.ch - TOPBAR;
+    let new = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return false };
+        let max = st.doc_h.saturating_sub(view_h);
+        let page = view_h.saturating_sub(24);
+        let new = match code {
+            KEY_UP => st.scroll.saturating_sub(40),
+            KEY_DOWN => (st.scroll + 40).min(max),
+            KEY_PGUP => st.scroll.saturating_sub(page),
+            KEY_PGDN => (st.scroll + page).min(max),
+            _ => return false,
+        };
+        if new == st.scroll {
+            return true;
+        }
+        st.scroll = new;
+        new
+    };
+    kprintln!("BROWSER: scroll y={new}");
+    paint_view(win);
+    true
+}

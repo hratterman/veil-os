@@ -1,0 +1,17 @@
+[package]
+name = "veil"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[features]
+# Raspberry Pi 4 (BCM2711) target: kernel8.img loaded at 0x8_0000 by the
+# Pi firmware, PL011 on the BCM2711 base, VideoCore mailbox framebuffer.
+pi4 = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

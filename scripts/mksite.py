@@ -21,6 +21,7 @@ INDEX = """<html>
 <p>This page is served by an operating system written from scratch:
 its own kernel, its own TCP/IP stack, its own HTTP server, off its own
 FAT16 filesystem driver.</p>
+<p>More: <a href="page2.htm">how this was built</a></p>
 </div>
 <h2>What you are touching right now</h2>
 <ul>
@@ -29,8 +30,21 @@ FAT16 filesystem driver.</p>
 <li>a hand-written TCP state machine - the handshake that delivered
 this page was ours on one side</li>
 <li>an HTTP/1.1 server running as a preemptively scheduled kernel task</li>
+<li>the browser you may be reading this in, rendering our own HTML, CSS
+and PNG decoders</li>
 </ul>
-<p>More: <a href="page2.htm">how this was built</a></p>
+<h2>Apps that ship with it</h2>
+<ul>
+<li>Editor - type and save text files to the FAT16 disk</li>
+<li>Clock - analog and digital faces, chronograph and stopwatch, with
+real local time synced over NTP (it resolves pool.ntp.org through our
+own DNS query)</li>
+<li>Paint - palette, brushes, a canvas that survives reboot</li>
+<li>Browser - this site, over our own loopback TCP</li>
+<li>Chat - every running Veil instance joins one room over real UDP</li>
+<li>Image viewer and a WAV audio player driving Intel HDA</li>
+</ul>
+<p>It also boots on a real Raspberry Pi 4, not just QEMU.</p>
 <pre>BOOT_OK: veil kernel alive</pre>
 </body>
 </html>
@@ -58,7 +72,17 @@ the next began.</p>
 <li>arp / ipv4 / icmp</li>
 <li>udp and tcp</li>
 <li>this http server</li>
+<li>an on-OS browser (html, css, png - all ours)</li>
+<li>the same kernel on a real Raspberry Pi 4</li>
+<li>a text editor with persistent files</li>
+<li>a clock with NTP-synced real local time</li>
+<li>global chat between independent Veil instances over UDP</li>
+<li>a public GitHub release and this browser-playable hosted demo</li>
 </ol>
+<p>Two more are landing: a PNG image viewer and a native WAV audio
+player over Intel HDA.</p>
+<p>Run it yourself on a Mac:</p>
+<pre>brew install qemu &amp;&amp; git clone https://github.com/hratterman/veil-os &amp;&amp; cd veil-os &amp;&amp; scripts/demo.sh</pre>
 <p><a href="index.htm">back home</a></p>
 </body>
 </html>

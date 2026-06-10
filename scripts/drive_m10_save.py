@@ -10,13 +10,19 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("M10_OK at boot", "M10_OK" in d.serial())
 
-    d.click(700, 340)             # raise the paint window
-    d.click(526, 368)             # palette: red
-    d.drag(550, 450, 750, 500, steps=6)
-    img = d.dump("m10_drawn")
-    check_px(img, "red stroke drawn", 650, 475, RED)
+    # UX overhaul: nothing opens at boot. Launch Paint from the taskbar
+    # (idx 3: x=70+3*78+36=340, bottom 40px strip). The window clamps 8px
+    # above the taskbar, so toolbar/canvas y sit 8px up vs the old build.
+    mark = len(d.serial())
+    d.click(340, 768 - 20)
+    check("paint launched", d.wait_serial("WM: launch 'paint'", 5, mark))
 
-    d.click(884, 368)             # SAV
+    d.click(526, 360)             # palette: red
+    d.drag(550, 442, 750, 492, steps=6)
+    img = d.dump("m10_drawn")
+    check_px(img, "red stroke drawn", 650, 467, RED)
+
+    d.click(884, 360)             # SAV
     check("canvas saved to FAT16", d.wait_serial("PAINT: saved 480x350 canvas to CANVAS.RAW"))
     d.quit()
     finish()

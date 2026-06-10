@@ -13,14 +13,18 @@ def main():
     log = d.serial()
     check("CANVAS.RAW listed at boot", "FS_LS: CANVAS.RAW" in log)
 
-    d.click(700, 340)             # raise the paint window
-    img = d.dump("m10_before_load")
-    check_px(img, "canvas empty before load", 650, 475, WHITE)
+    # Launch Paint from the taskbar (idx 3); window clamps 8px up.
+    mark = len(d.serial())
+    d.click(340, 768 - 20)
+    check("paint launched", d.wait_serial("WM: launch 'paint'", 5, mark))
 
-    d.click(836, 368)             # LOD
+    img = d.dump("m10_before_load")
+    check_px(img, "canvas empty before load", 650, 467, WHITE)
+
+    d.click(836, 360)             # LOD
     check("canvas loaded from FAT16", d.wait_serial("PAINT: loaded 480x350 canvas"))
     img = d.dump("m10_loaded")
-    check_px(img, "stroke from previous boot restored", 650, 475, RED)
+    check_px(img, "stroke from previous boot restored", 650, 467, RED)
     d.quit()
     finish()
 

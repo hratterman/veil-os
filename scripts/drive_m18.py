@@ -40,6 +40,12 @@ def main():
     d = Driver(qmp, serial_path, shots)
     snap = f"{shots}/m18_region.bin"
 
+    # UX overhaul: nothing opens at boot. Launch the Editor from the
+    # taskbar (idx 0: x=70+0*78+36=106, bottom 40px strip).
+    mark0 = len(d.serial())
+    d.click(106, 768 - 20)
+    check("editor launched", d.wait_serial("WM: launch 'edit'", 5, mark0))
+
     if phase == "save":
         check("editor window opened", d.wait_serial("EDITOR: window open on NOTE.TXT", 10))
         check("NOTE.TXT created on fresh disk", "EDITOR: NOTE.TXT missing -> new file" in d.serial())

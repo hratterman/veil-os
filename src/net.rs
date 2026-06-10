@@ -240,6 +240,14 @@ pub fn on_frame(frame: &[u8]) {
         return;
     }
     let Some(st) = state() else { return };
+    // Ignore frames we sent ourselves. A multicast/hub bridge (M20's
+    // two-instance LAN) loops a sender's own broadcasts back to it; without
+    // this a node would receive and render its own chat messages twice.
+    // Genuine on-OS loopback never touches the wire (it uses the internal
+    // queue), so a self-MAC source here is always an external echo.
+    if frame[6..12] == st.mac {
+        return;
+    }
     match u16::from_be_bytes([frame[12], frame[13]]) {
         ETH_ARP => arp_input(st, &frame[14..]),
         ETH_IP => ip_input(st, &frame[14..]),

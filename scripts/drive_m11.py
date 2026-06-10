@@ -17,6 +17,12 @@ def main():
     for sentinel in ["SHELL_OK", "M11_OK", "M10_OK"]:
         check(f"serial sentinel {sentinel}", sentinel in d.serial())
 
+    # UX overhaul: nothing opens at boot. Launch the Shell from the
+    # taskbar (idx 4: x=70+4*78+36=418, bottom 40px strip).
+    lmark = len(d.serial())
+    d.click(418, 768 - 20)
+    check("shell launched", d.wait_serial("WM: launch 'shell'", 5, lmark))
+
     d.click(150, 600)  # focus the shell window
     mark = len(d.serial())
 
@@ -55,10 +61,11 @@ def main():
     print("--- paint: launch as a window from the shell --------------------")
     mark = len(d.serial())
     d.type_text("paint\n")
-    check("paint launched", d.wait_serial("SHELL: launched 'paint-1'", after=mark))
+    # No window opens at boot now, so this is the first paint window: paint-0.
+    check("paint launched", d.wait_serial("SHELL: launched 'paint-0'", after=mark))
     img = d.dump("m11_desktop")
-    # paint-1 spawns at (544, 60); its title bar spans y 62..84.
-    check_px(img, "new paint window title bar on screen", 900, 70, T_FOCUS)
+    # paint-0 spawns at (520, 40); its title bar spans screen y 42..64.
+    check_px(img, "new paint window title bar on screen", 900, 52, T_FOCUS)
 
     # The shell window should be full of rendered text by now.
     lit = sum(1 for y in range(455, 730, 3) for x in range(45, 455, 3)

@@ -52,11 +52,38 @@ def rendered(serial, path, after=0):
     return m and (int(m[1]), int(m[2]), int(m[3]), int(m[4]))
 
 
+def cur_scroll(d):
+    """The browser's actual current scroll offset (it logs every change,
+    and clamps page-downs to doc_h - view_h — which the caller can't
+    predict, so read it rather than bookkeep it)."""
+    m = re.findall(r"BROWSER: scroll y=(\d+)", d.serial())
+    return int(m[-1]) if m else 0
+
+
+def scroll_into_view(d, y, h):
+    """Page-down until document rows [y, y+h) are within the viewport;
+    return the resulting actual scroll offset."""
+    for _ in range(12):
+        if y + h <= cur_scroll(d) + VIEW_H:
+            break
+        smark = len(d.serial())
+        for down in (True, False):
+            d.send([{"type": "key", "data": {"down": down,
+                     "key": {"type": "qcode", "data": "pgdn"}}}])
+        d.wait_serial("BROWSER: scroll y=", 5, smark)
+    return cur_scroll(d)
+
+
 def main():
     qmp, serial_path, shots = sys.argv[1], sys.argv[2], sys.argv[3]
     d = Driver(qmp, serial_path, shots)
 
-    # --- 1. index page renders on boot ---------------------------------
+    # --- 1. launch the browser, index page renders ---------------------
+    # UX overhaul: nothing opens at boot. Browser is taskbar idx 2 (NIC
+    # present, so Chat is in the bar): x = 70 + 2*78 + 36 = 262, y bottom.
+    mark = len(d.serial())
+    d.click(262, 768 - 20)
+    check("browser launched", d.wait_serial("WM: launch 'browser'", 5, mark))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", timeout=40))
     log = d.serial()
     info = rendered(log, "/")
@@ -124,12 +151,7 @@ def main():
     check("back-home link laid out", len(back) == 1, str(back))
     if back:
         _, x, y, w, h = back[0]
-        scroll = 0
-        while y + h > scroll + VIEW_H:
-            for down in (True, False):
-                d.send([{"type": "key", "data": {"down": down,
-                         "key": {"type": "qcode", "data": "pgdn"}}}])
-            scroll += VIEW_H - 24
+        scroll = scroll_into_view(d, y, h)
         mark = len(d.serial())
         d.click(CONTENT_X + x + w // 2, PAGE_Y + y + h // 2 - scroll)
         check("back-home navigates", d.wait_serial("BROWSER: rendered /index.htm", 30, mark))

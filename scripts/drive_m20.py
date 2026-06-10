@@ -78,6 +78,14 @@ def main():
     a = Driver(qmp_a, ser_a, shots)
     b = Driver(qmp_b, ser_b, shots)
 
+    # UX overhaul: nothing opens at boot. Wait for each desktop to be live
+    # (the offline bridge has no NTP, so boot is delayed by the sync
+    # timeout), then launch Chat from the taskbar (idx 5 with a NIC
+    # present: x = 70 + 5*78 + 36 = 496).
+    check("A desktop up", a.wait_serial("WM_OK", 40))
+    check("B desktop up", b.wait_serial("WM_OK", 40))
+    a.click(496, 768 - 20)
+    b.click(496, 768 - 20)
     check("A chat window open", a.wait_serial("CHAT: window open as 'A'", 30))
     check("B chat window open", b.wait_serial("CHAT: window open as 'B'", 30))
 

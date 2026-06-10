@@ -27,9 +27,9 @@ Gated milestones; each passes only on observed proof.
 | M18 | Text editor + persistence | PASSED 2026-06-10 | `scripts/m18_test.sh` (two boots, pixel-identical region) |
 | M19 | Clock app, 4 faces | PASSED 2026-06-10 | `run_gui.sh drive_m19.py CLOCK_OK` (all 24 checks) |
 | M19b | NTP wall-clock sync | PASSED 2026-06-10 | `scripts/m19b_test.sh` (real DNS+NTP over slirp, clock within 0s of host); `drive_m19.py` re-green |
-| M20 | Two-instance LAN chat | PASSED 2026-06-10 | `scripts/m20_test.sh`; confirmed via instance serial logs (A sent, B received + replied, both `CHAT_OK`) |
-| M21 | GitHub release + hosted demo | not started | |
-| M22 | Paint-save verify + polish | not started | |
+| M20 | Two-instance LAN chat | PASSED 2026-06-10 | `scripts/m20_test.sh` (reflector-hub bridge); all 14 checks green, both directions, exact font pixels |
+| M21 | GitHub release + hosted demo | GitHub PASSED; demo backend live, public URL pending 1 DNS record | `curl -I https://veil.henryratterman.com` (after CNAME); local chain verified |
+| M22 | Paint-save verify + polish | PASSED 2026-06-10 | paint reboot pixel-verified; site updated through M21 (browser-rendered); full regression suite green |
 
 ## M19b notes (2026-06-10)
 
@@ -45,6 +45,62 @@ Boot calls `milestone19b()` after net is up (NIC-gated). The GUI proof
 runs without a NIC → `(no sync)` path; synced path proven on serial by
 `m19b_test.sh`.
 
+## M21 notes (2026-06-10)
+
+GitHub: public repo `github.com/hratterman/veil-os` (the `henryratterman`
+GH account does not exist — README one-liner uses `hratterman`). README +
+MIT LICENSE + `.gitignore` + `scripts/demo.sh` (cocoa, slirp net) all
+shipped; hero screenshot at `assets/screenshot.png`.
+
+Hosted demo (self-hosted on this Mac mini, NOT a DO droplet): QEMU
+headless `-vnc 127.0.0.1:10` (tcp 5910; :0/5900 is macOS Screen Sharing)
+via `scripts/serve_vnc.sh`; websockify `--web /Users/henry/server/novnc`
+on 6090 → 5910; noVNC `index.html` auto-redirects to vnc.html autoconnect.
+Three launchd agents: `com.veil.qemu` (KeepAlive), `com.veil.websockify`
+(KeepAlive), `com.veil.reset` (StartInterval 1800 → `reset_vnc.sh` kills
+QEMU so KeepAlive relaunches a clean disk). serve_vnc.sh hard-sets PATH
+(launchd lacks /opt/homebrew/bin). Local chain fully verified.
+
+Cloudflare: ingress `veil.henryratterman.com → localhost:6090` appended to
+`~/.cloudflared/config.yml` (backup saved), validated, SIGHUP-reloaded.
+**Blocker:** `henryratterman.com` is on a DIFFERENT Cloudflare account
+than the tunnel cert (cert token only sees `bythecoverbooks.com`), so I
+can't create the DNS record. `cloudflared route dns` mis-created
+`veil.henryratterman.com.bythecoverbooks.com` (deleted). User is adding a
+proxied CNAME `veil → 3a546195-...cfargotunnel.com` in henryratterman.com;
+once it propagates the demo is live (ingress already wired). Verify with
+`curl -I https://veil.henryratterman.com`.
+
+## M22 notes (2026-06-10)
+
+Paint SAV/LOD reboot proven: `drive_m10_{save,load}.py` (taskbar-launch +
+8px clamp shift) — red stroke drawn boot 1, restored pixel-identical boot
+2. `mksite.py` updated to describe features through M21 (apps list, NTP
+clock, hosted demo, install one-liner); the page2 link moved into the
+hero so the M16 browser proof finds it above the fold; `drive_m16.py`
+reads the browser's actual logged scroll offset instead of guessing
+(pgdn clamps to doc_h-view_h). Updated site renders in the on-OS browser
+(`m16_test.sh` all green).
+
+**Regression suite re-greened after the UX overhaul** — all GUI drivers
+now launch their app from the taskbar first (nothing auto-opens):
+`drive_gui.py` (M6/M7/M8) fully rewritten to drive Editor/Clock/Paint
+(keyboard echo, drag/focus/z-order via two real windows, paint strokes +
+persistence-under-occlusion + clear); `drive_m11.py` (shell, paint-0 not
+paint-1), `drive_m18.py`, `drive_m19.py`, `drive_m20.py`. Cursor sprite
+is parked off-snapshot before pixel checks. net (M12–15), Pi4 (M17) green
+unchanged.
+
+**M20 bridge rewritten:** QEMU `socket` listen/connect delivered only one
+direction on this host (B→A; A→B dead even at M12 boot) and `mcast`
+doesn't route on macOS — both reproducible/deterministic, not flaky. Now
+a host-side UDP reflector (`scripts/hub.py`, a virtual switch mirroring
+the M21 relay design) bridges both instances' `-netdev dgram` tunnels;
+delivery is symmetric. Also hardened `net.rs` `on_frame` to drop
+self-MAC-sourced frames (a hub/mcast loops a sender's own broadcast back;
+genuine loopback never hits the wire). m20_test frees stale UDP ports on
+start for back-to-back runs.
+
 ## Post-M20 UX overhaul (no milestone — 2026-06-10)
 
 Boot shows the bare desktop; nothing opens automatically. Apps launch
@@ -53,12 +109,10 @@ Chat-when-NIC) or the top-left desktop icon grid; both open-or-raise.
 Every title bar has an 18px close (X) zone at its right edge. Windows
 clamp above the taskbar. Default open positions unchanged.
 
-**Known follow-up (deliberate, per instruction "build only"):** the
-M6–M19 proof drivers assume windows exist at boot — they need a
-launch-via-taskbar step before driving. Also the taskbar clamp shifts
-shell/paint up 8px from their requested y (frames previously ended at
-736 > 728), and drive_gui's beta drag to y≈640 will clamp. Re-verify the
-suite when the drivers are updated (M22 polish pass is the natural slot).
+**Resolved in M22:** every GUI proof driver now launches its app from the
+taskbar before driving, and pixel coords account for the 8px clamp. Full
+suite re-verified green. (drive_gui.py was rewritten end-to-end since the
+old alpha/beta/echo/static boot windows no longer exist.)
 
 ## Kernel bugs found by milestone gates
 

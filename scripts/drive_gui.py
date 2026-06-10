@@ -131,54 +131,90 @@ def check_px(img, label, x, y, want, invert=False):
     check(label, ok, f"@({x},{y}) got rgb{got}, want {rel} rgb{want}")
 
 
+# Taskbar launcher buttons (UX overhaul): x = 70 + idx*78 + 36, bottom strip.
+def taskbar(idx):
+    return (70 + idx * 78 + 36, H - 20)
+
+EDITOR_BTN, CLOCK_BTN, PAINT_BTN = taskbar(0), taskbar(1), taskbar(3)
+PARK = (990, 620)  # empty desktop corner: park the cursor clear of snapshots
+
+
+def launch(d, app, btn):
+    mark = len(d.serial())
+    d.click(*btn)
+    check(f"{app} launched", f"WM: launch '{app}'" in d.serial()[mark:]
+          or wait_line(d, f"WM: launch '{app}'", mark))
+
+
+def wait_line(d, needle, after, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if needle in d.serial()[after:]:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def main():
     qmp_path, serial_path, shots = sys.argv[1], sys.argv[2], sys.argv[3]
     d = Driver(Qmp(qmp_path), serial_path, shots)
 
+    # Capability sentinels still print at boot even though no window opens.
     for sentinel in ["INPUT_OK", "M6_OK", "WM_OK", "M7_OK", "PAINT_OK", "M8_OK"]:
         check(f"serial sentinel {sentinel}", sentinel in d.serial())
 
-    print("--- M7: initial z-order -------------------------------------")
-    img = d.dump("m7_initial")
-    check_px(img, "beta covers alpha in overlap", 300, 220, PURPLE)
-    check_px(img, "paint (topmost) title focused over beta", 560, 340, T_FOCUS)
-    check_px(img, "desktop background", 980, 30, DESKTOP)
-
-    print("--- M6: keyboard echo + cursor + click ----------------------")
-    d.click(150, 150)            # focus the echo window (alpha)
+    print("--- M6: launch editor, keyboard echo + cursor + click -------")
+    launch(d, "edit", EDITOR_BTN)        # editor at (40, 40, 420, 300)
+    d.click(150, 150)                    # focus + a click at exact coords
     d.type_text("veil")
-    d.move(700, 500)
+    d.move(700, 500)                     # park cursor over the desktop
     img = d.dump("m6")
     log = d.serial()
     check("click detected at exact coords", "CLICK: left down @ (150, 150)" in log)
     for ch in "veil":
         check(f"key '{ch}' received", f"KEY: '{ch}'" in log)
-    lit = sum(1 for y in range(86, 120) for x in range(66, 240)
-              if img.at(x, y) == ECHO_TEXT)
+    # Typed text is dark glyphs on the editor's white text area (canvas
+    # origin screen (48, 98)); count non-white pixels where "veil" lands.
+    lit = sum(1 for y in range(96, 116) for x in range(46, 130)
+              if img.at(x, y) != WHITE)
     check("typed text echoed to framebuffer", lit >= 20, f"{lit} glyph pixels")
     check_px(img, "cursor tip", 700, 500, BLACK)
     check_px(img, "cursor body 1", 701, 502, WHITE)
     check_px(img, "cursor body 2", 703, 505, WHITE)
     check_px(img, "cursor edge", 709, 509, BLACK)
-    check_px(img, "click raised alpha above beta", 300, 220, WHITE)
-    check_px(img, "alpha title focused", 400, 72, T_FOCUS)
-    check_px(img, "beta title unfocused", 500, 170, T_UNFOCUS)
+    check_px(img, "editor title focused", 200, 52, T_FOCUS)
 
-    print("--- M7: drag beta by its title bar --------------------------")
-    d.drag(500, 170, 320, 650)
+    print("--- M7: second window, drag, focus, z-order -----------------")
+    launch(d, "clock", CLOCK_BTN)        # clock at (700, 36, 260, 260), now on top
+    img = d.dump("m7_two")
+    check_px(img, "clock (newly launched) title focused", 760, 48, T_FOCUS)
+    check_px(img, "editor title unfocused under clock", 200, 52, T_UNFOCUS)
+    # Drag the clock by its title bar so its title sits OVER the editor's
+    # text area: grab (760, 48) -> drop (300, 195). Origin moves to
+    # (300-60, 195-12) = (240, 183). Park the cursor before snapshotting so
+    # the pointer sprite doesn't sit on the pixel under test.
+    d.drag(760, 48, 300, 195)
+    d.move(*PARK)
     img = d.dump("m7_dragged")
-    check("drag reported", "WM: 'beta' moved to (80, 640)" in d.serial())
-    check_px(img, "beta title at new position, focused", 330, 652, T_FOCUS)
-    check_px(img, "old beta position now desktop", 500, 170, DESKTOP)
-    check_px(img, "paint title unfocused after beta raise", 560, 340, T_UNFOCUS)
+    check("clock drag reported", "WM: 'clock' moved to (240, 183)" in d.serial())
+    check_px(img, "clock title now over editor (z-order: clock on top)",
+             300, 195, T_FOCUS)
+    # Raise the editor by clicking its title bar; it must occlude the clock.
+    d.click(200, 52)
+    d.move(*PARK)
+    img = d.dump("m7_raised")
+    check("editor raised, title focused", img.at(200, 52) == T_FOCUS)
+    check_px(img, "editor content now occludes clock (z-order swapped)",
+             300, 195, WHITE)
 
-    print("--- M8: paint strokes ----------------------------------------")
-    d.click(700, 340)            # raise paint
-    d.click(526, 368)            # palette: red
-    d.drag(550, 450, 750, 500, steps=6)
-    d.click(786, 368)            # brush: large
-    d.click(582, 368)            # palette: blue
-    d.drag(560, 560, 700, 620, steps=6)
+    print("--- M8: launch paint, strokes, persistence, clear -----------")
+    launch(d, "paint", PAINT_BTN)        # paint clamps to (480, 322), content (482,346)
+    d.click(526, 360)                    # palette: red (idx 1)
+    d.drag(550, 442, 750, 492, steps=6)
+    d.click(786, 360)                    # brush: large (idx 2)
+    d.click(582, 360)                    # palette: blue (idx 3)
+    d.drag(560, 560, 700, 610, steps=6)
+    d.move(*PARK)
     img = d.dump("m8_strokes")
     log = d.serial()
     check("red selected", "PAINT: color set to #e03030" in log)
@@ -186,25 +222,30 @@ def main():
     check("brush size changed", "PAINT: brush radius 7" in log)
     check("strokes logged", log.count("PAINT: stroke start") >= 2
           and log.count("PAINT: stroke end") >= 2)
-    check_px(img, "red stroke on canvas", 650, 475, RED)
-    check_px(img, "blue stroke (large brush)", 630, 590, BLUE)
+    check_px(img, "red stroke on canvas", 650, 467, RED)
+    check_px(img, "blue stroke (large brush)", 630, 585, BLUE)
 
     print("--- M8: strokes persist under window traffic -----------------")
-    d.drag(150, 72, 600, 480)    # park alpha on top of the strokes
+    # Drag the editor (grab its title at (200,52)) so its content covers the
+    # strokes: drop at (650,312) -> origin (490,300), content y 324..624
+    # covers both strokes without hitting the taskbar clamp (max origin y
+    # 402). Then grab the title at its new spot (650,312) and move it back.
+    d.drag(200, 52, 650, 312)
+    d.move(*PARK)
     img = d.dump("m8_covered")
-    check_px(img, "red stroke hidden under alpha", 650, 475, RED, invert=True)
-    check_px(img, "blue stroke hidden under alpha", 630, 590, BLUE, invert=True)
-    d.drag(650, 480, 200, 80)    # move alpha away again
+    check_px(img, "red stroke hidden under editor", 650, 467, RED, invert=True)
+    d.drag(650, 312, 200, 52)            # move the editor away again
+    d.move(*PARK)
     img = d.dump("m8_persist")
-    check_px(img, "red stroke persisted", 650, 475, RED)
-    check_px(img, "blue stroke persisted", 630, 590, BLUE)
+    check_px(img, "red stroke persisted", 650, 467, RED)
+    check_px(img, "blue stroke persisted", 630, 585, BLUE)
 
     print("--- M8: clear -------------------------------------------------")
-    d.click(934, 368)            # CLR button
+    d.click(934, 360)                    # CLR button
     img = d.dump("m8_clear")
     check("clear logged", "PAINT: cleared" in d.serial())
-    check_px(img, "canvas cleared (red gone)", 650, 475, WHITE)
-    check_px(img, "canvas cleared (blue gone)", 630, 590, WHITE)
+    check_px(img, "canvas cleared (red gone)", 650, 467, WHITE)
+    check_px(img, "canvas cleared (blue gone)", 630, 585, WHITE)
 
     d.q.cmd("quit")
     print(f"\n{'FAILED: ' + str(len(failures)) + ' checks' if failures else 'ALL GUI CHECKS PASSED'}")

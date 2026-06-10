@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# M20 proof: two complete Veil instances on one Mac, bridged by QEMU's
-# -netdev socket (A listens, B connects), exchanging chat messages over
-# UDP broadcast — both kernels, both network stacks, ours on both ends.
+# M20 proof: two complete Veil instances on one Mac, bridged by a pair of
+# crossed QEMU -netdev dgram tunnels (each instance sends UDP-encapsulated
+# ethernet to the other's port and listens on its own) — symmetric and
+# fully bidirectional, unlike socket listen/connect (one direction only on
+# this QEMU) or mcast (no delivery on macOS). UDP broadcasts ride the
+# tunnel as ordinary frames. Both kernels, both network stacks, ours on
+# both ends. drive_m20.py injects typing into A and pixel-verifies the
+# message in B (and the reverse), using the kernel's own font table.
 # scripts/drive_m20.py injects typing into A and pixel-verifies the
 # message in B (and the reverse), using the kernel's own font table.
 set -u
@@ -10,8 +15,25 @@ cd "$(dirname "$0")/.."
 
 scripts/build.sh || exit 2
 KERNEL=target/aarch64-unknown-none/debug/veil
-BRIDGE=127.0.0.1:23456
+HUB=23456  # host-side reflector hub port (scripts/hub.py)
+PA=23000   # instance A's local dgram port
+PB=23001   # instance B's local dgram port
 mkdir -p shots
+
+dgram() { # local-port  -> tunnel this instance's frames to the hub
+    echo "dgram,id=net0,local.type=inet,local.host=127.0.0.1,local.port=$1,remote.type=inet,remote.host=127.0.0.1,remote.port=$HUB"
+}
+
+# Free the dgram/hub ports from any prior run still shutting down, so
+# back-to-back invocations don't race on a still-bound UDP port.
+for p in "$HUB" "$PA" "$PB"; do
+    lsof -nP -iUDP:"$p" -t 2>/dev/null | xargs -r kill 2>/dev/null
+done
+sleep 0.5
+
+python3 scripts/hub.py "$HUB" &
+HUBPID=$!
+trap 'kill "$HUBPID" 2>/dev/null' EXIT
 
 launch() { # name extra-netdev-arg ip
     local name="$1" netarg="$2" ip="$3"
@@ -24,7 +46,7 @@ launch() { # name extra-netdev-arg ip
         -device ramfb \
         -device virtio-keyboard-device \
         -device virtio-tablet-device \
-        -netdev "socket,id=net0,$netarg" \
+        -netdev "$netarg" \
         -device "virtio-net-device,netdev=net0,mac=52:54:00:12:34:0$3" \
         -fw_cfg "name=opt/veil.net,string=10.0.0.$3/24,,10.0.0.$3" \
         -display none \
@@ -35,9 +57,8 @@ launch() { # name extra-netdev-arg ip
     echo $!
 }
 
-QA=$(launch a "listen=$BRIDGE" 1)
-sleep 1
-QB=$(launch b "connect=$BRIDGE" 2)
+QA=$(launch a "$(dgram $PA)" 1)
+QB=$(launch b "$(dgram $PB)" 2)
 
 python3 scripts/drive_m20.py \
     /tmp/veil-m20-a-qmp.sock /tmp/veil-m20-a-serial.log \

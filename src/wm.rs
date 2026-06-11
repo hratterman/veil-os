@@ -661,7 +661,9 @@ impl Wm {
                         self.dirty = true;
                     }
                     App::Browser(_) => {
-                        if let Some(href) = browser::link_at(win, rx, ry) {
+                        if ry < browser::TOPBAR as isize && rx < 18 {
+                            browser::back(win); // the `<` back button
+                        } else if let Some(href) = browser::link_at(win, rx, ry) {
                             kprintln!("BROWSER: clicked link -> {href}");
                             browser::navigate(win, &href, true);
                         }

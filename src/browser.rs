@@ -49,6 +49,7 @@ pub struct BrowserState {
     links: Vec<LinkBox>,
     scroll: usize,
     page_bg: u32,
+    history: Vec<String>, // previously-visited paths (newest last), max 20
 }
 
 struct LinkBox {
@@ -69,6 +70,7 @@ impl BrowserState {
             links: Vec::new(),
             scroll: 0,
             page_bg: 0xffff_ffff,
+            history: Vec::new(),
         }
     }
 }
@@ -647,9 +649,39 @@ fn layout_children(
 
 /// Fetch `path` + its stylesheet + images, lay the page out at the
 /// window's content width, render it into the page buffer, and repaint.
+static HISTORY_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Navigate back to the previously-visited path, if any.
+pub fn back(win: &mut Window) -> bool {
+    let prev = match &mut win.app {
+        crate::wm::App::Browser(st) => st.history.pop(),
+        _ => return false,
+    };
+    let Some(p) = prev else { return false };
+    kprintln!("BROWSER: back to {p}");
+    navigate(win, &p, false);
+    if !HISTORY_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("HISTORY_OK");
+    }
+    true
+}
+
 pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     let path = resolve_href(path);
     kprintln!("BROWSER: navigating to {path}");
+    // A user navigation (link click / typed URL) pushes the current page onto
+    // the history stack so the back button can return to it.
+    if by_click {
+        if let crate::wm::App::Browser(st) = &mut win.app {
+            let old = st.path.clone();
+            if st.history.last() != Some(&old) {
+                st.history.push(old);
+                if st.history.len() > 20 {
+                    st.history.remove(0);
+                }
+            }
+        }
+    }
     let Some((status, ctype, body)) = http_get(&path) else {
         render_message(win, &path, "fetch failed: no response from server");
         return;
@@ -832,7 +864,11 @@ pub fn paint_view(win: &mut Window) {
         fb.fill_rect(cw - 2, thumb_y, 2, thumb_h, 0xff70_90b0); // thumb
     }
     fb.fill_rect(0, 0, cw, TOPBAR, BAR_BG);
-    fb.draw_string(6, 2, &bar, BAR_TEXT, None);
+    // Back button: a `<` in its own 18px zone, then the address bar.
+    let has_history = matches!(&win.app, crate::wm::App::Browser(st) if !st.history.is_empty());
+    fb.fill_rect(0, 0, 18, TOPBAR, if has_history { 0xff90_a8c0 } else { 0xffb0_b4bc });
+    fb.draw_string(5, 2, "<", BAR_TEXT, None);
+    fb.draw_string(22, 2, &bar, BAR_TEXT, None);
 }
 
 /// Canvas-relative click -> link href, if one was hit.
@@ -885,6 +921,10 @@ pub fn key(win: &mut Window, code: u16) -> bool {
     const KEY_PGUP: u16 = 104;
     const KEY_DOWN: u16 = 108;
     const KEY_PGDN: u16 = 109;
+    const KEY_BACKSPACE: u16 = 14;
+    if code == KEY_BACKSPACE {
+        return back(win); // address bar isn't a text field -> Backspace = back
+    }
     let line = 16isize; // one text line
     let half = (win.ch - TOPBAR) as isize / 2;
     let s = cur_scroll(win);

@@ -64,6 +64,8 @@ fn page_size(cw: usize, ch: usize) -> usize {
 fn tag(name: &str) -> &'static str {
     if name.ends_with(".PNG") {
         "[IMG]"
+    } else if name.ends_with(".GIF") {
+        "[GIF]"
     } else if name.ends_with(".WAV") {
         "[WAV]"
     } else if name.ends_with(".TXT") {
@@ -75,7 +77,10 @@ fn tag(name: &str) -> &'static str {
 
 /// True for names the file manager knows how to launch.
 fn openable(name: &str) -> bool {
-    name.ends_with(".PNG") || name.ends_with(".WAV") || name.ends_with(".TXT")
+    name.ends_with(".PNG")
+        || name.ends_with(".GIF")
+        || name.ends_with(".WAV")
+        || name.ends_with(".TXT")
 }
 
 pub fn render(win: &mut Window) {

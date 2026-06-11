@@ -2,9 +2,12 @@
 //! inflate (stored, fixed and dynamic Huffman blocks, puff-style
 //! bit-at-a-time canonical decode) plus PNG scanline unfiltering.
 //!
-//! Supported: 8-bit truecolor (color type 2) and truecolor+alpha (6),
-//! non-interlaced. Alpha is dropped (no compositing translucency).
-//! Output is XRGB8888 rows, ready to blit.
+//! Supported: all non-interlaced colour types — grayscale (0),
+//! truecolor (2), palette/indexed (3, with PLTE + optional tRNS),
+//! grayscale+alpha (4) and truecolor+alpha (6) — at bit depths
+//! 1/2/4/8/16 (16-bit takes the high byte; sub-8-bit only for grayscale
+//! and palette). Alpha (from the alpha channel or tRNS) is composited onto
+//! the dark UI background. Output is XRGB8888 rows, ready to blit.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -239,8 +242,11 @@ pub fn decode(data: &[u8]) -> Option<Image> {
     let be32 = |o: usize| -> Option<usize> {
         Some(u32::from_be_bytes(data.get(o..o + 4)?.try_into().ok()?) as usize)
     };
-    let (mut w, mut h, mut bpp) = (0usize, 0usize, 0usize);
+    let (mut w, mut h, mut depth, mut color) = (0usize, 0usize, 0u8, 0u8);
     let mut idat = Vec::new();
+    let mut plte: Vec<u32> = Vec::new(); // palette RGB (0xff_RRGGBB)
+    let mut trns: Vec<u8> = Vec::new(); // per-index alpha (colour type 3)
+    let mut seen_ihdr = false;
     let mut pos = 8;
     while pos + 8 <= data.len() {
         let len = be32(pos)?;
@@ -253,40 +259,91 @@ pub fn decode(data: &[u8]) -> Option<Image> {
                 }
                 w = be32(pos + 8)?;
                 h = be32(pos + 12)?;
-                // bit depth 8, color type 2/6, no interlace only
-                if body[8] != 8 || body[12] != 0 {
-                    return None;
+                depth = body[8];
+                color = body[9];
+                if body[12] != 0 {
+                    return None; // interlacing not supported
                 }
-                bpp = match body[9] {
-                    2 => 3,
-                    6 => 4,
-                    _ => return None,
-                };
+                seen_ihdr = true;
             }
+            b"PLTE" => {
+                for c in body.chunks_exact(3) {
+                    plte.push(0xff00_0000 | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32);
+                }
+            }
+            b"tRNS" => trns = body.to_vec(),
             b"IDAT" => idat.extend_from_slice(body),
             b"IEND" => break,
             _ => {}
         }
         pos += 12 + len; // len + tag + body + crc
     }
-    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+    if !seen_ihdr || w == 0 || h == 0 || w > 4096 || h > 4096 {
         return None;
     }
+    let channels = match color {
+        0 => 1, // grayscale
+        2 => 3, // truecolor
+        3 => 1, // palette index
+        4 => 2, // grayscale + alpha
+        6 => 4, // truecolor + alpha
+        _ => return None,
+    };
+    let depth_ok = match color {
+        0 => matches!(depth, 1 | 2 | 4 | 8 | 16),
+        3 => matches!(depth, 1 | 2 | 4 | 8),
+        _ => matches!(depth, 8 | 16),
+    };
+    if !depth_ok || (color == 3 && plte.is_empty()) {
+        return None;
+    }
+
+    let depth = depth as usize;
     let raw = inflate(&idat)?;
-    let stride = w * bpp;
-    if raw.len() < h * (stride + 1) {
+    let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8)
+    let fbpp = (channels * depth / 8).max(1); // filter back-reference, in bytes
+    if stride == 0 || raw.len() < h * (stride + 1) {
         return None;
     }
+
+    const BG: (u32, u32, u32) = (0x14, 0x18, 0x1c); // composite transparency here
+    let maxv = ((1u32 << depth) - 1).max(1);
+
+    // Read the s-th sample of a row as an 8-bit-ish value: a whole byte at
+    // depth 8, the high byte at depth 16, or `depth` MSB-first bits below 8.
+    let read = |cur: &[u8], s: usize| -> u32 {
+        match depth {
+            16 => cur[s * 2] as u32,
+            8 => cur[s] as u32,
+            d => {
+                let bit = s * d;
+                let byte = cur[bit / 8] as u32;
+                (byte >> (8 - d - (bit % 8))) & ((1 << d) - 1)
+            }
+        }
+    };
+    // Scale a raw grayscale/alpha sample to 8 bits (identity at depth >= 8,
+    // where `read` already returns a byte).
+    let to8 = |v: u32| if depth >= 8 { v } else { v * 255 / maxv };
+    let comp = |r: u32, g: u32, b: u32, a: u32| -> u32 {
+        if a >= 255 {
+            0xff00_0000 | r << 16 | g << 8 | b
+        } else {
+            let bl = |s: u32, d: u32| (s * a + d * (255 - a)) / 255;
+            0xff00_0000 | bl(r, BG.0) << 16 | bl(g, BG.1) << 8 | bl(b, BG.2)
+        }
+    };
+
     let mut prev = vec![0u8; stride];
     let mut pixels = Vec::with_capacity(w * h);
     for y in 0..h {
-        let row = &raw[y * (stride + 1)..(y + 1) * (stride + 1)];
-        let filt = row[0];
-        let mut cur = row[1..].to_vec();
+        let base = y * (stride + 1);
+        let filt = *raw.get(base)?;
+        let mut cur = raw.get(base + 1..base + 1 + stride)?.to_vec();
         for i in 0..stride {
-            let a = if i >= bpp { cur[i - bpp] } else { 0 };
+            let a = if i >= fbpp { cur[i - fbpp] } else { 0 };
             let up = prev[i];
-            let c = if i >= bpp { prev[i - bpp] } else { 0 };
+            let c = if i >= fbpp { prev[i - fbpp] } else { 0 };
             cur[i] = cur[i].wrapping_add(match filt {
                 0 => 0,
                 1 => a,
@@ -296,10 +353,32 @@ pub fn decode(data: &[u8]) -> Option<Image> {
                 _ => return None,
             });
         }
-        for px in cur.chunks_exact(bpp) {
-            pixels.push(
-                0xff00_0000 | (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32,
-            );
+        for x in 0..w {
+            let px = match color {
+                0 => {
+                    let g = to8(read(&cur, x));
+                    comp(g, g, g, 255)
+                }
+                2 => comp(read(&cur, x * 3), read(&cur, x * 3 + 1), read(&cur, x * 3 + 2), 255),
+                3 => {
+                    let idx = read(&cur, x) as usize;
+                    let rgb = plte.get(idx).copied().unwrap_or(0xff00_0000);
+                    let a = trns.get(idx).copied().unwrap_or(255) as u32;
+                    comp((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff, a)
+                }
+                4 => {
+                    let g = to8(read(&cur, x * 2));
+                    let a = to8(read(&cur, x * 2 + 1));
+                    comp(g, g, g, a)
+                }
+                _ => comp(
+                    read(&cur, x * 4),
+                    read(&cur, x * 4 + 1),
+                    read(&cur, x * 4 + 2),
+                    read(&cur, x * 4 + 3),
+                ),
+            };
+            pixels.push(px);
         }
         prev = cur;
     }

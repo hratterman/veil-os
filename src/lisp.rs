@@ -265,7 +265,45 @@ impl Interp {
     }
 }
 
+// Native `eval` recursion depth guard. Task 0 (where the REPL runs) is on the
+// 512 KiB boot stack; a non-tail-recursive Lisp function with no base case
+// (e.g. `(define (f n) (+ 1 (f n))) (f 0)`) would recurse `eval` until the
+// kernel stack overflows and the whole OS dies (a PC-alignment fault from the
+// clobbered return address). Tail calls reuse the eval frame (the trampoline
+// `continue`s) so they don't count — only genuine nested eval() calls bump
+// the depth. Hitting the cap yields a clean Err the REPL prints, not a crash.
+//
+// The cap must be conservative: this unoptimised debug `eval` frame is ~1.7 KB,
+// so ~300 frames already overflow 512 KiB (measured — a guard set that high
+// faults itself). 80 frames ≈ 136 KiB leaves a wide margin, and 80 levels of
+// non-tail recursion is far more than any i64 computation needs (fact overflows
+// i64 by depth 21). Iterative builtins like `map` don't recurse `eval`, so
+// long lists are unaffected.
+const MAX_DEPTH: usize = 80;
+static mut DEPTH: usize = 0;
+
+struct DepthGuard;
+impl DepthGuard {
+    fn enter() -> Result<DepthGuard, String> {
+        unsafe {
+            let d = core::ptr::addr_of_mut!(DEPTH);
+            *d += 1;
+            if *d > MAX_DEPTH {
+                *d -= 1;
+                return Err("recursion too deep".to_string());
+            }
+        }
+        Ok(DepthGuard)
+    }
+}
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        unsafe { *core::ptr::addr_of_mut!(DEPTH) -= 1; }
+    }
+}
+
 fn eval(mut expr: Value, mut env: Env) -> Result<Value, String> {
+    let _guard = DepthGuard::enter()?;
     loop {
         match expr {
             Value::Int(_)

@@ -39,6 +39,8 @@ observed proof.
 | M28 | Browser audio (PCM over WebSocket) | PASSED 2026-06-10 | `scripts/m28_test.sh` (QEMU `wav` FIFO audiodev → `audio_server.js` taps FIFO → WS → `ws_probe.js` read 8148 bytes, 7966 non-zero, AUDIO_STREAM_OK; driver clicked Play, AUDIO_OK). Browser client `novnc_audio.js` + `com.veil.audio` staged (no browser in-sandbox) |
 | M29 | In-OS file manager (App::Files) | PASSED 2026-06-10 | `scripts/m29_test.sh` (Files lists 20 disk files; row-0 highlight + first filename exact font pixels; click CHECK.PNG → Viewer opens 128x128 image, FILES_OK). `user-files/` PNG copy verified; mkdisk `--extra-dir` shared with M30 |
 | M30 | Pre-boot file upload (hosted demo) | PASSED 2026-06-10 | `scripts/m30_test.sh` (session_manager: POST /upload veiltest.png → POST /boot 302 → spawned QEMU; drive setup → Files lists VEILTEST.PNG (exact font pixels) → opens 320x240 in Viewer, UPLOAD_OK). `landing.html` upload page + selftest green |
+| M31 | Site expansion (9 pages) + GIF player | PASSED 2026-06-10 | `drive_m31_web.py` (9 cross-linked pages, nav bar, no 404s); `drive_m31_gif.py` (GIF_OK — `src/gif.rs` LZW decoder + `gifplayer.rs`; demo.gif + real 400x400 Wikipedia GIF both animate) |
+| M32 | Browser overhaul + Lisp REPL + Adam7 | PASSED 2026-06-11 | `scripts/m32_test.sh` per track: SCROLL_OK, HISTORY_OK, TABLE_OK, INTERNET_OK (real sites via host proxy); `drive_m32_lisp.py` LISP_OK; `drive_m32_interlace.py` INTERLACE_OK. All re-verified 2026-06-11 |
 
 ## M19b notes (2026-06-10)
 

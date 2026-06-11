@@ -80,6 +80,13 @@ fn run_self_test(interp: &mut Interp) {
     }
     let _ = lisp::take_output();
     kprintln!("LISP: {bad_ok}/{} malformed inputs errored cleanly", BAD_INPUT.len());
+    // Runaway non-tail recursion must hit the depth guard (Err), not overflow
+    // the kernel stack. If this crashes, LISP_OK below never prints.
+    let _ = lisp::take_output();
+    match interp.eval_str("(define (loop n) (+ 1 (loop n))) (loop 0)") {
+        Err(e) => kprintln!("LISP: deep recursion guarded ({e})"),
+        Ok(_) => { all = false; kprintln!("LISP ROBUST FAIL: deep recursion not guarded"); }
+    }
     if all {
         kprintln!("LISP_OK");
     }

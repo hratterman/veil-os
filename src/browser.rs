@@ -334,10 +334,51 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
 
 /// "page2.htm" -> "/page2.htm"; absolute paths and full external URLs pass
 /// through (the proxy keeps query strings, so don't strip those for URLs).
+// The current page's URL, so relative links/srcs/stylesheets on an external
+// page resolve against its host (not loopback). None while on the local site.
+static mut PAGE_BASE: Option<String> = None;
+
+fn set_page_base(base: Option<String>) {
+    unsafe { *core::ptr::addr_of_mut!(PAGE_BASE) = base };
+}
+
+fn page_base() -> Option<String> {
+    unsafe { (*core::ptr::addr_of!(PAGE_BASE)).clone() }
+}
+
+/// Join a possibly-relative URL against an absolute base (scheme://host/path).
+fn url_join(base: &str, href: &str) -> String {
+    let href = href.split('#').next().unwrap_or("").trim(); // keep query, drop fragment
+    if href.is_empty() {
+        return String::from(base);
+    }
+    let (scheme, rest) = base.split_once("://").unwrap_or(("https", base));
+    let host = rest.split('/').next().unwrap_or(rest);
+    if href.starts_with("//") {
+        return format!("{scheme}:{href}");
+    }
+    if href.starts_with('/') {
+        return format!("{scheme}://{host}{href}");
+    }
+    // Relative to the base's directory.
+    let path = &rest[host.len()..];
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..i + 1],
+        None => "/",
+    };
+    format!("{scheme}://{host}{dir}{href}")
+}
+
 fn resolve_href(href: &str) -> String {
+    let href = href.trim();
     if is_external(href) {
         return String::from(href);
     }
+    // On an external page, resolve relative URLs against its host.
+    if let Some(base) = page_base() {
+        return url_join(&base, href);
+    }
+    // Local site: strip fragment/query and normalise to an absolute path.
     let href = href.split(['#', '?']).next().unwrap_or("");
     if href.starts_with('/') {
         String::from(href)
@@ -534,6 +575,15 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
             }
         }
         "background-color" => s.bg = parse_color(val),
+        "background" => {
+            // Shorthand: take the first colour-like token (after var() expansion).
+            for tok in val.split([' ', ',']).filter(|t| !t.is_empty()) {
+                if let Some(c) = parse_color(tok) {
+                    s.bg = Some(c);
+                    break;
+                }
+            }
+        }
         "font-size" => {
             if let Some(px) = parse_px(val) {
                 s.scale = (((px + 8) / 16).max(1) as usize).min(4);
@@ -1268,6 +1318,9 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     let path = resolve_href(path);
     let was_external = is_external(&path);
     let path_for_log = path.clone();
+    // Set the base so this page's relative stylesheets/images/links resolve
+    // against its own host (external) or stay loopback-relative (local).
+    set_page_base(if was_external { Some(path.clone()) } else { None });
     kprintln!("BROWSER: navigating to {path}");
     // A user navigation (link click / typed URL) pushes the current page onto
     // the history stack so the back button can return to it.

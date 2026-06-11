@@ -278,6 +278,7 @@ WEB = page("""<h1>The Real Web</h1>
 <p><a href="imgtest.htm">External images test</a> -
 <a href="cssvar.htm">CSS variables test</a> -
 <a href="flextest.htm">Flexbox test</a></p>
+<p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
 host-side proxy that fetches the real (often HTTPS) page, strips it to what

@@ -87,26 +87,102 @@ fn write_all(h: net::Handle, mut data: &[u8]) {
     }
 }
 
-fn read_to_eof(h: net::Handle, cap: usize, timeout: u64) -> Vec<u8> {
-    let mut deadline = timer::ticks() + timeout;
+/// Index just past the end of the HTTP header block (`\r\n\r\n`), if present.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+fn content_length(head_lower: &str) -> Option<usize> {
+    head_lower.lines().find_map(|l| {
+        let (n, v) = l.split_once(':')?;
+        (n.trim() == "content-length").then(|| v.trim().parse().ok())?
+    })
+}
+
+/// True once a chunked body contains its terminating 0-length chunk.
+fn chunked_complete(body: &[u8]) -> bool {
+    let mut i = 0;
+    loop {
+        let mut j = i;
+        while j + 1 < body.len() && !(body[j] == b'\r' && body[j + 1] == b'\n') {
+            j += 1;
+        }
+        if j + 1 >= body.len() {
+            return false; // size line not fully received
+        }
+        let line = core::str::from_utf8(&body[i..j]).unwrap_or("");
+        let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16);
+        match size {
+            Ok(0) => return true,            // terminator chunk
+            Ok(sz) => i = j + 2 + sz + 2,    // size CRLF + data + CRLF
+            Err(_) => return false,
+        }
+        if i > body.len() {
+            return false;
+        }
+    }
+}
+
+/// Has a full HTTP/1.1 response arrived? Uses Content-Length or the chunked
+/// terminator; returns false (keep reading until close/deadline) when neither
+/// is present. This is what stops a keep-alive server — which never sends EOF
+/// — from hanging the reader (and thus the whole desktop) forever.
+fn response_complete(buf: &[u8]) -> bool {
+    let Some(hend) = header_end(buf) else {
+        return false;
+    };
+    let head = core::str::from_utf8(&buf[..hend]).unwrap_or("").to_ascii_lowercase();
+    if head.contains("transfer-encoding:") && head.contains("chunked") {
+        return chunked_complete(&buf[hend..]);
+    }
+    if let Some(cl) = content_length(&head) {
+        return buf.len() >= hend + cl;
+    }
+    false
+}
+
+static HTTP_READ_DONE: AtomicBool = AtomicBool::new(false);
+
+/// One-time proof that the response terminated on a parsed length (not on the
+/// old block-until-EOF path that hung on keep-alive servers).
+fn note_bounded_read() {
+    if !HTTP_READ_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("HTTP_READ_OK");
+    }
+}
+
+/// Read an HTTP response over plain TCP. Returns as soon as the response is
+/// complete (Content-Length / chunked), on EOF, when `cap` is exceeded, after
+/// `idle` ticks with no data, or after a hard `hard` total-time backstop —
+/// whichever comes first, so it can never block indefinitely.
+fn read_http(h: net::Handle, cap: usize, idle: u64, hard: u64) -> Vec<u8> {
+    let hard_deadline = timer::ticks() + hard;
+    let mut idle_deadline = timer::ticks() + idle;
     let mut buf = Vec::new();
-    let mut tmp = [0u8; 2048];
+    let mut tmp = [0u8; 4096];
     loop {
         match net::tcp_read(h, &mut tmp) {
             net::TcpRead::Data(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                deadline = timer::ticks() + timeout; // progress resets the clock
+                idle_deadline = timer::ticks() + idle;
                 if buf.len() > cap {
+                    return buf;
+                }
+                if response_complete(&buf) {
+                    note_bounded_read();
                     return buf;
                 }
             }
             net::TcpRead::Empty => {
-                if timer::ticks() > deadline {
+                if timer::ticks() > idle_deadline {
                     return buf;
                 }
                 scheduler::yield_now();
             }
             net::TcpRead::Eof => return buf,
+        }
+        if timer::ticks() > hard_deadline {
+            return buf;
         }
     }
 }
@@ -194,7 +270,13 @@ fn tls_get(url: &str) -> Option<(u32, String, Vec<u8>)> {
     let mut resp = Vec::new();
     while let Some(chunk) = conn.read(deadline) {
         resp.extend_from_slice(&chunk);
+        // Stop as soon as the response is complete — real HTTPS servers keep
+        // the connection open (no close_notify), so waiting for EOF would hang.
         if resp.len() > (1 << 20) {
+            break;
+        }
+        if response_complete(&resp) {
+            note_bounded_read();
             break;
         }
     }
@@ -232,7 +314,10 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
         let host = if external { "proxy" } else { "veil" };
         let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         write_all(h, req.as_bytes());
-        let resp = read_to_eof(h, 1 << 20, timeout);
+        // idle = stall timeout; hard = absolute backstop so a keep-alive peer
+        // that never closes can't hang the desktop. response_complete() returns
+        // us promptly once Content-Length / chunked says the body is done.
+        let resp = read_http(h, 1 << 20, timeout, timeout * 4);
         net::tcp_close(h);
         if let Some(r) = parse_response(&resp, path) {
             return Some(r);

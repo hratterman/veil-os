@@ -353,6 +353,30 @@ enum Display {
     Block,
     Inline,
     None,
+    Flex,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FlexDir {
+    Row,
+    Column,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Justify {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+    SpaceAround,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlignItems {
+    Stretch,
+    Center,
+    Start,
+    End,
 }
 
 #[derive(Clone)]
@@ -366,6 +390,14 @@ struct Style {
     width: Option<isize>,
     underline: bool,
     pre: bool,
+    // Flex container properties (meaningful when display == Flex).
+    flex_dir: FlexDir,
+    flex_wrap: bool,
+    justify: Justify,
+    align: AlignItems,
+    gap: isize,
+    // Flex item property (this element as a child of a flex container).
+    flex_grow: u32,
 }
 
 const ROOT_STYLE: Style = Style {
@@ -378,6 +410,12 @@ const ROOT_STYLE: Style = Style {
     width: None,
     underline: false,
     pre: false,
+    flex_dir: FlexDir::Row,
+    flex_wrap: false,
+    justify: Justify::Start,
+    align: AlignItems::Stretch,
+    gap: 0,
+    flex_grow: 0,
 };
 
 fn parse_color(v: &str) -> Option<u32> {
@@ -523,11 +561,40 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
         "display" => {
             s.display = match val.trim() {
                 "none" => Display::None,
-                "inline" => Display::Inline,
+                "inline" | "inline-block" => Display::Inline,
                 "block" => Display::Block,
+                "flex" | "inline-flex" => Display::Flex,
                 _ => s.display,
             }
         }
+        "flex-direction" => {
+            s.flex_dir = if val.trim().starts_with("column") { FlexDir::Column } else { FlexDir::Row };
+        }
+        "flex-wrap" => s.flex_wrap = val.trim().starts_with("wrap"),
+        "justify-content" => {
+            s.justify = match val.trim() {
+                "center" => Justify::Center,
+                "flex-end" | "end" | "right" => Justify::End,
+                "space-between" => Justify::SpaceBetween,
+                "space-around" | "space-evenly" => Justify::SpaceAround,
+                _ => Justify::Start,
+            }
+        }
+        "align-items" => {
+            s.align = match val.trim() {
+                "center" => AlignItems::Center,
+                "flex-end" | "end" => AlignItems::End,
+                "flex-start" | "start" => AlignItems::Start,
+                _ => AlignItems::Stretch,
+            }
+        }
+        "gap" | "grid-gap" => s.gap = parse_px(val).unwrap_or(s.gap),
+        "flex" => {
+            // `flex: <grow>` (also accept the shorthand's first number).
+            let first = val.split_whitespace().next().unwrap_or("0");
+            s.flex_grow = first.parse::<u32>().unwrap_or(if first == "none" { 0 } else { 1 });
+        }
+        "flex-grow" => s.flex_grow = val.trim().parse().unwrap_or(s.flex_grow),
         _ => {}
     }
 }
@@ -548,6 +615,13 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         width: None,
         underline: inherited.underline,
         pre: inherited.pre,
+        // Flex properties don't inherit — reset to defaults each element.
+        flex_dir: FlexDir::Row,
+        flex_wrap: false,
+        justify: Justify::Start,
+        align: AlignItems::Stretch,
+        gap: 0,
+        flex_grow: 0,
     };
     match tag {
         "html" => s.display = Display::Block,
@@ -910,6 +984,8 @@ fn layout_block(
             });
             cy += 16 * style.scale as isize;
         }
+    } else if style.display == Display::Flex {
+        cy = layout_flex(ctx, node, &style, cx, cw, cy);
     } else {
         cy = layout_children(ctx, node, &style, cx, cw, cy);
     }
@@ -944,7 +1020,7 @@ fn layout_children(
             continue;
         }
         let is_block = matches!(child, html::Node::Element { .. })
-            && cstyle.display == Display::Block;
+            && matches!(cstyle.display, Display::Block | Display::Flex);
         if !is_block {
             collect_inline(ctx, child, &cstyle, &None, &mut buf);
             continue;
@@ -961,6 +1037,210 @@ fn layout_children(
         y = layout_block(ctx, child, style, x, w, y, marker);
     }
     flush_inline(ctx, &mut buf, x, w, y)
+}
+
+// --- flexbox ----------------------------------------------------------------
+
+static FLEX_DONE: AtomicBool = AtomicBool::new(false);
+
+fn item_right(it: &Item, ctx: &Ctx) -> isize {
+    match it {
+        Item::Text { x, s, scale, .. } => x + s.chars().count() as isize * 8 * *scale as isize,
+        Item::Image { x, idx, .. } => x + ctx.imgs[*idx].1.w as isize,
+        Item::Rect { x, w, .. } => x + w,
+    }
+}
+
+/// Lay a node out in isolation at `avail_w` and return its positioned items
+/// plus its measured content width (text/image extent — background/border
+/// rects that fill `avail_w` are ignored) and total height.
+fn measure_item(
+    ctx: &Ctx, node: &html::Node, parent: &Style, avail_w: isize,
+) -> (Vec<Item>, Vec<LinkBox>, Vec<(usize, isize, isize)>, isize, isize) {
+    let mut tmp = Ctx {
+        sheet: ctx.sheet,
+        imgs: ctx.imgs,
+        items: Vec::new(),
+        links: Vec::new(),
+        img_spots: Vec::new(),
+    };
+    let cstyle = resolve(ctx.sheet, node, parent);
+    let bottom = if cstyle.display == Display::Inline {
+        let mut buf = Vec::new();
+        collect_inline(&mut tmp, node, &cstyle, &None, &mut buf);
+        flush_inline(&mut tmp, &mut buf, 0, avail_w, 0)
+    } else {
+        layout_block(&mut tmp, node, parent, 0, avail_w, 0, None)
+    };
+    // Content width from text/image items only (ignore full-width bg rects).
+    let mut content_w = 0;
+    for it in &tmp.items {
+        if !matches!(it, Item::Rect { .. }) {
+            content_w = content_w.max(item_right(it, ctx));
+        }
+    }
+    if content_w == 0 {
+        // No text/image (e.g. an empty coloured box): fall back to bg width.
+        for it in &tmp.items {
+            content_w = content_w.max(item_right(it, ctx));
+        }
+    }
+    (tmp.items, tmp.links, tmp.img_spots, content_w.min(avail_w), bottom)
+}
+
+/// Shift a measured item set by (dx, dy) and append it to `dst`.
+fn place(
+    dst: &mut Ctx, mut items: Vec<Item>, mut links: Vec<LinkBox>,
+    mut spots: Vec<(usize, isize, isize)>, dx: isize, dy: isize,
+) {
+    for it in &mut items {
+        match it {
+            Item::Rect { x, y, .. } | Item::Text { x, y, .. } | Item::Image { x, y, .. } => {
+                *x += dx;
+                *y += dy;
+            }
+        }
+    }
+    for l in &mut links {
+        l.x += dx;
+        l.y += dy;
+    }
+    for s in &mut spots {
+        s.1 += dx;
+        s.2 += dy;
+    }
+    dst.items.extend(items);
+    dst.links.extend(links);
+    dst.img_spots.extend(spots);
+}
+
+fn align_offset(a: AlignItems, line: isize, item: isize) -> isize {
+    match a {
+        AlignItems::Start | AlignItems::Stretch => 0,
+        AlignItems::Center => (line - item) / 2,
+        AlignItems::End => line - item,
+    }
+}
+
+/// (leading offset before the first item, extra space added after each item)
+/// for `justify-content` given the free main-axis space.
+fn justify_layout(j: Justify, free: isize, n: isize) -> (isize, isize) {
+    if free <= 0 || n <= 0 {
+        return (0, 0);
+    }
+    match j {
+        Justify::Start => (0, 0),
+        Justify::End => (free, 0),
+        Justify::Center => (free / 2, 0),
+        Justify::SpaceBetween => (0, if n > 1 { free / (n - 1) } else { 0 }),
+        Justify::SpaceAround => {
+            let s = free / n;
+            (s / 2, s)
+        }
+    }
+}
+
+struct FlexItem<'a> {
+    node: &'a html::Node,
+    main: isize,
+    cross: isize,
+    grow: u32,
+    width: Option<isize>,
+}
+
+fn layout_flex(ctx: &mut Ctx, node: &html::Node, style: &Style, x: isize, w: isize, y: isize) -> isize {
+    if !FLEX_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("FLEX_OK");
+    }
+    let dir_row = style.flex_dir == FlexDir::Row;
+    let gap = style.gap;
+    // Flex items: element children (bare whitespace text between them is ignored).
+    let mut fis: Vec<FlexItem> = Vec::new();
+    for c in node.children() {
+        if !matches!(c, html::Node::Element { .. }) {
+            continue;
+        }
+        let cs = resolve(ctx.sheet, c, style);
+        if cs.display == Display::None {
+            continue;
+        }
+        let (_, _, _, cw, ch) = measure_item(ctx, c, style, w);
+        let nat_w = cs.width.unwrap_or(cw).max(1);
+        let (main, cross) = if dir_row { (nat_w, ch) } else { (ch, nat_w) };
+        fis.push(FlexItem { node: c, main, cross, grow: cs.flex_grow, width: cs.width });
+    }
+    if fis.is_empty() {
+        return y;
+    }
+
+    if !dir_row {
+        // Column: stack vertically with gaps; align-items on the horizontal axis.
+        let mut cy = y;
+        for (i, fi) in fis.iter().enumerate() {
+            if i > 0 {
+                cy += gap;
+            }
+            let item_w = if style.align == AlignItems::Stretch {
+                w
+            } else {
+                fi.cross.min(w)
+            };
+            let off = align_offset(style.align, w, item_w);
+            let (items, links, spots, _, _) = measure_item(ctx, fi.node, style, item_w);
+            place(ctx, items, links, spots, x + off, cy);
+            cy += fi.main;
+        }
+        return cy;
+    }
+
+    // Row: break into wrap lines, then justify + align each line.
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_main = 0isize;
+    for (i, fi) in fis.iter().enumerate() {
+        let add = fi.main + if cur.is_empty() { 0 } else { gap };
+        if style.flex_wrap && !cur.is_empty() && cur_main + add > w {
+            lines.push(core::mem::take(&mut cur));
+            cur_main = 0;
+        }
+        cur_main += fi.main + if cur.is_empty() { 0 } else { gap };
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+
+    let mut cy = y;
+    for line in &lines {
+        let natural: isize = line.iter().map(|&i| fis[i].main).sum();
+        let gaps = gap * (line.len() as isize - 1).max(0);
+        let total_grow: u32 = line.iter().map(|&i| fis[i].grow).sum();
+        let free = (w - natural - gaps).max(0);
+        let line_h = line.iter().map(|&i| fis[i].cross).max().unwrap_or(0);
+        let (lead, between) = if total_grow > 0 {
+            (0, 0) // grow consumes the free space instead of justify spacing
+        } else {
+            justify_layout(style.justify, free, line.len() as isize)
+        };
+        let mut px = x + lead;
+        for (k, &i) in line.iter().enumerate() {
+            if k > 0 {
+                px += gap + between;
+            }
+            let extra = if total_grow > 0 {
+                free * fis[i].grow as isize / total_grow as isize
+            } else {
+                0
+            };
+            let item_w = fis[i].width.unwrap_or(fis[i].main) + extra;
+            let cross_off = align_offset(style.align, line_h, fis[i].cross);
+            let (items, links, spots, _, _) = measure_item(ctx, fis[i].node, style, item_w.max(1));
+            place(ctx, items, links, spots, px, cy + cross_off);
+            px += item_w;
+        }
+        cy += line_h + gap;
+    }
+    (cy - gap).max(y)
 }
 
 // --- navigation -------------------------------------------------------------------

@@ -275,6 +275,9 @@ point was never to be fast or complete; it was to be honest.</p>
 <p><a href="index.htm">Home</a></p>""")
 
 WEB = page("""<h1>The Real Web</h1>
+<p><a href="imgtest.htm">External images test</a> -
+<a href="cssvar.htm">CSS variables test</a> -
+<a href="flextest.htm">Flexbox test</a></p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
 host-side proxy that fetches the real (often HTTPS) page, strips it to what
@@ -293,9 +296,27 @@ written from scratch.</p>
 </ul>
 <p class="muted">Slow to load is normal - the proxy is fetching a real site
 across the internet, then this browser lays out every line by hand.</p>
-<p><a href="imgtest.htm">External images test</a></p>
-<p><a href="cssvar.htm">CSS variables test</a></p>
 <p><a href="index.htm">Home</a></p>""")
+
+FLEXTEST = page("""<style>
+.fnav { display: flex; flex-direction: row; justify-content: space-between; align-items: center; background-color: #1a2e1a; padding: 12px; gap: 8px; }
+.fnav a { color: #f5f0e8; }
+.cards { display: flex; flex-direction: row; flex-wrap: wrap; gap: 14px; }
+.card { flex: 1; background-color: #243024; color: #ffffff; padding: 12px; }
+</style>
+<div class="fnav">
+<a href="flexhome.htm">HOME</a>
+<a href="flexwork.htm">WORK</a>
+<a href="flexabout.htm">ABOUT</a>
+<a href="flexcontact.htm">CONTACT</a>
+</div>
+<h2>Cards</h2>
+<div class="cards">
+<div class="card">Card one body text here.</div>
+<div class="card">Card two body text here.</div>
+<div class="card">Card three body text here.</div>
+</div>
+<p><a href="web.htm">Back</a></p>""")
 
 CSSVAR = page("""<style>
 :root { --brand: #2a7e3b; --accent: #cc4422; --pad: 14px; }
@@ -571,7 +592,7 @@ def main():
         "index.htm": INDEX, "page2.htm": PAGE2, "news.htm": NEWS,
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
-        "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR,
+        "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

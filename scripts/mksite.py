@@ -277,7 +277,8 @@ point was never to be fast or complete; it was to be honest.</p>
 WEB = page("""<h1>The Real Web</h1>
 <p><a href="imgtest.htm">External images test</a> -
 <a href="cssvar.htm">CSS variables test</a> -
-<a href="flextest.htm">Flexbox test</a> - <a href="fonttest.htm">Fonts test</a></p>
+<a href="flextest.htm">Flexbox test</a> - <a href="fonttest.htm">Fonts test</a> -
+<a href="navtest.htm">Nav/selector test</a></p>
 <p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
@@ -341,6 +342,23 @@ CSSVAR = page("""<style>
 <div class="vbar">brand colored bar (background = var(--brand))</div>
 <h1 class="vtext">accent heading (color = var(--accent))</h1>
 <p class="vfb">fallback works (var(--nope, #1188dd))</p>
+<p><a href="web.htm">Back</a></p>""")
+
+NAVTEST = page("""<style>
+:root { --link: #f0a020; }
+.navbar { display: flex; flex-direction: row; gap: 2rem; padding: 1rem; background-color: #102a40; }
+.navbar a { color: var(--link); }
+.overlay { background-color: #ff00ff; color: #ff00ff; opacity: 0; pointer-events: none; padding: 2rem; }
+.reveal { color: #20e0a0; opacity: 0; }
+@media (max-width: 900px) { .navbar { display: none; } .navbar a { color: #ff0000; } }
+</style>
+<nav class="navbar primary">
+<a href="navhome.htm">HOME</a>
+<a href="navwork.htm">WORK</a>
+<a href="navabout.htm">ABOUT</a>
+</nav>
+<div class="overlay">HIDDEN OVERLAY MENU SHOULD NOT APPEAR</div>
+<p class="reveal">REVEAL CONTENT STAYS VISIBLE</p>
 <p><a href="web.htm">Back</a></p>""")
 
 IMGTEST = page("""<h1>External images</h1>
@@ -607,6 +625,7 @@ def main():
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
         "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST, "fonttest.htm": FONTTEST,
+        "navtest.htm": NAVTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

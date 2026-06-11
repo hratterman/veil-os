@@ -447,32 +447,56 @@ struct Style {
     gap: isize,
     // Flex item property (this element as a child of a flex container).
     flex_grow: u32,
+    // Hidden-overlay detection (don't inherit). `transparent` = opacity:0,
+    // `pointer_none` = pointer-events:none; an element with both is a hidden
+    // overlay (e.g. a JS-toggled mobile menu) and is dropped — but opacity:0
+    // alone is left visible, since sites also use it for scroll-reveal content
+    // that we can't un-hide (no JS).
+    transparent: bool,
+    pointer_none: bool,
+    // Ancestor chain (root..parent) as (tag, raw class attr), for matching
+    // descendant selectors like `.nav-links a`. Not a render property.
+    anc: Vec<(Option<String>, Option<String>)>,
 }
 
-const ROOT_STYLE: Style = Style {
-    color: 0xff10_1418,
-    bg: None,
-    scale: 1,
-    margin: [0; 4],
-    padding: [0; 4],
-    display: Display::Block,
-    width: None,
-    underline: false,
-    pre: false,
-    font_fam: font::Family::Default,
-    font_weight: 400,
-    font_italic: false,
-    font: None,
-    flex_dir: FlexDir::Row,
-    flex_wrap: false,
-    justify: Justify::Start,
-    align: AlignItems::Stretch,
-    gap: 0,
-    flex_grow: 0,
-};
+fn root_style() -> Style {
+    Style {
+        color: 0xff10_1418,
+        bg: None,
+        scale: 1,
+        margin: [0; 4],
+        padding: [0; 4],
+        display: Display::Block,
+        width: None,
+        underline: false,
+        pre: false,
+        font_fam: font::Family::Default,
+        font_weight: 400,
+        font_italic: false,
+        font: None,
+        flex_dir: FlexDir::Row,
+        flex_wrap: false,
+        justify: Justify::Start,
+        align: AlignItems::Stretch,
+        gap: 0,
+        flex_grow: 0,
+        transparent: false,
+        pointer_none: false,
+        anc: Vec::new(),
+    }
+}
 
 fn parse_color(v: &str) -> Option<u32> {
     let v = v.trim();
+    // rgb()/rgba(): integer channels; any alpha is ignored (we render opaque).
+    let lower = v.to_ascii_lowercase();
+    if let Some(inner) = lower.strip_prefix("rgb(").or_else(|| lower.strip_prefix("rgba(")) {
+        let mut ch = inner.trim_end_matches(')').split(',').map(str::trim);
+        let r = ch.next()?.parse::<u32>().ok()?;
+        let g = ch.next()?.parse::<u32>().ok()?;
+        let b = ch.next()?.parse::<u32>().ok()?;
+        return Some(0xff00_0000 | (r & 0xff) << 16 | (g & 0xff) << 8 | (b & 0xff));
+    }
     if let Some(hex) = v.strip_prefix('#') {
         let d = |c: u8| (c as char).to_digit(16);
         let h = hex.as_bytes();
@@ -505,8 +529,54 @@ fn parse_color(v: &str) -> Option<u32> {
     }
 }
 
+/// Parse a length to pixels, supporting px, rem/em (1 unit ≈ 16px), pt, and
+/// bare numbers. Relative/computed units (%, vw, clamp(), calc()) are unknown.
+/// Approximate perceptual luminance (0..255) of an XRGB color.
+fn luma(c: u32) -> i32 {
+    let (r, g, b) = (((c >> 16) & 0xff) as i32, ((c >> 8) & 0xff) as i32, (c & 0xff) as i32);
+    (r * 54 + g * 183 + b * 19) >> 8
+}
+
+/// Nudge a text color so it stays legible against `bg`. The site's text colors
+/// assume light section backgrounds; on our single (dark) page background, very
+/// dark text would vanish. When fg/bg luminance is too close, blend fg ~62%
+/// toward white (dark bg) or black (light bg) — keeping a hint of the hue.
+/// High-contrast text (the overwhelming common case) is returned unchanged.
+fn readable(fg: u32, bg: u32) -> u32 {
+    if (luma(fg) - luma(bg)).abs() >= 72 {
+        return fg;
+    }
+    let target: u32 = if luma(bg) < 110 { 0xffff_ffff } else { 0xff00_0000 };
+    let mix = |s: u32, d: u32| (s * 3 + d * 5) / 8;
+    0xff00_0000
+        | mix((fg >> 16) & 0xff, (target >> 16) & 0xff) << 16
+        | mix((fg >> 8) & 0xff, (target >> 8) & 0xff) << 8
+        | mix(fg & 0xff, target & 0xff)
+}
+
+/// Parse a length to pixels, supporting px, rem/em (1 unit ≈ 16px), pt, and
+/// bare numbers. Relative/computed units (%, vw, clamp(), calc()) are unknown.
 fn parse_px(v: &str) -> Option<isize> {
-    v.trim().trim_end_matches("px").trim().parse().ok()
+    let v = v.trim();
+    let (num, mul, div) = if let Some(n) = v.strip_suffix("px") {
+        (n, 1, 1)
+    } else if let Some(n) = v.strip_suffix("rem") {
+        (n, 16, 1)
+    } else if let Some(n) = v.strip_suffix("em") {
+        (n, 16, 1)
+    } else if let Some(n) = v.strip_suffix("pt") {
+        (n, 4, 3) // 1pt = 4/3 px
+    } else {
+        (v, 1, 1)
+    };
+    // Decimal number in tenths (e.g. "2.5" -> 25), to keep integer math.
+    let n = num.trim();
+    let (int, frac) = n.split_once('.').unwrap_or((n, ""));
+    let neg = int.starts_with('-');
+    let i: isize = int.trim_start_matches('-').parse().ok().or(int.is_empty().then_some(0))?;
+    let f = frac.bytes().next().map_or(0, |b| (b.wrapping_sub(b'0')).min(9) as isize);
+    let tenths = i * 10 + f;
+    Some((if neg { -tenths } else { tenths }) * mul / div / 10)
 }
 
 // CSS custom properties for the current document. Rendering is single-threaded
@@ -666,6 +736,25 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
             s.flex_grow = first.parse::<u32>().unwrap_or(if first == "none" { 0 } else { 1 });
         }
         "flex-grow" => s.flex_grow = val.trim().parse().unwrap_or(s.flex_grow),
+        "opacity" => {
+            // Note transparency; whether it hides depends on pointer-events too
+            // (decided after the whole cascade, in `resolve`).
+            let v = val.trim();
+            s.transparent = !v.is_empty() && v.bytes().all(|b| b == b'0' || b == b'.');
+        }
+        "pointer-events" => s.pointer_none = val.trim() == "none",
+        "visibility" => {
+            if matches!(val.trim(), "hidden" | "collapse") {
+                s.display = Display::None;
+            }
+        }
+        "text-decoration" | "text-decoration-line" => {
+            if val.contains("none") {
+                s.underline = false;
+            } else if val.contains("underline") {
+                s.underline = true;
+            }
+        }
         _ => {}
     }
 }
@@ -698,6 +787,9 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         align: AlignItems::Stretch,
         gap: 0,
         flex_grow: 0,
+        transparent: false,
+        pointer_none: false,
+        anc: Vec::new(),
     };
     match tag {
         "html" => s.display = Display::Block,
@@ -705,7 +797,8 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
             s.display = Display::Block;
             s.margin = [8; 4];
         }
-        "div" => s.display = Display::Block,
+        "div" | "section" | "nav" | "header" | "footer" | "main" | "article" | "aside"
+        | "figure" | "figcaption" | "blockquote" => s.display = Display::Block,
         "p" => {
             s.display = Display::Block;
             s.margin[0] = 8;
@@ -747,15 +840,37 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         "head" | "title" | "script" | "style" | "meta" | "link" => s.display = Display::None,
         _ => {} // span, img, unknown: inline containers
     }
-    for tier in 0..2 {
-        for r in sheet {
-            if r.rank() == tier && r.matches(tag, class) {
-                for (p, v) in &r.decls {
-                    apply_decl(&mut s, p, v);
-                }
-            }
+    // Ancestor chain (root..parent) as borrowed (tag, class) pairs, for
+    // descendant-selector matching.
+    let anc: Vec<(&str, Option<&str>)> = inherited
+        .anc
+        .iter()
+        .map(|(t, c)| (t.as_deref().unwrap_or(""), c.as_deref()))
+        .collect();
+    // Apply every matching rule in ascending specificity. A stable sort keeps
+    // source order within a rank, so a later equal-rank rule still wins (the
+    // cascade). Tag UA defaults above are rank -∞, applied first.
+    let mut matched: Vec<(u32, usize)> = Vec::new();
+    for (i, r) in sheet.iter().enumerate() {
+        if r.matches(tag, class, &anc) {
+            matched.push((r.rank(), i));
         }
     }
+    matched.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (_, i) in matched {
+        for (p, v) in &sheet[i].decls {
+            apply_decl(&mut s, p, v);
+        }
+    }
+    // A fully-transparent, non-interactive element is a hidden overlay (a
+    // JS-toggled mobile menu, a dialog backdrop): drop it. opacity:0 on its own
+    // is scroll-reveal content — leave it visible since no JS will reveal it.
+    if s.transparent && s.pointer_none {
+        s.display = Display::None;
+    }
+    // Record this node so its descendants can match `ancestor key` selectors.
+    s.anc = inherited.anc.clone();
+    s.anc.push((Some(String::from(tag)), class.map(String::from)));
     // Resolve the bitmap font from the (possibly inherited) typography + size.
     s.font = font::pick(s.font_fam, s.font_weight, s.font_italic, (s.scale * 16) as u16);
     s
@@ -1466,7 +1581,8 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     // Layout at the window's content width.
     let view_w = win.cw;
     let body_node = doc.find("body").unwrap_or(&doc);
-    let body_style = resolve(&sheet, body_node, &ROOT_STYLE);
+    let root = root_style();
+    let body_style = resolve(&sheet, body_node, &root);
     let page_bg = body_style.bg.unwrap_or(0xffff_ffff);
     let mut ctx = Ctx {
         sheet: &sheet,
@@ -1475,7 +1591,7 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         links: Vec::new(),
         img_spots: Vec::new(),
     };
-    let end_y = layout_block(&mut ctx, body_node, &ROOT_STYLE, 0, view_w as isize, 0, None);
+    let end_y = layout_block(&mut ctx, body_node, &root, 0, view_w as isize, 0, None);
     let doc_h = (end_y.max(1) as usize).min(MAX_DOC_H);
     if end_y as usize > MAX_DOC_H {
         kprintln!("BROWSER: document truncated at {MAX_DOC_H}px (was {end_y})");
@@ -1493,9 +1609,12 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
             }
             Item::Text { x, y, s, color, scale, font } => {
                 if *y >= 0 {
+                    // Keep text legible against the page: the site's colors
+                    // assume light section backgrounds we don't paint.
+                    let color = readable(*color, page_bg);
                     match font {
-                        Some(bm) => pfb.draw_bm_string((*x).max(0) as usize, *y as usize, s, bm, *color),
-                        None => pfb.draw_string_scaled((*x).max(0) as usize, *y as usize, s, *color, *scale),
+                        Some(bm) => pfb.draw_bm_string((*x).max(0) as usize, *y as usize, s, bm, color),
+                        None => pfb.draw_string_scaled((*x).max(0) as usize, *y as usize, s, color, *scale),
                     }
                 }
             }

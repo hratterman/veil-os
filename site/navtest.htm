@@ -1,0 +1,22 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a> | <a href="web.htm">Web</a></div>
+<style>
+:root { --link: #f0a020; }
+.navbar { display: flex; flex-direction: row; gap: 2rem; padding: 1rem; background-color: #102a40; }
+.navbar a { color: var(--link); }
+.overlay { background-color: #ff00ff; color: #ff00ff; opacity: 0; pointer-events: none; padding: 2rem; }
+.reveal { color: #20e0a0; opacity: 0; }
+@media (max-width: 900px) { .navbar { display: none; } .navbar a { color: #ff0000; } }
+</style>
+<nav class="navbar primary">
+<a href="navhome.htm">HOME</a>
+<a href="navwork.htm">WORK</a>
+<a href="navabout.htm">ABOUT</a>
+</nav>
+<div class="overlay">HIDDEN OVERLAY MENU SHOULD NOT APPEAR</div>
+<p class="reveal">REVEAL CONTENT STAYS VISIBLE</p>
+<p><a href="web.htm">Back</a></p>
+</body>
+</html>

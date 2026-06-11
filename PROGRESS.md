@@ -517,3 +517,43 @@ max 2048 x 2048 px" message, instead of a black "cannot decode" box.
 `scripts/pngfix_test.sh` now stages a 2048x2048 (must render, downscaled — it
 does: ~1/2, 5853 distinct colors on screen) and a 3000x2000 (must show the
 graceful message). M23/M29/M34-img/Adam7 regressions all still green.
+
+## Browser CSS overhaul — real sites render cleanly (2026-06-11)
+
+henryratterman.com (and real sites generally) rendered badly: a duplicate
+centered nav over the content, blue (wrong) nav links, cramped/inline layout,
+and dark-on-dark invisible headings. Root causes were all in the CSS subset.
+
+Fixes (`src/css.rs`, `src/browser.rs`):
+- **Descendant selectors + multi-class matching.** `.nav-links a { color }` and
+  `class="nav-links nav-links--desktop"` now resolve (the engine threads the
+  ancestor chain through `Style.anc` and matches any one of an element's
+  classes). This is what fixed the nav link colour (was falling back to the
+  default blue).
+- **`@media` / `@keyframes` / `@font-face` blocks are skipped** (balanced-brace
+  scan). Previously their nested rules were parsed as global, so mobile
+  `display:none` overrides leaked into the desktop render.
+- **`opacity:0` + `pointer-events:none` ⇒ hidden** (a JS-toggled overlay like
+  the mobile menu — the duplicate nav). `opacity:0` *alone* is left visible,
+  since sites also use it for scroll-reveal content we can't un-hide (no JS).
+- **HTML5 block elements** (`section`/`nav`/`header`/`footer`/`main`/
+  `article`/`aside`/`figure`/`blockquote`) default to `display:block` — they
+  were inline, so everything cramped onto a few lines.
+- **rem/em/pt units** in `parse_px` (1rem≈16px) — gaps, padding, margins and
+  font-sizes were collapsing because only `px` parsed.
+- **rgb()/rgba()** in `parse_color`; **text-decoration** (none/underline).
+- **Minimum-contrast text** at paint time: the site's dark text colours assume
+  light section backgrounds we don't paint, so on the dark page they vanished.
+  When fg/bg luminance is too close, blend fg toward the legible extreme
+  (keeps a hint of hue). High-contrast text — the common case, and every
+  existing test page — is untouched.
+
+Result: henryratterman.com now renders as a clean personal site — a single
+spaced cream nav bar, terracotta section labels, and visible headings.
+
+New deterministic gate `scripts/drive_m34_nav.py` + `navtest.htm` (in
+`mksite.py`) exercises all of the above over loopback (no live network):
+multi-class+descendant link colour, @media skipped, overlay hidden,
+scroll-reveal visible, rem gap. Regressions all green: M16 (pixel-exact on-OS
+site), M34 flex/cssvar/font, M32 table/internet, M31 web; the live
+henryratterman render via `scripts/m32_test.sh scripts/drive_m34_hr.py`.

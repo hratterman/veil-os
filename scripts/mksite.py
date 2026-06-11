@@ -274,8 +274,15 @@ point was never to be fast or complete; it was to be honest.</p>
 <p><a href="index.htm">Home</a></p>""")
 
 CHANGES = page("""<h1>Changelog</h1>
-<p class="muted">Thirty-one milestones. Each one gated behind an observed
-proof before the next began.</p>
+<p class="muted">Every milestone gated behind an observed proof before the
+next began. The phases, at a glance:</p>
+<table>
+<tr><th>Phase</th><th>Milestones</th><th>Highlight</th></tr>
+<tr><td>Boot to OS</td><td>M1 - M15</td><td>its own TCP/IP stack</td></tr>
+<tr><td>A computer</td><td>M16 - M24</td><td>browser, audio, real Pi 4</td></tr>
+<tr><td>Hosted demo</td><td>M25 - M31</td><td>uploads and a GIF player</td></tr>
+<tr><td>Overnight</td><td>M32</td><td>scroll, history, tables, Lisp, the internet</td></tr>
+</table>
 <div class="card">
 <h2>M31 - Internet expansion and the GIF player <span class="tag">new</span></h2>
 <p>This little web you are browsing grew from two pages to a small

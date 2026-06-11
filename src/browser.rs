@@ -336,6 +336,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
             s.color = 0xff20_50c0;
             s.underline = true;
         }
+        "table" | "tr" | "td" | "th" => s.display = Display::Block,
         "head" | "title" | "script" | "style" | "meta" | "link" => s.display = Display::None,
         _ => {} // span, img, unknown: inline containers
     }
@@ -541,6 +542,63 @@ fn flush_inline(ctx: &mut Ctx, buf: &mut Vec<Frag>, x: isize, w: isize, mut y: i
     y
 }
 
+static TABLE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Lay out a `<table>`: equal-width columns, each cell a block container,
+/// 1px borders between cells. No rowspan/colspan. Returns the y below it.
+fn layout_table(
+    ctx: &mut Ctx,
+    node: &html::Node,
+    style: &Style,
+    x: isize,
+    w: isize,
+    mut y: isize,
+) -> isize {
+    const LINE: u32 = 0xff58_6068;
+    const PAD: isize = 4;
+    // Collect rows (anywhere under the table, so an implicit <tbody> is fine).
+    let mut trs: Vec<&html::Node> = Vec::new();
+    node.find_all("tr", &mut trs);
+    if trs.is_empty() {
+        return y;
+    }
+    let row_cells: Vec<Vec<&html::Node>> = trs
+        .iter()
+        .map(|tr| {
+            tr.children()
+                .iter()
+                .filter(|c| matches!(c.tag(), Some("td") | Some("th")))
+                .collect()
+        })
+        .collect();
+    let ncols = row_cells.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let col_w = (w / ncols as isize).max(24);
+    let table_w = col_w * ncols as isize;
+    let table_top = y;
+    for cells in &row_cells {
+        let row_top = y;
+        let mut row_bottom = row_top + 16; // a min row height
+        for (j, cell) in cells.iter().enumerate().take(ncols) {
+            let cx = x + j as isize * col_w + PAD;
+            let cw = (col_w - 2 * PAD).max(8);
+            let cstyle = resolve(ctx.sheet, cell, style);
+            let bottom = layout_children(ctx, cell, &cstyle, cx, cw, row_top + PAD);
+            row_bottom = row_bottom.max(bottom + PAD);
+        }
+        y = row_bottom;
+        // Column separators down this row, then a rule under it.
+        for j in 0..=ncols {
+            ctx.items.push(Item::Rect { x: x + j as isize * col_w, y: row_top, w: 1, h: y - row_top, color: LINE });
+        }
+        ctx.items.push(Item::Rect { x, y, w: table_w, h: 1, color: LINE });
+    }
+    ctx.items.push(Item::Rect { x, y: table_top, w: table_w, h: 1, color: LINE });
+    if !TABLE_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("TABLE_OK");
+    }
+    y + 8
+}
+
 /// Lay out one block element. Returns the y below it (margins included).
 fn layout_block(
     ctx: &mut Ctx,
@@ -561,6 +619,9 @@ fn layout_block(
         .width
         .unwrap_or(w - style.margin[3] - style.margin[1])
         .max(16);
+    if node.tag() == Some("table") {
+        return layout_table(ctx, node, &style, bx, bw, y) + style.margin[2];
+    }
     let bg_at = ctx.items.len();
     let cx = bx + style.padding[3];
     let cw = (bw - style.padding[3] - style.padding[1]).max(16);

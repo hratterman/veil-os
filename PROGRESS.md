@@ -245,6 +245,35 @@ kernel to the M27 setup screen (framebuffer captured). os route is on the
 **dashboard-managed** tunnel (ingress lives in the CF dashboard, not
 config.yml), already pointing at localhost:6090.
 
+## Audio freeze in hosted sessions — root-caused + fixed (2026-06-10)
+
+**Symptom:** pressing Play in the Audio window froze the entire hosted VM
+(VNC, desktop, all devices); only in hosted sessions, never local run.sh.
+
+**Root cause (host-side, not guest):** hosted sessions use
+`-audiodev wav,path=/tmp/veil-audio-<sid>.fifo`. QEMU's `wav` backend does
+a **blocking write** to that FIFO. If nothing drains it, the ~64 KB pipe
+fills mid-playback and QEMU's main loop blocks on the write — freezing the
+whole VM. Confirmed by a 2-scenario repro: a held-but-not-draining FIFO
+reader → HUNG at "SND: stream started"; an actively-drained FIFO →
+AUDIO_OK. This is why every guest-side attempt (yield/wfi/GIC IRQ) failed:
+the guest can't fix a blocked host. The old design leaned on a *separate*
+best-effort Node bridge (`audio_server.js` / com.veil.audio) to drain, and
+browser audio was never actually wired into the page — so in practice
+nothing reliably drained the FIFO.
+
+**Fix:** `session_manager.py` now drains each session's FIFO **in-process**
+for the session lifetime (`drain_fifo` thread, started in `spawn`, stopped
+in `kill`) — guaranteed, not best-effort. It header-strips and forwards the
+PCM to browser audio clients over a **same-origin** WebSocket at
+`/session/<id>/audio` (handled directly by the manager, not proxied). The
+standalone audio bridge is retired (com.veil.audio unloaded/removed — a 2nd
+FIFO reader would split the bytes). `novnc_audio.js` now connects to the
+same-origin endpoint and is wired into `~/server/novnc/vnc.html`. Verified
+live: `drive_audio_session.py` (no freeze: AUDIO_OK + framebuffer still
+updates) and `drive_audio_ws.py` (browser received 528 KB of PCM over the
+WS during playback). No kernel change required.
+
 ## Post-M20 UX overhaul (no milestone — 2026-06-10)
 
 Boot shows the bare desktop; nothing opens automatically. Apps launch

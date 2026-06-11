@@ -20,12 +20,29 @@ for a in com.veil.qemu com.veil.websockify com.veil.reset; do
     rm -f "$LA/$a.plist"
 done
 
-echo "Installing com.veil.relay + com.veil.audio + com.veil.sessions..."
-for a in com.veil.relay com.veil.audio com.veil.sessions; do
+# NOTE: com.veil.audio (the standalone Node FIFO->WS bridge) is intentionally
+# NOT installed. The session manager now drains each QEMU `wav` audiodev FIFO
+# in-process (mandatory — an undrained FIFO fills and QEMU's blocking write
+# freezes the whole VM) and serves browser audio same-origin at
+# /session/<id>/audio. A second FIFO reader would split the bytes, so the
+# bridge is retired.
+echo "Installing com.veil.relay + com.veil.sessions..."
+for a in com.veil.relay com.veil.sessions; do
     cp "$SRC/launchd/$a.plist" "$LA/$a.plist"
     launchctl unload "$LA/$a.plist" 2>/dev/null || true
     launchctl load "$LA/$a.plist"
 done
+launchctl unload "$LA/com.veil.audio.plist" 2>/dev/null || true
+rm -f "$LA/com.veil.audio.plist"
+
+# Browser audio: ship the client and reference it from the noVNC page (the
+# session id comes from the /session/<id>/ path at runtime).
+NOVNC="$HOME/server/novnc"
+if [ -d "$NOVNC" ]; then
+    cp "$SRC/novnc_audio.js" "$NOVNC/audio.js"
+    grep -q "audio.js" "$NOVNC/vnc.html" 2>/dev/null \
+        || perl -0pi -e 's{</body>}{<script src="audio.js"></script>\n</body>}' "$NOVNC/vnc.html"
+fi
 
 echo "Done. Relay on :7778, session manager on localhost:6090 (dual-stack)."
 echo "Remember: point the Cloudflare tunnel ( / and /session/ ) at 127.0.0.1:6090."

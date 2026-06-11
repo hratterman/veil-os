@@ -19,6 +19,8 @@ Layout:
   - 30 min of inactivity (or an explicit GET /close) reclaims a session:
     QEMU killed, disk + upload dir removed, ports freed.
 """
+import base64
+import hashlib
 import html
 import json
 import os
@@ -34,6 +36,25 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+AUDIO_CHUNK = 4096  # ~23 ms at 44100 Hz, 16-bit stereo
+
+
+def ws_accept(key):
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+def ws_binary_frame(payload):
+    """Frame `payload` as a single unmasked binary WebSocket message."""
+    n = len(payload)
+    if n < 126:
+        head = bytes([0x82, n])
+    elif n < 65536:
+        head = bytes([0x82, 126]) + n.to_bytes(2, "big")
+    else:
+        head = bytes([0x82, 127]) + n.to_bytes(8, "big")
+    return head + payload
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNEL = os.path.join(ROOT, "target/aarch64-unknown-none/debug/veil")
@@ -106,7 +127,10 @@ class Session:
         self.serial = f"/tmp/veil-session-{sid}-serial.log"
         self.qemu = None
         self.wsproc = None
-        self.fifo_rd = None   # read-end fd kept open to unblock QEMU's write-open
+        self.fifo_rd = None   # read-end fd; a thread drains it (see drain_fifo)
+        self.audio_clients = set()       # browser audio WebSocket sockets
+        self.audio_lock = threading.Lock()
+        self.closed = False
         self.last_active = time.time()
         self.booted = False
 
@@ -179,6 +203,71 @@ class Manager:
         subprocess.run(cmd, cwd=ROOT, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def broadcast_audio(self, s, pcm):
+        """Send PCM to this session's browser audio clients (WS binary)."""
+        if not pcm:
+            return
+        with s.audio_lock:
+            clients = list(s.audio_clients)
+        for off in range(0, len(pcm), AUDIO_CHUNK):
+            frame = ws_binary_frame(pcm[off:off + AUDIO_CHUNK])
+            for sock in clients:
+                try:
+                    sock.sendall(frame)
+                except OSError:
+                    with s.audio_lock:
+                        s.audio_clients.discard(sock)
+
+    def drain_fifo(self, s):
+        """Continuously read the QEMU `wav` audiodev FIFO and forward the PCM
+        to browser audio clients.
+
+        THIS IS LOAD-BEARING, not just for browser audio: QEMU's wav backend
+        does a *blocking* write to the FIFO, so if nobody drains it the 64 KB
+        pipe fills mid-playback and QEMU's main loop blocks on write — which
+        freezes the entire VM (VNC, timers, every device). Draining in-process
+        here, for the whole session lifetime, guarantees that never happens
+        (the old design leaned on a separate Node bridge being healthy)."""
+        fd = s.fifo_rd
+        if fd is None:
+            return
+        saw_data = False
+        carry = b""
+        while not s.closed:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                # All writers closed (QEMU exited / not yet started). The
+                # O_NONBLOCK reader stays valid; pause briefly and retry so a
+                # late QEMU write-open still rendezvouses.
+                if s.qemu and s.qemu.poll() is not None:
+                    break
+                time.sleep(0.05)
+                continue
+            # Strip QEMU's leading RIFF/WAVE header (up to and incl. the
+            # `data` chunk marker + size) so clients get pure PCM. Draining
+            # happens regardless — this only shapes what's forwarded.
+            if not saw_data:
+                carry += chunk
+                i = carry.find(b"data")
+                if i < 0:
+                    carry = carry[-8:]
+                    continue
+                saw_data = True
+                pcm = carry[i + 8:]
+                carry = b""
+            else:
+                pcm = chunk
+            if pcm:
+                self.broadcast_audio(s, pcm)
+
     def spawn(self, s):
         """Build the disk and launch QEMU (+websockify) for session s."""
         if s.booted:
@@ -187,8 +276,9 @@ class Manager:
         # FIFO audio tap.  QEMU opens the write end of the FIFO at startup,
         # which blocks until a reader also opens it (POSIX named-pipe
         # rendezvous).  Open the read end here in O_NONBLOCK|O_RDONLY so
-        # QEMU's open() returns immediately.  We keep the fd alive for the
-        # session lifetime (stored in s.fifo_rd) so QEMU never gets ENXIO.
+        # QEMU's open() returns immediately, then drain it from a thread for
+        # the session's lifetime (drain_fifo) — see that method for why this
+        # is required to keep the VM from freezing.
         try:
             if not os.path.exists(s.fifo):
                 os.mkfifo(s.fifo)
@@ -198,6 +288,8 @@ class Manager:
             s.fifo_rd = os.open(s.fifo, os.O_RDONLY | os.O_NONBLOCK)
         except OSError:
             s.fifo_rd = None
+        if s.fifo_rd is not None:
+            threading.Thread(target=self.drain_fifo, args=(s,), daemon=True).start()
         s.qemu = subprocess.Popen([
             "qemu-system-aarch64",
             "-machine", "virt", "-cpu", "cortex-a72", "-m", "512M",
@@ -244,6 +336,15 @@ class Manager:
         s.last_active = time.time()
 
     def kill(self, s):
+        s.closed = True  # stop the drain thread
+        with s.audio_lock:
+            clients = list(s.audio_clients)
+            s.audio_clients.clear()
+        for sock in clients:
+            try:
+                sock.close()
+            except OSError:
+                pass
         for p in (s.qemu, s.wsproc):
             if p and p.poll() is None:
                 try:
@@ -325,8 +426,48 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/healthz":
             return self._send(200, "ok\n", "text/plain")
         if u.path.startswith("/session/"):
+            parts = u.path.split("/", 3)
+            rest = parts[3] if len(parts) > 3 else ""
+            if rest.split("?", 1)[0] == "audio":
+                return self.audio_ws(parts[2])
             return self.proxy_session(u)
         self._send(404, "not found")
+
+    def audio_ws(self, sid):
+        """Upgrade /session/<sid>/audio to a WebSocket and register it for
+        this session's PCM (the drain thread pushes binary frames)."""
+        with MGR.lock:
+            s = MGR.sessions.get(sid)
+        if s is None or not s.booted:
+            return self._send(404, "no such session")
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            return self._send(400, "expected websocket")
+        self.connection.sendall((
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {ws_accept(key)}\r\n\r\n"
+        ).encode())
+        self.close_connection = True
+        sock = self.connection
+        with s.audio_lock:
+            s.audio_clients.add(sock)
+        s.last_active = time.time()
+        try:
+            # We only push audio; block until the client closes (discard any
+            # frames it sends). recv returning b"" or erroring => gone.
+            while not s.closed:
+                if not sock.recv(4096):
+                    break
+        except OSError:
+            pass
+        finally:
+            with s.audio_lock:
+                s.audio_clients.discard(sock)
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def proxy_session(self, u):
         """Reverse-proxy /session/<sid>/<rest> (noVNC static files and the

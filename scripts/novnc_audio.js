@@ -16,13 +16,13 @@
     return new URLSearchParams(location.search).get("session") || "";
   }
 
-  var host = "audio.henryratterman.com";
-  var url = "wss://" + host + "/?session=" + encodeURIComponent(sessionId());
-  // Local dev fallback (page served over http on the bridge host directly).
-  if (location.protocol === "http:") {
-    url = "ws://" + location.hostname + ":6092/?session=" +
-      encodeURIComponent(sessionId());
-  }
+  // Same-origin audio: the session manager serves the PCM stream at
+  // /session/<id>/audio (it drains the QEMU FIFO in-process), so browser
+  // audio rides the same host/tunnel as the noVNC view — no separate
+  // audio.* ingress or bridge process.
+  var proto = location.protocol === "https:" ? "wss" : "ws";
+  var url = proto + "://" + location.host + "/session/" +
+    encodeURIComponent(sessionId()) + "/audio";
 
   var ctx = null, playHead = 0, muted = false, ws = null;
   var icon = makeIcon();

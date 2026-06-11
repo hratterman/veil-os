@@ -221,6 +221,17 @@ class Manager:
             except OSError:
                 # websockify absent (e.g. test box) — QEMU still serves VNC.
                 print("session: websockify not found; VNC only", flush=True)
+        # Wait for QEMU's VNC port to be ready before marking booted.
+        # Without this the browser arrives before QEMU has opened the port,
+        # websockify can't connect, and noVNC shows "failed to connect".
+        vnc_tcp = 5900 + s.vnc
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", vnc_tcp), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.25)
         s.booted = True
         s.last_active = time.time()
 
@@ -428,6 +439,8 @@ class DualStackServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         try:
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         except OSError:

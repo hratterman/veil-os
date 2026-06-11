@@ -12,6 +12,14 @@ cd "$(dirname "$0")/.."
 scripts/mkdisk.sh --no-user >/dev/null
 KERNEL=target/aarch64-unknown-none/debug/veil
 
+# Start the host HTTP proxy so the in-OS browser can reach the real internet
+# (the guest connects to it at the slirp gateway 10.0.2.2:7779). Skip if the
+# port is already held — e.g. the hosted-demo launchd agent or a prior run.
+if ! nc -z 127.0.0.1 7779 2>/dev/null; then
+    python3 -u scripts/veil_proxy.py >/tmp/veil-proxy.log 2>&1 &
+    echo "Started browser internet proxy (pid $!, log /tmp/veil-proxy.log)."
+fi
+
 echo "Veil OS is running — close the window to quit."
 
 exec qemu-system-aarch64 \

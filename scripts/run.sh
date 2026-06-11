@@ -58,7 +58,15 @@ if [ ! -d "$DIR/user-files" ]; then
 fi
 scripts/mkdisk.sh --no-user >/dev/null
 
-# 8. Boot
+# 8. Start the host HTTP proxy so the in-OS browser can reach the real
+#    internet (the guest connects to it at the slirp gateway 10.0.2.2:7779).
+#    Skip if the port is already held by a prior run.
+if ! nc -z 127.0.0.1 7779 2>/dev/null; then
+  python3 -u scripts/veil_proxy.py >/tmp/veil-proxy.log 2>&1 &
+  echo "Started browser internet proxy (pid $!, log /tmp/veil-proxy.log)."
+fi
+
+# 9. Boot
 echo ""
 echo "Booting Veil OS — close the window to quit."
 exec qemu-system-aarch64 \

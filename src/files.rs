@@ -45,13 +45,20 @@ impl FilesState {
         FilesState { files, sel: 0, scroll: 0 }
     }
 
-    fn clamp_scroll(&mut self, rows: usize) {
+    fn clamp_scroll(&mut self, page: usize) {
         if self.sel < self.scroll {
             self.scroll = self.sel;
-        } else if rows > 0 && self.sel >= self.scroll + rows {
-            self.scroll = self.sel + 1 - rows;
+        } else if page > 0 && self.sel >= self.scroll + page {
+            self.scroll = self.sel + 1 - page;
         }
     }
+}
+
+fn page_size(cw: usize, ch: usize) -> usize {
+    let rows = (ch / ROW_H).max(1);
+    let col_w = 4 + 48 + 4 + 12 * 8 + 8;
+    let cols = (cw / col_w).max(1);
+    rows * cols
 }
 
 fn tag(name: &str) -> &'static str {
@@ -77,41 +84,50 @@ pub fn render(win: &mut Window) {
         let App::Files(st) = &win.app else { return };
         (st.files.clone(), st.sel, st.scroll)
     };
-    let rows = ch / ROW_H;
+    let rows = (ch / ROW_H).max(1);
+    // Column width: tag (6 chars * 8px = 48) + space + up to 12 chars filename + padding.
+    let col_w = 4 + 48 + 4 + 12 * 8 + 8; // ~164px
+    let cols = (cw / col_w).max(1);
     let fb = win.canvas_fb();
     fb.clear(BG);
-    for r in 0..rows {
-        let i = scroll + r;
+    for slot in 0..(rows * cols) {
+        let i = scroll + slot;
         if i >= files.len() {
             break;
         }
-        let y = r * ROW_H;
+        let col = slot / rows;
+        let row = slot % rows;
+        let x = col * col_w;
+        let y = row * ROW_H;
         let selected = i == sel;
         if selected {
-            fb.fill_rect(0, y, cw, ROW_H, SEL_BG);
+            fb.fill_rect(x, y, col_w, ROW_H, SEL_BG);
         }
         let (tcol, ncol) = if selected { (SEL_TX, SEL_TX) } else { (TAG_COL, TEXT) };
-        fb.draw_string(4, y, tag(&files[i]), tcol, None);
-        fb.draw_string(4 + 6 * 8, y, &files[i], ncol, None);
+        fb.draw_string(x + 4, y, tag(&files[i]), tcol, None);
+        // Truncate filename to fit column.
+        let name = &files[i];
+        let max_chars = ((col_w - 4 - 48 - 4) / 8).min(name.len());
+        fb.draw_string(x + 4 + 48 + 4, y, &name[..max_chars], ncol, None);
     }
 }
 
 /// Keyboard: up/down move the selection, Enter opens it. Returns the action
 /// for the WM (it performs Open, since launching touches other windows).
 pub fn key(win: &mut Window, code: u16) -> Action {
-    let rows = win.ch / ROW_H;
+    let page = page_size(win.cw, win.ch);
     let App::Files(st) = &mut win.app else { return Action::None };
     match code {
         KEY_UP => {
             st.sel = st.sel.saturating_sub(1);
-            st.clamp_scroll(rows);
+            st.clamp_scroll(page);
             Action::Redraw
         }
         KEY_DOWN => {
             if st.sel + 1 < st.files.len() {
                 st.sel += 1;
             }
-            st.clamp_scroll(rows);
+            st.clamp_scroll(page);
             Action::Redraw
         }
         KEY_ENTER => match st.files.get(st.sel) {
@@ -123,12 +139,17 @@ pub fn key(win: &mut Window, code: u16) -> Action {
 }
 
 /// Click a row: select it and, if it's openable, dispatch it.
-pub fn click(win: &mut Window, _rx: isize, ry: isize) -> Action {
-    if ry < 0 {
+pub fn click(win: &mut Window, rx: isize, ry: isize) -> Action {
+    if ry < 0 || rx < 0 {
         return Action::None;
     }
+    let col_w = 4 + 48 + 4 + 12 * 8 + 8;
+    let rows = (win.ch / ROW_H).max(1);
+    let col = rx as usize / col_w;
+    let row = ry as usize / ROW_H;
     let App::Files(st) = &mut win.app else { return Action::None };
-    let i = st.scroll + ry as usize / ROW_H;
+    let slot = col * rows + row;
+    let i = st.scroll + slot;
     let Some(name) = st.files.get(i).cloned() else { return Action::None };
     st.sel = i;
     if openable(&name) {

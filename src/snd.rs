@@ -8,7 +8,7 @@
 //! 16-bit-stereo PCM as a ring of period buffers on the tx queue, refilling
 //! each as the device returns it, and STOP at the end.
 
-use crate::{dtb, frames, fs, kprintln, virtio};
+use crate::{dtb, frames, fs, kprintln, scheduler, virtio};
 use alloc::string::String;
 use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -285,6 +285,7 @@ pub fn play(pcm: &[u8]) -> usize {
             }
             None => {
                 dev.mmio.irq_ack(); // force a vCPU exit (see ctrl_cmd)
+                scheduler::yield_now(); // let the UI task run between buffer polls
                 spins += 1;
                 assert!(spins < 4_000_000_000, "virtio-sound tx hung");
             }

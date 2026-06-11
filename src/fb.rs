@@ -48,6 +48,26 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Alpha-blend a filled rect over the existing pixels. `alpha` is 0..=255
+    /// (0 = invisible, 255 = opaque). Used for the semi-transparent icon that
+    /// follows the cursor while a desktop icon is being dragged.
+    pub fn blend_rect(&self, x: usize, y: usize, w: usize, h: usize, color: u32, alpha: u32) {
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        let (cr, cg, cb) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+        let ia = 255 - alpha;
+        for row in y..y1 {
+            for col in x..x1 {
+                let p = unsafe { self.base.add(row * self.stride_px + col) };
+                let d = unsafe { p.read_volatile() };
+                let r = (cr * alpha + ((d >> 16) & 0xff) * ia) / 255;
+                let g = (cg * alpha + ((d >> 8) & 0xff) * ia) / 255;
+                let b = (cb * alpha + (d & 0xff) * ia) / 255;
+                unsafe { p.write_volatile(0xff00_0000 | (r << 16) | (g << 8) | b) };
+            }
+        }
+    }
+
     pub fn draw_line(&self, x0: isize, y0: isize, x1: isize, y1: isize, color: u32) {
         let (mut x, mut y) = (x0, y0);
         let dx = (x1 - x0).abs();

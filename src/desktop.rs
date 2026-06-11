@@ -60,6 +60,7 @@ pub fn run(screen: Framebuffer, fdt: &dtb::Fdt) {
             wm.chat_append(&String::from_utf8_lossy(&dgram));
         }
         wm.chat_poll(); // M26: pump the relay TCP connection
+        wm.icon_tick(); // M33: promote a held icon press to a drag at ~200 ms
         wm.clock_tick();
         if wm.dirty {
             wm.compose();

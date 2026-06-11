@@ -25,6 +25,15 @@ pub const TITLE_H: isize = 22;
 pub const TASKBAR_H: usize = 40;
 const CLOSE_W: isize = 18; // rightmost title-bar pixels = close hit zone
 
+// Desktop icon grid (shared by compose(), hit-testing, and drag drop-targets).
+const ICON_W: isize = 48;
+const ICON_SLOT: isize = 68; // 48 icon + 12 label + 8 gap
+const ICON_COL0_X: isize = 8;
+const ICON_COL1_X: isize = 76;
+const ICON_TOP: isize = 8;
+const ICON_HOLD_TICKS: u64 = 10; // 200 ms at the desktop's 50 Hz tick
+const ICONS_FILE: &str = "ICONS.TXT";
+
 const DESKTOP_BG: u32 = 0xff28_4858;
 const TASKBAR_BG: u32 = 0xff18_2028;
 const TASKBAR_BTN: u32 = 0xff30_4050;
@@ -59,6 +68,72 @@ fn launchers() -> Vec<(&'static str, &'static str)> {
         .copied()
         .filter(|(t, _)| *t != "chat" || netdev::available())
         .collect()
+}
+
+/// The `&'static` app name for `name`, if it is a real launcher.
+fn launcher_name(name: &str) -> Option<&'static str> {
+    LAUNCHERS.iter().find(|(a, _)| *a == name).map(|(a, _)| *a)
+}
+
+fn icon_label(app: &str) -> &'static str {
+    LAUNCHERS.iter().find(|(a, _)| *a == app).map(|(_, l)| *l).unwrap_or("?")
+}
+
+/// An app keeps its colour when reordered (colour follows the app, not the
+/// slot), so look it up by the app's original index in LAUNCHERS.
+fn icon_color(app: &str) -> u32 {
+    LAUNCHERS
+        .iter()
+        .position(|(a, _)| *a == app)
+        .map(|i| ICON_COLORS[i])
+        .unwrap_or(0xff808080)
+}
+
+/// Top-left pixel of the icon at display slot `i`, given the column-0 count.
+fn icon_slot_xy(i: usize, col0_count: usize) -> (isize, isize) {
+    let (col_x, row) = if i < col0_count {
+        (ICON_COL0_X, i as isize)
+    } else {
+        (ICON_COL1_X, (i - col0_count) as isize)
+    };
+    (col_x, ICON_TOP + row * ICON_SLOT)
+}
+
+/// Build the desktop icon order: the saved order from ICONS.TXT (filtered to
+/// apps that actually exist in this boot's launcher set), then any launchers
+/// not in the saved order appended in default order. Absent/empty file = the
+/// plain default order.
+fn load_icon_order() -> Vec<&'static str> {
+    let valid: Vec<&'static str> = launchers().iter().map(|(a, _)| *a).collect();
+    let mut order: Vec<&'static str> = Vec::new();
+    if crate::fs::mounted() {
+        if let Some(bytes) = crate::fs::read_file(ICONS_FILE) {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                let name = line.trim();
+                if let Some(app) = launcher_name(name) {
+                    if valid.contains(&app) && !order.contains(&app) {
+                        order.push(app);
+                    }
+                }
+            }
+        }
+    }
+    for app in valid {
+        if !order.contains(&app) {
+            order.push(app);
+        }
+    }
+    // Log the resolved order so a reboot test can confirm persistence.
+    let mut joined = String::new();
+    for (i, a) in order.iter().enumerate() {
+        if i > 0 {
+            joined.push(' ');
+        }
+        joined.push_str(a);
+    }
+    kprintln!("ICONS: order = {joined}");
+    order
 }
 const FRAME_COLOR: u32 = 0xff10_1418;
 const TITLE_FOCUSED: u32 = 0xff30_60c0;
@@ -194,6 +269,9 @@ pub struct Wm {
     shift: bool,
     abs_max: (u32, u32),
     pub dirty: bool,
+    icon_order: Vec<&'static str>,     // desktop icon display order
+    icon_press: Option<(usize, u64)>,  // (order slot, press tick) — pending tap/hold
+    icon_drag: Option<usize>,          // order slot currently being dragged
 }
 
 impl Wm {
@@ -213,6 +291,9 @@ impl Wm {
             shift: false,
             abs_max,
             dirty: true,
+            icon_order: load_icon_order(),
+            icon_press: None,
+            icon_drag: None,
         }
     }
 
@@ -609,6 +690,9 @@ impl Wm {
                 win.x = self.mx - ox;
                 let max_y = self.screen.height as isize - TASKBAR_H as isize - win.frame_h();
                 win.y = (self.my - oy).min(max_y);
+            } else if self.icon_drag.is_some() {
+                // The floating icon follows the cursor; just need a recompose
+                // (dirty already set above).
             } else if self.buttons & 1 != 0 {
                 self.forward_mouse_move();
             }
@@ -720,10 +804,11 @@ impl Wm {
                 }
             }
             None => {
-                // Bare desktop: maybe an icon launch.
-                if let Some(app) = self.icon_at(self.mx, self.my) {
-                    kprintln!("WM: icon -> '{app}'");
-                    self.launch(app);
+                // Bare desktop: arm a tap/hold on the icon under the cursor.
+                // A quick release launches it (on_left_up); holding ~200ms
+                // promotes to a drag (icon_tick).
+                if let Some(slot) = self.icon_slot_at(self.mx, self.my) {
+                    self.icon_press = Some((slot, timer::ticks()));
                 }
             }
         }
@@ -741,36 +826,68 @@ impl Wm {
         }
     }
 
-    /// Desktop icon hit test (two-column grid, matching compose()).
-    fn icon_at(&self, px: isize, py: isize) -> Option<&'static str> {
-        const ICON_W: isize = 48;
-        const ICON_SLOT: isize = 68;
-        const COL0_X: isize = 8;
-        const COL1_X: isize = 76;
-        let items = launchers();
-        let col0_count = ((items.len() + 1) / 2) as isize;
-        // Check column 0
-        if px >= COL0_X && px < COL0_X + ICON_W {
-            let row = (py - 8) / ICON_SLOT;
-            if row >= 0 && (py - 8) % ICON_SLOT < ICON_W {
-                let i = row as usize;
-                if i < col0_count as usize {
-                    return items.get(i).map(|(app, _)| *app);
-                }
-            }
-        }
-        // Check column 1
-        if px >= COL1_X && px < COL1_X + ICON_W {
-            let row = (py - 8) / ICON_SLOT;
-            if row >= 0 && (py - 8) % ICON_SLOT < ICON_W {
-                let i = col0_count as usize + row as usize;
-                return items.get(i).map(|(app, _)| *app);
+    /// Which icon slot (index into `icon_order`) a point lands on, if any —
+    /// the exact-hit test used to start a tap/hold.
+    fn icon_slot_at(&self, px: isize, py: isize) -> Option<usize> {
+        let n = self.icon_order.len();
+        let col0 = n.div_ceil(2);
+        for i in 0..n {
+            let (x, y) = icon_slot_xy(i, col0);
+            if px >= x && px < x + ICON_W && py >= y && py < y + ICON_W {
+                return Some(i);
             }
         }
         None
     }
 
+    /// The nearest slot to drop a dragged icon onto (clamped to the grid).
+    fn icon_drop_target(&self, px: isize, py: isize) -> usize {
+        let n = self.icon_order.len();
+        let col0 = n.div_ceil(2);
+        // Column split at the midpoint of the gap between the two columns.
+        let col0_hit = px < (ICON_COL0_X + ICON_COL1_X + ICON_W) / 2;
+        let row = ((py - ICON_TOP).max(0) / ICON_SLOT) as usize;
+        let idx = if col0_hit { row.min(col0.saturating_sub(1)) } else { col0 + row };
+        idx.min(n.saturating_sub(1))
+    }
+
+    /// Persist the current icon order, one app name per line.
+    fn save_icon_order(&self) {
+        if !crate::fs::mounted() {
+            return;
+        }
+        let mut s = String::new();
+        for app in &self.icon_order {
+            s.push_str(app);
+            s.push('\n');
+        }
+        let _ = crate::fs::write_file(ICONS_FILE, s.as_bytes());
+    }
+
     fn on_left_up(&mut self) {
+        // Complete an icon drag: reorder, persist, DRAG_OK.
+        if let Some(from) = self.icon_drag.take() {
+            self.icon_press = None;
+            if from < self.icon_order.len() {
+                let target = self.icon_drop_target(self.mx, self.my);
+                let app = self.icon_order.remove(from);
+                let target = target.min(self.icon_order.len());
+                self.icon_order.insert(target, app);
+                self.save_icon_order();
+                kprintln!("WM: icon '{app}' dropped at slot {target}");
+                kprintln!("DRAG_OK");
+            }
+            self.dirty = true;
+            return;
+        }
+        // A quick tap on an icon (no hold-to-drag) launches it.
+        if let Some((slot, _)) = self.icon_press.take() {
+            if let Some(app) = self.icon_order.get(slot).copied() {
+                kprintln!("WM: icon -> '{app}'");
+                self.launch(app);
+            }
+            return;
+        }
         if let Some((idx, _, _)) = self.drag.take() {
             let win = &self.windows[idx];
             kprintln!("WM: '{}' moved to ({}, {})", win.title, win.x, win.y);
@@ -788,6 +905,24 @@ impl Wm {
                 let ry = self.my - win.y - BORDER - TITLE_H;
                 paint_mouse_move(win, rx, ry);
                 self.dirty = true;
+            }
+        }
+    }
+
+    /// Promote a held icon press to a drag once the button has been down on it
+    /// for ~200 ms (distinguishing a hold-to-drag from a tap-to-launch). Called
+    /// each desktop-loop iteration; works even with no motion events since the
+    /// 50 Hz tick keeps waking the loop.
+    pub fn icon_tick(&mut self) {
+        if self.icon_drag.is_some() {
+            return;
+        }
+        if let Some((slot, t0)) = self.icon_press {
+            if self.buttons & 1 != 0 && timer::ticks().saturating_sub(t0) >= ICON_HOLD_TICKS {
+                self.icon_drag = Some(slot);
+                self.dirty = true;
+                let app = self.icon_order.get(slot).copied().unwrap_or("?");
+                kprintln!("WM: icon drag start '{app}'");
             }
         }
     }
@@ -817,21 +952,22 @@ impl Wm {
             unsafe { Framebuffer::new(self.back.as_mut_ptr(), w, h, w * 4) };
         back.clear(DESKTOP_BG);
 
-        // Desktop icons: two-column grid so all apps fit without clipping.
-        // Col 0: x=8, Col 1: x=76. Each slot is 68px (48 icon + 12 label + 8 gap).
-        const ICON_W: usize = 48;
-        const ICON_SLOT: usize = 68;
-        const COL0_X: usize = 8;
-        const COL1_X: usize = 76;
-        let apps = launchers();
-        let col0_count = (apps.len() + 1) / 2;
-        for (i, (_, label)) in apps.iter().enumerate() {
-            let (col_x, row) = if i < col0_count { (COL0_X, i) } else { (COL1_X, i - col0_count) };
-            let top = 8 + row * ICON_SLOT;
-            back.fill_rect(col_x, top, ICON_W, ICON_W, ICON_COLORS[i]);
-            back.draw_char_scaled(col_x + 16, top + 8, label.as_bytes()[0], 0xffff_ffff, 2);
-            let lx = col_x + ICON_W / 2 - label.len() * 4;
-            back.draw_string(lx, top + 50, label, 0xffd0_dce8, None);
+        // Desktop icons: two-column grid in the user-defined order. Each slot
+        // is 68px (48 icon + 12 label + 8 gap). The icon being dragged is drawn
+        // floating at the cursor (below), not in its home slot.
+        let iw = ICON_W as usize;
+        let col0_count = self.icon_order.len().div_ceil(2);
+        for (i, app) in self.icon_order.iter().enumerate() {
+            if self.icon_drag == Some(i) {
+                continue;
+            }
+            let (cx, cy) = icon_slot_xy(i, col0_count);
+            let (cx, cy) = (cx as usize, cy as usize);
+            let label = icon_label(app);
+            back.fill_rect(cx, cy, iw, iw, icon_color(app));
+            back.draw_char_scaled(cx + 16, cy + 8, label.as_bytes()[0], 0xffff_ffff, 2);
+            let lx = cx + iw / 2 - label.len() * 4;
+            back.draw_string(lx, cy + 50, label, 0xffd0_dce8, None);
         }
 
         let top = self.windows.len().saturating_sub(1);
@@ -888,6 +1024,17 @@ impl Wm {
         // with the number of launchers so they never overlap).
         let sx = 70 + launchers().len() * 78 + 16;
         back.draw_string(sx, ty + 12, "Veil OS", 0xff60_7888, None);
+
+        // The dragged icon floats semi-transparent under the cursor.
+        if let Some(slot) = self.icon_drag {
+            if let Some(app) = self.icon_order.get(slot) {
+                let iw = ICON_W as usize;
+                let fx = (self.mx - ICON_W / 2).max(0) as usize;
+                let fy = (self.my - ICON_W / 2).max(0) as usize;
+                back.blend_rect(fx, fy, iw, iw, icon_color(app), 150);
+                back.draw_char_scaled(fx + 16, fy + 8, icon_label(app).as_bytes()[0], 0xffff_ffff, 2);
+            }
+        }
 
         // Cursor, always on top.
         for (row, line) in CURSOR.iter().enumerate() {

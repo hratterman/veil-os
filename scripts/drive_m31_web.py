@@ -5,7 +5,7 @@ by clicking their nav links, and require each to render."""
 import re
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 # Browser is taskbar idx 2 (NIC present): x = 70 + 2*78 + 36 = 262.
 BROWSER_BTN = (70 + 2 * 78 + 36, 768 - 20)
@@ -42,7 +42,7 @@ def goto(d, href):
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     mark = len(d.serial())
-    d.click(*BROWSER_BTN)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, mark))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
 

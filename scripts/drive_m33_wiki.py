@@ -1,12 +1,12 @@
 import sys, re, time
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 CONTENT_X = 512; PAGE_Y = 54 + 20
 def boxes(s, kind):
     return [(m[0], int(m[1]), int(m[2]), int(m[3]), int(m[4]))
             for m in re.findall(rf"BROWSER: {kind} '([^']+)' at \((-?\d+), (-?\d+)\) (\d+)x(\d+)", s)]
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
-    m = len(d.serial()); d.click(262, 768 - 20)
+    m = len(d.serial()); d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
     m = len(d.serial())

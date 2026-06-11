@@ -3,14 +3,14 @@
 look (no-NIC taskbar: edit=106, clock=184, snake=886)."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
-    for btn in [(106, 748), (184, 748), (886, 748)]:  # editor, clock, snake
-        d.click(*btn)
+    for app in ["edit", "clock", "snake"]:
+        d.click(*taskbar_xy(d, app))
     d.move(1000, 700)
     img = d.dump("m35_gui")
     # The title bars must NOT be the old chunky blue (~rgb(48,96,192)).

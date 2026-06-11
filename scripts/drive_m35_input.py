@@ -6,7 +6,7 @@
 """
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 # Browser window at (510,30), BORDER 2, TITLE_H 22 -> content origin (512,54),
 # then a 20px address bar; the page starts at y=74.
@@ -50,7 +50,7 @@ def press(d, key):
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     m = len(d.serial())
-    d.click(262, 768 - 20)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
 

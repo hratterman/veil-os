@@ -10,7 +10,7 @@ No NIC -> Files is taskbar idx 7: x = 70 + 7*78 + 36 = 652.
 import re
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 FILES_BTN = (652, 768 - 20)
 WIN_X, WIN_Y = 120, 60
@@ -68,7 +68,7 @@ def main():
     check("desktop up", d.wait_serial("WM_OK", 60))
 
     mark = len(d.serial())
-    d.click(*FILES_BTN)
+    d.click(*taskbar_xy(d, "files"))
     check("files window open", d.wait_serial("FILES: window open", 8, mark))
 
     listing = files_listing(d)

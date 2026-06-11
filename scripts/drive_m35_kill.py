@@ -4,7 +4,7 @@ confirm the lisp REPL keeps running (still evaluates). NIC taskbar indices:
 browser 2 (262), shell 4 (418), lisp 10 (886)."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 LISP_BTN = (886, 748)
 BROWSER_BTN = (262, 748)
@@ -32,14 +32,14 @@ def main():
     check("WM_OK on serial", "WM_OK" in d.serial())
 
     m = len(d.serial())
-    d.click(*LISP_BTN)
+    d.click(*taskbar_xy(d, "lisp"))
     check("lisp launched", d.wait_serial("WM: launch 'lisp'", 5, m))
     m = len(d.serial())
-    d.click(*BROWSER_BTN)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
     m = len(d.serial())
-    d.click(*SHELL_BTN)
+    d.click(*taskbar_xy(d, "shell"))
     check("shell launched", d.wait_serial("WM: launch 'shell'", 5, m))
 
     # Kill the browser from the shell.

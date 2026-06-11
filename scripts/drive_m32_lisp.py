@@ -1,5 +1,5 @@
 import sys, time
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 LISP_BTN=(70+9*78+36, 768-20)
 SHIFTED={'(' :'9',')':'0','*':'8','+':'equal','?':'slash'}
 BASE={' ':'spc','-':'minus','=':'equal'}
@@ -21,7 +21,7 @@ def typ(d,s):
     k(d,"ret")
 def main():
     d=Driver(sys.argv[1],sys.argv[2],sys.argv[3])
-    m=len(d.serial()); d.click(*LISP_BTN)
+    m=len(d.serial()); d.click(*taskbar_xy(d, "lisp"))
     check("lisp launched", d.wait_serial("LISP: window open",5,m))
     check("LISP_OK", d.wait_serial("LISP_OK",8,m))
     typ(d,"(* 6 7)"); time.sleep(0.2)

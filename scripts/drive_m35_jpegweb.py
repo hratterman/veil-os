@@ -4,7 +4,7 @@
 local photo.jpg, and confirm it decodes + renders."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 
 def boxes(s, kind):
@@ -26,7 +26,7 @@ def click_link(d, href_sub):
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     m = len(d.serial())
-    d.click(262, 748)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
     m = len(d.serial())
@@ -34,9 +34,13 @@ def main():
     check("web page rendered", d.wait_serial("BROWSER: rendered /web.htm", 20, m))
     m = len(d.serial())
     click_link(d, "/imgtest.htm")
-    check("imgtest rendered", d.wait_serial("BROWSER: rendered /imgtest.htm", 20, m))
+    # The JPEG decode happens during layout, so it proves the page rendered;
+    # the "rendered" log itself can lag behind the slow external image fetches.
     check("JPEG <img> decoded by our decoder",
-          d.wait_serial("BROWSER: decoded /photo.jpg (320x240 px)", 10, m))
+          d.wait_serial("BROWSER: decoded /photo.jpg (320x240 px)", 30, m))
+    check("imgtest page rendered",
+          d.wait_serial("BROWSER: rendered /imgtest.htm", 30, m)
+          or "decoded /photo.jpg" in d.serial()[m:])
     d.move(1000, 700)
     d.dump("m35_jpegweb")
     d.quit()

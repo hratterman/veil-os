@@ -4,7 +4,7 @@ The browser fetches it over the kernel's own TCP/IP stack (DIRECT_HTTP_OK), not
 the host proxy. Browser is taskbar idx 2 (x=262); address bar at content y~62."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 BROWSER_BTN = (262, 748)
 CONTENT_X, CONTENT_Y = 512, 54
@@ -32,7 +32,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
     m = len(d.serial())
-    d.click(*BROWSER_BTN)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
 

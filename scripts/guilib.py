@@ -118,6 +118,21 @@ class Image:
         return (self.px[i], self.px[i + 1], self.px[i + 2])
 
 
+def taskbar_xy(d, app):
+    """Centre (x, y) of the taskbar pill for `app`, read from the TASKBAR_PILL
+    serial log. Pill positions are dynamic (compressed to fit), so drivers must
+    never hardcode them."""
+    import re
+    x = w = None
+    for line in d.serial().splitlines():
+        m = re.match(rf"TASKBAR_PILL: {re.escape(app)} (\d+) (\d+)\s*$", line)
+        if m:
+            x, w = int(m.group(1)), int(m.group(2))
+    if x is None:
+        return None
+    return (x + w // 2, 752)
+
+
 def check(label, ok, detail=""):
     print(f"{'ok  ' if ok else 'FAIL'} {label}{': ' + detail if detail else ''}")
     if not ok:

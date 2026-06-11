@@ -5,7 +5,7 @@ Space freezes it."""
 import sys
 import time
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 # GIF is launcher idx 8 without a NIC (chat filtered):
 # edit,clock,browser,paint,shell,viewer,audio,files,gif -> x=70+8*78+36=730.
@@ -29,7 +29,7 @@ def region(img):
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     mark = len(d.serial())
-    d.click(*GIF_BTN)
+    d.click(*taskbar_xy(d, "gif"))
     check("gif launched", d.wait_serial("WM: launch 'gif'", 5, mark))
     check("GIF_OK on serial", d.wait_serial("GIF_OK", 5, mark))
     check("demo decoded 64x64 / 12 frames",

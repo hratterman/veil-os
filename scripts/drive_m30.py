@@ -10,7 +10,7 @@ x = 70 + 8*78 + 36 = 730.
 import re
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 FILES_BTN = (730, 768 - 20)
 CONTENT_X = 120 + 2
@@ -73,7 +73,7 @@ def main():
     check("desktop reached", d.wait_serial("WM_OK", 20))
 
     mark = len(d.serial())
-    d.click(*FILES_BTN)
+    d.click(*taskbar_xy(d, "files"))
     check("files window open", d.wait_serial("FILES: window open", 8, mark))
 
     names = listing(d)

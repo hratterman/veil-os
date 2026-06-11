@@ -5,7 +5,7 @@ manager window (120,60), content origin (122,84), rows 14px, col width 164."""
 import re
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 FILES_BTN = (652, 748)
 CONTENT_X, CONTENT_Y = 122, 84
@@ -25,7 +25,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
     m = len(d.serial())
-    d.click(*FILES_BTN)
+    d.click(*taskbar_xy(d, "files"))
     check("file manager launched", d.wait_serial("WM: launch 'files'", 5, m))
     check("files listed", d.wait_serial("FILES[0]:", 4, m))
 

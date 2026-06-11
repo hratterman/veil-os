@@ -4,7 +4,7 @@ open COMPUTE.WSM -> a JIT-compiled compute kernel runs. No-NIC: files idx 7."""
 import re
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 FILES_BTN = (652, 748)
 CONTENT_X, CONTENT_Y = 122, 84
@@ -30,7 +30,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
     m = len(d.serial())
-    d.click(*FILES_BTN)
+    d.click(*taskbar_xy(d, "files"))
     check("file manager launched", d.wait_serial("WM: launch 'files'", 5, m))
     check("files listed", d.wait_serial("FILES[0]:", 4, m))
 
@@ -45,7 +45,7 @@ def main():
 
     # compute WASM: JIT-compiled kernel runs. Re-raise the file manager first
     # (the hello window overlaps the list).
-    d.click(*FILES_BTN)
+    d.click(*taskbar_xy(d, "files"))
     m = len(d.serial())
     check("COMPUTE.WSM present", open_file(d, "COMPUTE.WSM"))
     check("compute wasm JIT ran",

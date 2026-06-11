@@ -1,5 +1,5 @@
 import sys, time
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 LISP_BTN = (70 + 9 * 78 + 36, 768 - 20)   # no-NIC taskbar: lisp idx 9
 CLOSE = (620, 82)                          # rightmost title-bar X of the Lisp win
 SHIFTED = {'(': '9', ')': '0', '*': '8', '+': 'equal', '?': 'slash'}
@@ -23,7 +23,7 @@ def typ(d, s):
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     # 1. Launch Lisp, define a variable.
-    m = len(d.serial()); d.click(*LISP_BTN)
+    m = len(d.serial()); d.click(*taskbar_xy(d, "lisp"))
     check("lisp launched", d.wait_serial("LISP: window open", 5, m))
     m = len(d.serial()); typ(d, "(define wibble 1234)")
     check("define evaluated", d.wait_serial("LISP_EVAL: (define wibble 1234) => wibble", 5, m))
@@ -33,7 +33,7 @@ def main():
     check("window closed", d.wait_serial("WM: closed 'lisp'", 5, m))
     time.sleep(0.2)
     # 3. Reopen — a fresh LispState that must restore from LISP.TXT.
-    m = len(d.serial()); d.click(*LISP_BTN)
+    m = len(d.serial()); d.click(*taskbar_xy(d, "lisp"))
     check("lisp relaunched", d.wait_serial("LISP: window open", 5, m))
     check("env restored from LISP.TXT", d.wait_serial("LISP: restored", 5, m))
     # 4. The variable must still be bound.

@@ -14,7 +14,7 @@ x = 70 + 5*78 + 36 = 496.
 """
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 VIEWER_BTN = (496, 768 - 20)
 WIN_X, WIN_Y, CW, CH = 220, 80, 560, 460
@@ -47,7 +47,7 @@ def main():
     check("VIEWER_OK on serial", "VIEWER_OK" in d.serial())
 
     mark = len(d.serial())
-    d.click(*VIEWER_BTN)
+    d.click(*taskbar_xy(d, "viewer"))
     check("viewer launched", d.wait_serial("WM: launch 'viewer'", 5, mark))
     check("first image is CHECK.PNG", d.wait_serial("VIEWER: showing CHECK.PNG 128x128", 5, mark))
 

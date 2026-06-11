@@ -4,7 +4,7 @@ games over, and saves the high score to SNAKE.TXT. No-NIC taskbar: snake is
 idx 10 -> x = 70 + 10*78 + 36 = 886."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 SNAKE_BTN = (886, 748)
 
@@ -13,7 +13,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
     m = len(d.serial())
-    d.click(*SNAKE_BTN)
+    d.click(*taskbar_xy(d, "snake"))
     check("snake launched", d.wait_serial("WM: launch 'snake'", 5, m))
     check("new game started", d.wait_serial("SNAKE: new game", 4, m))
 

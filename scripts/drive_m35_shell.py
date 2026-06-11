@@ -3,7 +3,7 @@
 Shell launcher is index 4 with no NIC: x = 70 + 4*78 + 36 = 418."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 SHELL_BTN = (418, 768 - 20)
 
@@ -36,7 +36,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
     m = len(d.serial())
-    d.click(*SHELL_BTN)
+    d.click(*taskbar_xy(d, "shell"))
     check("shell launched", d.wait_serial("WM: launch 'shell'", 5, m))
 
     m = run(d, "ls")

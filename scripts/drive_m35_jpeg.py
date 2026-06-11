@@ -4,7 +4,7 @@ Open the viewer, step to a .JPG, confirm the window shows real photo content
 (many distinct colours), and screenshot it."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 VIEWER_BTN = (496, 768 - 20)
 WIN_X, WIN_Y, CW, CH = 220, 80, 560, 460
@@ -24,7 +24,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("VIEWER_OK on serial", "VIEWER_OK" in d.serial())
     mark = len(d.serial())
-    d.click(*VIEWER_BTN)
+    d.click(*taskbar_xy(d, "viewer"))
     check("viewer launched", d.wait_serial("WM: launch 'viewer'", 5, mark))
 
     # Step right until the viewer reports showing a .JPG file.

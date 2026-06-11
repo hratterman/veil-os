@@ -1,10 +1,10 @@
 import sys, time
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 def key(d,qc):
     for dn in (True,False): d.send([{"type":"key","data":{"down":dn,"key":{"type":"qcode","data":qc}}}])
 def main():
     d=Driver(sys.argv[1],sys.argv[2],sys.argv[3])
-    m=len(d.serial()); d.click(262,768-20)
+    m=len(d.serial()); d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'",5,m))
     check("index rendered (tall page)", d.wait_serial("BROWSER: rendered / -",40))
     # keyboard scroll -> SCROLL_OK

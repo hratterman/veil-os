@@ -13,7 +13,7 @@ navtest.htm exercises, deterministically over loopback (no live network):
 """
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 CONTENT_X = 512
 PAGE_Y = 54 + 20
@@ -38,7 +38,7 @@ def click_link(d, href_sub):
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     m = len(d.serial())
-    d.click(262, 768 - 20)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
     m = len(d.serial())

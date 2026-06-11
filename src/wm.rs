@@ -131,6 +131,23 @@ fn ui_centered(fb: &Framebuffer, cx: usize, y: usize, s: &str, font: &font::Bitm
     fb.draw_bm_string(cx.saturating_sub(w / 2), y, s, font, color);
 }
 
+/// Truncate `s` so it fits in `max_w` pixels in `font` (for narrow pills).
+fn fit_label(s: &str, max_w: usize, font: &font::BitmapFont) -> String {
+    if font::text_width(font, s) <= max_w {
+        return String::from(s);
+    }
+    let mut out = String::new();
+    for ch in s.chars() {
+        let mut trial = out.clone();
+        trial.push(ch);
+        if font::text_width(font, &trial) > max_w {
+            break;
+        }
+        out = trial;
+    }
+    out
+}
+
 /// Blend colour `a` toward `b` by `t`/255.
 fn blend(a: u32, b: u32, t: u32) -> u32 {
     let ch = |sh: u32| {
@@ -1091,15 +1108,40 @@ impl Wm {
         }
     }
 
+    /// Pill geometry for the taskbar: (app, label, x, width). Pill widths are
+    /// the label width + padding, compressed proportionally if the row would
+    /// otherwise overrun the clock — so any number of apps fits the screen.
+    /// Render and hit-test both call this so they can never disagree.
+    fn taskbar_layout(&self) -> Vec<(&'static str, &'static str, usize, usize)> {
+        let sw = self.screen.width;
+        let apps = launchers();
+        if apps.is_empty() {
+            return Vec::new();
+        }
+        const START: usize = 58; // just past the VEIL wordmark
+        const CLOCK_SPACE: usize = 60; // reserve room for the clock on the right
+        const GAP: usize = 4;
+        let small = font::ui_small();
+        let nat: Vec<usize> = apps.iter().map(|(_, l)| font::text_width(small, l) + 16).collect();
+        let total: usize = nat.iter().sum();
+        let avail = sw.saturating_sub(START + CLOCK_SPACE + GAP * apps.len());
+        let mut out = Vec::with_capacity(apps.len());
+        let mut x = START;
+        for (i, (app, label)) in apps.iter().enumerate() {
+            let wdt = if total > avail && total > 0 { (nat[i] * avail / total).max(14) } else { nat[i] };
+            out.push((*app, *label, x, wdt));
+            x += wdt + GAP;
+        }
+        out
+    }
+
     fn taskbar_click(&mut self, px: isize) {
-        let mut x = 70isize;
-        for (app, _) in launchers() {
-            if px >= x && px < x + 72 {
+        for (app, _, x, wdt) in self.taskbar_layout() {
+            if px >= x as isize && px < (x + wdt) as isize {
                 kprintln!("WM: taskbar -> '{app}'");
                 self.launch(app);
                 return;
             }
-            x += 78;
         }
     }
 
@@ -1322,27 +1364,31 @@ impl Wm {
         }
 
         // Taskbar: a slim dark strip with pill launchers, a wordmark, a clock.
+        // Pill widths are dynamic + compressed so any number of apps fits.
         let ty = h - TASKBAR_H;
         back.fill_rect(0, ty, w, TASKBAR_H, 0xff111111);
         back.fill_rect(0, ty, w, 1, 0xff262626); // hairline top edge
         ui_text(&back, 12, ty + 7, "VEIL", font::ui_bold(), ACCENT);
-        let mut bx = 70usize;
-        for (app, label) in launchers() {
-            // Keep the 70/+78 layout (hit-test compatible); draw a pill inside it.
-            let open = self.windows.iter().any(|w| w.title == app);
+        let layout = self.taskbar_layout();
+        if !TASKBAR_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            for (app, _, x, pw) in &layout {
+                kprintln!("TASKBAR_PILL: {app} {x} {pw}");
+            }
+        }
+        for (app, label, x, pw) in &layout {
+            let open = self.windows.iter().any(|win| win.title == *app);
             let (pill, txt) = if open {
                 (blend(0xff111111, ACCENT, 70), ACCENT)
             } else {
                 (0xff1e1e1e, 0xff8a8a8a)
             };
-            back.fill_round_rect(bx, ty + 5, 72, TASKBAR_H - 10, 7, pill);
-            ui_centered(&back, bx + 36, ty + 7, label, font::ui_small(), txt);
-            bx += 78;
+            back.fill_round_rect(*x, ty + 5, *pw, TASKBAR_H - 10, 7, pill);
+            ui_centered(&back, x + pw / 2, ty + 7, &fit_label(label, pw.saturating_sub(6), font::ui_small()), font::ui_small(), txt);
         }
         // Clock on the far right.
         let clk = clock_string();
         let cw_px = font::text_width(font::ui_small(), &clk);
-        back.draw_bm_string(w - cw_px - 14, ty + 7, &clk, font::ui_small(), 0xffb0b0b0);
+        back.draw_bm_string(w - cw_px - 12, ty + 7, &clk, font::ui_small(), 0xffb0b0b0);
 
         // The dragged icon floats semi-transparent under the cursor.
         if let Some(slot) = self.icon_drag {
@@ -1696,6 +1742,7 @@ const PANEL_BG: u32 = 0xffe8_e6e0;
 const PANEL_TEXT: u32 = 0xff30_3840;
 const PANEL_SEL: u32 = 0xffc0_7850; // highlighted DM target
 const PANEL_DOT: u32 = 0xff40_b060; // online indicator
+static TASKBAR_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static CHAT_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DM_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 

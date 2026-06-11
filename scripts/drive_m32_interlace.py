@@ -1,5 +1,5 @@
 import sys, re, time
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 VIEWER_BTN=(70+5*78+36, 768-20)  # no NIC: viewer idx5
 CX,CY,CW,CH=222,104,560,460
 def key(d,qc):
@@ -17,7 +17,7 @@ def goto(d,name):
     return False
 def main():
     d=Driver(sys.argv[1],sys.argv[2],sys.argv[3])
-    m=len(d.serial()); d.click(*VIEWER_BTN)
+    m=len(d.serial()); d.click(*taskbar_xy(d, "viewer"))
     check("viewer launched", d.wait_serial("WM: launch 'viewer'",5,m))
     check("first decode", d.wait_serial("VIEWER: showing ",5,m))
     check("plain GRAD.PNG decodes", goto(d,"GRAD.PNG"))

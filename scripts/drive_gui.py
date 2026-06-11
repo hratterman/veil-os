@@ -131,17 +131,24 @@ def check_px(img, label, x, y, want, invert=False):
     check(label, ok, f"@({x},{y}) got rgb{got}, want {rel} rgb{want}")
 
 
-# Taskbar launcher buttons (UX overhaul): x = 70 + idx*78 + 36, bottom strip.
-def taskbar(idx):
-    return (70 + idx * 78 + 36, H - 20)
+# Taskbar pills now have dynamic widths; read each pill's position from the
+# TASKBAR_PILL serial log instead of hardcoding x = 70 + idx*78.
+def taskbar_xy(d, app):
+    import re
+    x = w = None
+    for line in d.serial().splitlines():
+        mm = re.match(rf"TASKBAR_PILL: {re.escape(app)} (\d+) (\d+)\s*$", line)
+        if mm:
+            x, w = int(mm.group(1)), int(mm.group(2))
+    return None if x is None else (x + w // 2, 752)
 
-EDITOR_BTN, CLOCK_BTN, PAINT_BTN = taskbar(0), taskbar(1), taskbar(3)
+
 PARK = (990, 620)  # empty desktop corner: park the cursor clear of snapshots
 
 
-def launch(d, app, btn):
+def launch(d, app, btn=None):
     mark = len(d.serial())
-    d.click(*btn)
+    d.click(*taskbar_xy(d, app))
     check(f"{app} launched", f"WM: launch '{app}'" in d.serial()[mark:]
           or wait_line(d, f"WM: launch '{app}'", mark))
 
@@ -164,7 +171,7 @@ def main():
         check(f"serial sentinel {sentinel}", sentinel in d.serial())
 
     print("--- M6: launch editor, keyboard echo + cursor + click -------")
-    launch(d, "edit", EDITOR_BTN)        # editor at (40, 40, 420, 300)
+    launch(d, "edit")        # editor at (40, 40, 420, 300)
     d.click(150, 150)                    # focus + a click at exact coords
     d.type_text("veil")
     d.move(700, 500)                     # park cursor over the desktop
@@ -185,7 +192,7 @@ def main():
     check_px(img, "editor title focused", 200, 52, T_FOCUS)
 
     print("--- M7: second window, drag, focus, z-order -----------------")
-    launch(d, "clock", CLOCK_BTN)        # clock at (700, 36, 260, 260), now on top
+    launch(d, "clock")        # clock at (700, 36, 260, 260), now on top
     img = d.dump("m7_two")
     check_px(img, "clock (newly launched) title focused", 760, 48, T_FOCUS)
     check_px(img, "editor title unfocused under clock", 200, 52, T_UNFOCUS)
@@ -208,7 +215,7 @@ def main():
              300, 195, WHITE)
 
     print("--- M8: launch paint, strokes, persistence, clear -----------")
-    launch(d, "paint", PAINT_BTN)        # paint clamps to (480, 322), content (482,346)
+    launch(d, "paint")        # paint clamps to (480, 322), content (482,346)
     d.click(526, 360)                    # palette: red (idx 1)
     d.drag(550, 442, 750, 492, steps=6)
     d.click(786, 360)                    # brush: large (idx 2)

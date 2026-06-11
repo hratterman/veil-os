@@ -4,7 +4,7 @@ the shell and Ctrl+V pastes it; Alt+Tab cycles windows. With a NIC: browser is
 taskbar idx 2 (x=262), shell idx 4 (x=418)."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 BROWSER_BTN = (262, 748)
 SHELL_BTN = (418, 748)
@@ -26,7 +26,7 @@ def main():
     check("WM_OK on serial", "WM_OK" in d.serial())
 
     m = len(d.serial())
-    d.click(*BROWSER_BTN)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, m))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
 
@@ -37,7 +37,7 @@ def main():
 
     # Open the shell and Ctrl+V to paste the copied text.
     m = len(d.serial())
-    d.click(*SHELL_BTN)
+    d.click(*taskbar_xy(d, "shell"))
     check("shell launched", d.wait_serial("WM: launch 'shell'", 5, m))
     m = len(d.serial())
     combo(d, "ctrl", "v")

@@ -3,7 +3,7 @@
 breaks bricks (scores). No-NIC: shell is taskbar idx 4 (x=418)."""
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 SHELL_BTN = (418, 748)
 
@@ -16,7 +16,7 @@ def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("WM_OK on serial", "WM_OK" in d.serial())
     m = len(d.serial())
-    d.click(*SHELL_BTN)
+    d.click(*taskbar_xy(d, "shell"))
     check("shell launched", d.wait_serial("WM: launch 'shell'", 5, m))
 
     # `breakout` launches the game (and focuses it).

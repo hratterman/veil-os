@@ -1,5 +1,5 @@
 import sys, time
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 LISP_BTN = (70 + 9 * 78 + 36, 768 - 20)   # no-NIC taskbar: lisp idx 9
 SHIFTED = {'(': '9', ')': '0', '*': '8', '+': 'equal', '?': 'slash', '"': "apostrophe"}
 BASE = {' ': 'spc', '-': 'minus', '=': 'equal', '.': 'dot', '"': "apostrophe"}
@@ -22,7 +22,7 @@ def typ(d, s):
     k(d, "ret")
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
-    m = len(d.serial()); d.click(*LISP_BTN)
+    m = len(d.serial()); d.click(*taskbar_xy(d, "lisp"))
     check("lisp launched", d.wait_serial("LISP: window open", 5, m))
     check("LISP_IO_OK (self-test write+read+list)", d.wait_serial("LISP_IO_OK", 6, m))
     # Interactive: write a file, read it back.

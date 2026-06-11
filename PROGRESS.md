@@ -227,6 +227,65 @@ optional `websockify` launch (absent here) raised `FileNotFoundError` and
 killed the session — now guarded.** The booted instance hits the M27 setup
 screen first (fresh `--no-user` disk), then Files shows the uploaded file.
 
+## M31 notes (2026-06-10)
+
+Site expansion: `mksite.py` grew from 2 to 9 cross-linked pages (home/build,
+news, wiki, gallery, ascii, tips, about, changelog) with a shared nav bar and
+a richer dark `style.css`, all within the browser's HTML/CSS subset; no 404s
+(`drive_m31_web.py`). GIF player: `src/gif.rs` is a from-scratch GIF87a/89a
+decoder — LZW decompression (the classic code-size off-by-one: decoder bumps
+at `table==2^cs`, the encoder one step later — verified by round-trip),
+global/local colour tables, GCE delay/disposal, interlacing, transparent-index
+compositing, heap-bounded so a big upload can't OOM. `src/gifplayer.rs`
+(App::Gif) plays it: space toggles, arrows scrub frames, up/down switch files,
+Esc closes. `mkdisk.sh`/`landing.html`/`session_manager.py` accept `.gif`
+uploads. Proven on demo.gif + a real 400x400 Wikipedia GIF (GIF_OK).
+
+## M32 notes (2026-06-11)
+
+Overnight Fable session delivered all six tracks; re-verified 2026-06-11.
+
+- **A1 scroll** (`browser.rs`): mouse wheel (REL_WHEEL → 3 lines/notch),
+  arrows (1 line), PgUp/PgDn (half window), proportional 2px scrollbar thumb.
+  SCROLL_OK on first off-top move of a tall page.
+- **A2 history**: `history: Vec<String>` (max 20), `<` back button + Backspace
+  when the address bar is unfocused. HISTORY_OK.
+- **A3 tables**: `<table>/<tr>/<td>/<th>` as equal-width column block cells
+  with 1px borders. TABLE_OK; `mksite.py` changelog page carries a table.
+- **C Adam7** (`png.rs`): 7-pass interlaced PNG deinterlace+composite.
+  INTERLACE_OK.
+- **B Lisp** (`lisp.rs` + `repl.rs`): trampolined evaluator (TCO for
+  if/begin/let/lambda-body), lexical envs, ~30 builtins, green-on-black REPL
+  with scrollback + input history. Self-test (incl. fact 10, map) emits
+  LISP_OK.
+- **A4 real internet**: TLS was *not* implemented; took the proxy path.
+  `scripts/veil_proxy.py` (launchd `com.veil.proxy`, 127.0.0.1:7779, reached
+  by the guest at the slirp gateway 10.0.2.2) fetches real HTTPS sites on the
+  host, strips them to the browser's subset, absolutises links. `browser.rs`
+  sends absolute-form `GET http://host/path` to the proxy for external URLs,
+  loopback for local. INTERNET_OK on example.com; multi-site verified
+  (neverssl HTTP + Hacker News HTTPS render in-guest, `drive_m32_internet2.py`).
+
+**Harness:** `scripts/m32_test.sh <driver.py>` boots with a NIC + starts the
+proxy (the browser homepage is fetched over the net stack, so the browser
+drivers need a NIC, which `run_gui.sh` lacks). Lisp/Adam7 self-tests need no
+NIC (`run_gui.sh <driver> WM_OK`).
+
+**Bugs found + fixed on re-verification (2026-06-11):**
+- *Lisp panics on malformed input.* Many builtins/special forms indexed
+  argument vectors without arity checks — `(car)`, `(if)`, `(cons 1)`,
+  `(mod 5)`, an empty `cond` clause, etc. hit an out-of-bounds panic, which in
+  this kernel is `semihosting::exit` — the whole VM dies. An interactive REPL
+  *will* see malformed input. Added arity guards so every bad form returns an
+  Err the REPL catches; startup self-test now drives 21 malformed inputs and
+  asserts each errors cleanly before LISP_OK.
+- *Lisp deep-recursion stack overflow.* Runaway non-tail recursion overflowed
+  the 512 KiB boot stack → PC-alignment fault → dead OS. Added an `eval` depth
+  guard. **Tuning gotcha: the unoptimised debug `eval` frame is ~1.7 KB, so a
+  guard at 700 (then 300) reproduced the very overflow it was meant to stop**
+  (faulted right after the Lisp window opened). Measured the safe cap down to
+  80 (~136 KiB); self-test drives a runaway recursion and asserts it's guarded.
+
 ## Hosted-demo deployment (2026-06-10) — LIVE
 
 The per-visitor session architecture is deployed to os.henryratterman.com.

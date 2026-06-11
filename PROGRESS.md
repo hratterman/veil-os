@@ -42,6 +42,7 @@ observed proof.
 | M31 | Site expansion (9 pages) + GIF player | PASSED 2026-06-10 | `drive_m31_web.py` (9 cross-linked pages, nav bar, no 404s); `drive_m31_gif.py` (GIF_OK — `src/gif.rs` LZW decoder + `gifplayer.rs`; demo.gif + real 400x400 Wikipedia GIF both animate) |
 | M32 | Browser overhaul + Lisp REPL + Adam7 | PASSED 2026-06-11 | `scripts/m32_test.sh` per track: SCROLL_OK, HISTORY_OK, TABLE_OK, INTERNET_OK (real sites via host proxy); `drive_m32_lisp.py` LISP_OK; `drive_m32_interlace.py` INTERLACE_OK. All re-verified 2026-06-11 |
 | M33 | Browser audio + Lisp persistence/IO + icon drag + TLS 1.3 | PASSED 2026-06-11 | AUDIO_BROWSER_OK (`drive_audio_browser.py` headless Chrome + manager log), LISP_PERSIST_OK/LISP_IO_OK (`m33_lisp_test.sh`), DRAG_OK (`m33_icondrag_test.sh`, reboot-persisted), CRYPTO_OK + TLS_OK + HTTPS_OK (`m33_tls_test.sh` boot handshake to example.com; `drive_m33_https.py` browser direct TLS) |
+| M34 | Browser visual overhaul (HTTP read fix, ext images, CSS vars, flexbox, fonts) | PASSED 2026-06-11 | HTTP_READ_OK (`drive_m33_wiki.py` Wikipedia chunked, no freeze), EXT_IMG_OK (`drive_m34_img.py` PNG over TLS+proxy), CSS_VAR_OK (`drive_m34_cssvar.py`), FLEX_OK (`drive_m34_flex.py` space-between nav), FONTS_OK (`drive_m34_font.py` Cormorant/Lora/Barlow/Mono). Acceptance: henryratterman.com renders recognizably over direct TLS (`drive_m34_hr.py`) |
 
 ## M19b notes (2026-06-10)
 
@@ -405,3 +406,61 @@ Five tracks, all serial-gated.
 
 **Serial tokens fired this milestone:** AUDIO_BROWSER_OK, LISP_PERSIST_OK,
 LISP_IO_OK, DRAG_OK, CRYPTO_OK, TLS_OK, HTTPS_OK.
+
+## M34 notes (2026-06-11) — browser visual overhaul
+
+Five tasks; the goal was henryratterman.com rendering recognizably in the Veil
+browser (acceptance test below).
+
+- **T1 — bounded HTTP reads (HTTP_READ_OK).** `read_to_eof` reset its idle
+  deadline on every byte, so a keep-alive HTTP/1.1 server (Wikipedia, neverssl)
+  that holds the socket open after the body never returned — hanging the
+  desktop task and freezing the whole OS. Replaced with `read_http`:
+  `response_complete()` returns the moment Content-Length / the chunked
+  terminator is satisfied, with a hard total-time backstop; falls back to
+  EOF-wait only when neither length is present. Same logic in the TLS path.
+- **T2 — external images (EXT_IMG_OK).** `<img>` from https/http/loopback are
+  fetched (via http_get → TLS / proxy / loopback), PNG-decoded, and rendered
+  inline; non-PNG is skipped silently (no `[img]`). Persistent per-window LRU
+  cache (cap 10). The proxy now keeps `<img>` (absolutised src) and serves raw
+  image bytes instead of replacing with `[image]`.
+- **T3 — CSS custom properties (CSS_VAR_OK).** `css::collect_vars` gathers
+  `--name: value` (incl. from `:root`); `apply_decl` substitutes
+  `var(--x, fallback)` before parsing colour/size/spacing. Inline `<style>` is
+  now parsed too (via `Node::text`).
+- **T4 — flexbox (FLEX_OK).** `display:flex` with flex-direction, wrap,
+  justify-content, align-items, gap, and `flex` grow. Items are measured in
+  isolation then re-laid at their allocated width and translated into place
+  (preserving links/images). Fixed a load-bearing dispatch bug: `layout_children`
+  only treated `Display::Block` as a block, so flex elements fell through to
+  inline and `layout_flex` never ran.
+- **T5 — bitmap fonts (FONTS_OK).** `scripts/gen_fonts.py` rasterizes Cormorant
+  Garamond, Lora, Barlow Condensed and JetBrains Mono (Pillow) into
+  `src/fonts_generated.rs` — 16 variants at 16/24px, variable-width 1-bpp
+  glyphs. `font::select_font`/`pick` map CSS font-family/weight/style to a
+  variant; the browser threads the chosen font through measurement + drawing
+  (None = built-in 8x16). `<pre>` and the Lisp REPL use JetBrains Mono.
+
+Two supporting fixes (not numbered tasks) were needed for real sites:
+**base-relative URL resolution** (an external page's relative `style.css`/images
+now resolve against its own host, not loopback — `url_join` + `PAGE_BASE`), and
+**the `background:` shorthand** (most sites use it, not `background-color`).
+
+### Acceptance test — henryratterman.com (direct TLS 1.3)
+
+Loads end to end: page HTML + Google Fonts CSS + the 31 KB `style.css` all
+fetched over our from-scratch TLS (base-relative), parsed, and rendered.
+
+**Renders correctly:** the dark theme (background shorthand + CSS vars), the
+horizontal nav bar (flexbox), section headings and body text in real serif
+typefaces (Cormorant Garamond / Lora) and Barlow Condensed labels — it reads as
+a real personal site, not a wall of bitmap text.
+
+**Doesn't (known, acceptable):** a duplicate vertical nav (the mobile menu —
+hidden by a media query / complex selector the CSS subset skips); emoji/section
+icons show as `?` (outside printable ASCII); hero/project images are JPEG, so
+empty space (no JPEG decoder); the page is shorter than the live site (much of
+its content is injected by JavaScript, which the browser doesn't run).
+
+**Serial tokens fired this milestone:** HTTP_READ_OK, EXT_IMG_OK, CSS_VAR_OK,
+FLEX_OK, FONTS_OK.

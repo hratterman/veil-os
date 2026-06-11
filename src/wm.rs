@@ -1692,7 +1692,7 @@ impl Wm {
                 // Double-click the title bar (not on a button) -> maximize.
                 let now = timer::ticks();
                 let (lt, lx, ly) = self.last_title_click;
-                if now.wrapping_sub(lt) < 30 && (self.mx - lx).abs() < 6 && (self.my - ly).abs() < 6 {
+                if now.wrapping_sub(lt) < 40 && (self.mx - lx).abs() < 6 && (self.my - ly).abs() < 6 {
                     self.last_title_click = (0, 0, 0);
                     self.maximize_toggle(top);
                     return;

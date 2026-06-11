@@ -649,6 +649,32 @@ impl Wm {
 
     /// Run a shell command line: kernel built-ins, or a user binary
     /// loaded from the filesystem and run at EL0.
+    /// Kill an app by window id (index) or name. Removing the window drops its
+    /// App state — and thus its heap allocations (page buffers, etc.) — without
+    /// touching any other app, so the others keep running.
+    fn kill_app(&mut self, target: &str) -> bool {
+        let by_id = target.parse::<usize>().ok();
+        let pos = self.windows.iter().position(|w| {
+            by_id == Some(usize::MAX) // never
+                || w.title.eq_ignore_ascii_case(target)
+                || w.title.to_ascii_lowercase().contains(&target.to_ascii_lowercase())
+        });
+        let pos = match (by_id, pos) {
+            (Some(i), _) if i < self.windows.len() => Some(i),
+            (_, p) => p,
+        };
+        let Some(i) = pos else { return false };
+        let w = self.windows.remove(i);
+        let freed = match &w.app {
+            App::Browser(_) => "browser page buffers",
+            App::Viewer(_) => "image buffer",
+            _ => "app state",
+        };
+        kprintln!("WM: killed '{}' (reclaimed {freed})", w.title);
+        self.dirty = true;
+        true
+    }
+
     /// Alt+Tab: bring the next window to the top (cycle the z-order).
     fn cycle_windows(&mut self) {
         if self.windows.len() < 2 {
@@ -732,6 +758,25 @@ impl Wm {
         if let Some(app) = target {
             self.launch(&app);
             self.shell_append(&format!("launched {app}\n"));
+            return;
+        }
+        // ps / kill operate on the live window registry (each window is an app
+        // with its own state + heap; dropping it reclaims memory, no reboot).
+        if first == "ps" {
+            let mut out = String::from("ID  APP\n");
+            for (i, w) in self.windows.iter().enumerate() {
+                out.push_str(&format!("{i:<3} {} (running)\n", w.title));
+            }
+            self.shell_append(&out);
+            return;
+        }
+        if first == "kill" {
+            let arg = cmd.split_whitespace().nth(1).unwrap_or("");
+            if self.kill_app(arg) {
+                self.shell_append(&format!("killed {arg}\n"));
+            } else {
+                self.shell_append(&format!("kill: {arg}: no such app\n"));
+            }
             return;
         }
         // The real shell engine (ls/cat/cp/mv/rm/echo/pipes/...) is authoritative

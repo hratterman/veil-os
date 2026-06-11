@@ -49,6 +49,7 @@ pub fn run(screen: &Framebuffer) {
     let mut half: i32 = 0; // UTC offset in 30-min steps; 0 = UTC+0
     let mut shift = false;
     let mut blink = true;
+    render_static(screen);
     render(screen, &name, half, blink);
     let mut last_blink = timer::ticks();
 
@@ -149,38 +150,49 @@ fn commit(name: &str, half: i32) {
     kprintln!("SETUP_OK");
 }
 
-fn render(screen: &Framebuffer, name: &str, half: i32, blink: bool) {
+/// Draw the static parts (background, card, labels) once.
+fn render_static(screen: &Framebuffer) {
     let (w, h) = (screen.width, screen.height);
     screen.clear(BG);
-
     let cw = 460usize;
     let ch = 320usize;
     let cx = (w - cw) / 2;
     let cy = (h - ch) / 2;
     screen.fill_rect(cx - 1, cy - 1, cw + 2, ch + 2, CARD_EDGE);
     screen.fill_rect(cx, cy, cw, ch, CARD);
-
-    // Header (largest bitmap font available = 3x scale).
     screen.draw_string_scaled(cx + 28, cy + 28, "Welcome to Veil OS", HEAD, 3);
     screen.draw_string(cx + 30, cy + 70, "a from-scratch AArch64 operating system", LABEL, None);
-
-    // Field 1: name.
     let fy = cy + 110;
     screen.draw_string(cx + 30, fy, "Your name", LABEL, None);
+    let ty = cy + 180;
+    screen.draw_string(cx + 30, ty, "Timezone  (left / right arrows)", LABEL, None);
+    screen.draw_string(cx + 38, ty + 22, "<", ACCENT, None);
+    screen.draw_string(cx + cw - 48, ty + 22, ">", ACCENT, None);
+}
+
+/// Redraw only the dynamic fields (name input, timezone, button). No full clear.
+fn render(screen: &Framebuffer, name: &str, half: i32, blink: bool) {
+    let (w, h) = (screen.width, screen.height);
+    let cw = 460usize;
+    let ch = 320usize;
+    let cx = (w - cw) / 2;
+    let cy = (h - ch) / 2;
+
+    // Name field: clear and redraw just the input box row.
+    let fy = cy + 110;
     screen.fill_rect(cx + 30, fy + 20, cw - 60, 30, FIELD_BG);
     let cursor = if blink { "_" } else { " " };
     screen.draw_string(cx + 38, fy + 28, &alloc::format!("{name}{cursor}"), FIELD_TX, None);
 
-    // Field 2: timezone.
+    // Timezone field: clear and redraw the value area only.
     let ty = cy + 180;
-    screen.draw_string(cx + 30, ty, "Timezone  (left / right arrows)", LABEL, None);
     screen.fill_rect(cx + 30, ty + 20, cw - 60, 30, FIELD_BG);
     screen.draw_string(cx + 38, ty + 22, "<", ACCENT, None);
     screen.draw_string(cx + cw - 48, ty + 22, ">", ACCENT, None);
     let lbl = tz_label(half);
     screen.draw_string_scaled(cx + cw / 2 - lbl.len() * 8, ty + 24, &lbl, FIELD_TX, 2);
 
-    // Confirm button / hint.
+    // Button: only changes when name goes empty <-> non-empty.
     let by = cy + ch - 56;
     let valid = !name.trim().is_empty();
     let bg = if valid { BTN_BG } else { 0xff31_3a48 };

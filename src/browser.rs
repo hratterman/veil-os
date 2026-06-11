@@ -87,14 +87,15 @@ fn write_all(h: net::Handle, mut data: &[u8]) {
     }
 }
 
-fn read_to_eof(h: net::Handle, cap: usize) -> Vec<u8> {
-    let deadline = timer::ticks() + FETCH_TIMEOUT;
+fn read_to_eof(h: net::Handle, cap: usize, timeout: u64) -> Vec<u8> {
+    let mut deadline = timer::ticks() + timeout;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     loop {
         match net::tcp_read(h, &mut tmp) {
             net::TcpRead::Data(n) => {
                 buf.extend_from_slice(&tmp[..n]);
+                deadline = timer::ticks() + timeout; // progress resets the clock
                 if buf.len() > cap {
                     return buf;
                 }
@@ -110,20 +111,37 @@ fn read_to_eof(h: net::Handle, cap: usize) -> Vec<u8> {
     }
 }
 
-/// GET `path` from our own HTTP server. Returns (status, content-type,
-/// body). One retry in case the connect raced service startup.
+/// True for a fully-qualified URL pointing somewhere off our own machine.
+fn is_external(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    (u.starts_with("http://") || u.starts_with("https://"))
+        && !u.contains("//127.0.0.1")
+        && !u.contains("//10.0.2.")
+        && !u.contains("//veil")
+        && !u.contains("//localhost")
+}
+
+/// GET `path`. Local paths ("/page.htm") hit our own HTTP server on loopback;
+/// full external URLs are sent verbatim to the host proxy at 10.0.2.2:7779,
+/// which fetches the real (possibly HTTPS) site and returns stripped HTML.
 fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
-    let ip = net::local_ip()?;
+    let external = is_external(path);
+    let (ip, port, timeout) = if external {
+        ([10, 0, 2, 2], 7779u16, 1500) // proxy fetch can take a while
+    } else {
+        (net::local_ip()?, 80u16, FETCH_TIMEOUT)
+    };
     for attempt in 0..2 {
         if attempt > 0 {
             for _ in 0..10 {
                 scheduler::yield_now();
             }
         }
-        let Some(h) = net::tcp_connect(ip, 80) else { continue };
-        let req = format!("GET {path} HTTP/1.1\r\nHost: veil\r\nConnection: close\r\n\r\n");
+        let Some(h) = net::tcp_connect(ip, port) else { continue };
+        let host = if external { "proxy" } else { "veil" };
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         write_all(h, req.as_bytes());
-        let resp = read_to_eof(h, 1 << 20);
+        let resp = read_to_eof(h, 1 << 20, timeout);
         net::tcp_close(h);
         let Some(split) = resp.windows(4).position(|w| w == b"\r\n\r\n") else {
             continue;
@@ -150,8 +168,12 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
     None
 }
 
-/// "page2.htm" -> "/page2.htm"; absolute paths pass through.
+/// "page2.htm" -> "/page2.htm"; absolute paths and full external URLs pass
+/// through (the proxy keeps query strings, so don't strip those for URLs).
 fn resolve_href(href: &str) -> String {
+    if is_external(href) {
+        return String::from(href);
+    }
     let href = href.split(['#', '?']).next().unwrap_or("");
     if href.starts_with('/') {
         String::from(href)
@@ -729,6 +751,8 @@ pub fn back(win: &mut Window) -> bool {
 
 pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     let path = resolve_href(path);
+    let was_external = is_external(&path);
+    let path_for_log = path.clone();
     kprintln!("BROWSER: navigating to {path}");
     // A user navigation (link click / typed URL) pushes the current page onto
     // the history stack so the back button can return to it.
@@ -867,7 +891,13 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         );
         kprintln!("M16_OK");
     }
+    if was_external && !INTERNET_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("BROWSER: rendered external page {path_for_log}");
+        kprintln!("INTERNET_OK");
+    }
 }
+
+static INTERNET_DONE: AtomicBool = AtomicBool::new(false);
 
 /// A one-line stand-in page for fetch/parse failures.
 fn render_message(win: &mut Window, path: &str, msg: &str) {
@@ -909,7 +939,12 @@ pub fn paint_view(win: &mut Window) {
         } else {
             100
         };
-        format!("http://{}{}  [{pct}%]", net::fmt_ip(&ip), st.path)
+        // External pages already carry a full URL; local paths get our IP.
+        if st.path.starts_with("http://") || st.path.starts_with("https://") {
+            format!("{}  [{pct}%]", st.path)
+        } else {
+            format!("http://{}{}  [{pct}%]", net::fmt_ip(&ip), st.path)
+        }
     };
     // Scrollbar: a 2px gutter on the right edge with a proportional thumb.
     let (doc_h, scroll) = {

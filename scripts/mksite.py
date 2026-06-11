@@ -26,7 +26,8 @@ NAV = (
     '<a href="ascii.htm">ASCII</a> | '
     '<a href="tips.htm">Tips</a> | '
     '<a href="changes.htm">Changelog</a> | '
-    '<a href="about.htm">About</a>'
+    '<a href="about.htm">About</a> | '
+    '<a href="web.htm">Web</a>'
     '</div>'
 )
 
@@ -271,6 +272,26 @@ point was never to be fast or complete; it was to be honest.</p>
 </ul>
 <p>Source and a one-line installer live on the
 <a href="changes.htm">changelog</a> page.</p>
+<p><a href="index.htm">Home</a></p>""")
+
+WEB = page("""<h1>The Real Web</h1>
+<div class="card">
+<p>These links leave the island. The browser hands the full URL to a small
+host-side proxy that fetches the real (often HTTPS) page, strips it to what
+this renderer understands, and sends back plain HTML over our own TCP. No
+JavaScript, no images - just the text of the live internet, in a browser
+written from scratch.</p>
+</div>
+<h2>Try these</h2>
+<ul>
+<li><a href="http://neverssl.com">neverssl.com</a> - plain HTTP, always up</li>
+<li><a href="http://example.com">example.com</a> - the minimal classic</li>
+<li><a href="https://lite.cnn.com">lite.cnn.com</a> - CNN, text-only edition</li>
+<li><a href="https://en.wikipedia.org/wiki/ARM_architecture_family">Wikipedia: ARM</a> - text-heavy, renders well</li>
+<li><a href="https://news.ycombinator.com">Hacker News</a> - simple HTML</li>
+</ul>
+<p class="muted">Slow to load is normal - the proxy is fetching a real site
+across the internet, then this browser lays out every line by hand.</p>
 <p><a href="index.htm">Home</a></p>""")
 
 CHANGES = page("""<h1>Changelog</h1>
@@ -529,6 +550,7 @@ def main():
         "index.htm": INDEX, "page2.htm": PAGE2, "news.htm": NEWS,
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
+        "web.htm": WEB,
         "style.css": STYLE,
     }
     for name, text in pages.items():

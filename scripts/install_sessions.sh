@@ -26,8 +26,8 @@ done
 # freezes the whole VM) and serves browser audio same-origin at
 # /session/<id>/audio. A second FIFO reader would split the bytes, so the
 # bridge is retired.
-echo "Installing com.veil.relay + com.veil.sessions..."
-for a in com.veil.relay com.veil.sessions; do
+echo "Installing com.veil.relay + com.veil.sessions + com.veil.proxy..."
+for a in com.veil.relay com.veil.sessions com.veil.proxy; do
     cp "$SRC/launchd/$a.plist" "$LA/$a.plist"
     launchctl unload "$LA/$a.plist" 2>/dev/null || true
     launchctl load "$LA/$a.plist"

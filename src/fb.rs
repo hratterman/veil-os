@@ -185,6 +185,30 @@ impl Framebuffer {
         }
     }
 
+    /// Blit one glyph from a generated `BitmapFont`; returns its advance.
+    pub fn draw_bm_glyph(&self, x: usize, y: usize, font: &font::BitmapFont, ch: char, fg: u32) -> usize {
+        let g = &font.glyphs[font::glyph_index(ch)];
+        let (adv, w, off, len) = (g.0 as usize, g.1 as usize, g.2 as usize, g.3 as usize);
+        let row_bytes = w.div_ceil(8);
+        let bits = &font.bits[off..off + len];
+        for r in 0..font.height as usize {
+            for c in 0..w {
+                if bits[r * row_bytes + (c >> 3)] & (0x80 >> (c & 7)) != 0 {
+                    self.put_pixel(x + c, y + r, fg);
+                }
+            }
+        }
+        adv
+    }
+
+    /// Draw a string in a generated bitmap font (variable-width advances).
+    pub fn draw_bm_string(&self, x: usize, y: usize, s: &str, font: &font::BitmapFont, fg: u32) {
+        let mut px = x;
+        for ch in s.chars() {
+            px += self.draw_bm_glyph(px, y, font, ch, fg);
+        }
+    }
+
     pub fn draw_string(&self, x: usize, y: usize, s: &str, fg: u32, bg: Option<u32>) {
         let mut cx = x;
         let mut cy = y;

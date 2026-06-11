@@ -26,7 +26,10 @@
 
 use crate::fb::Framebuffer;
 use crate::wm::Window;
-use crate::{css, html, kprintln, net, png, scheduler, timer, tls};
+use crate::{css, font, html, kprintln, net, png, scheduler, timer, tls};
+
+/// A selected bitmap font, or None to use the built-in 8x16 font.
+type Font = Option<&'static font::BitmapFont>;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -431,6 +434,11 @@ struct Style {
     width: Option<isize>,
     underline: bool,
     pre: bool,
+    // Typography (inherits). `font` is the resolved bitmap font (None = 8x16).
+    font_fam: font::Family,
+    font_weight: u16,
+    font_italic: bool,
+    font: Font,
     // Flex container properties (meaningful when display == Flex).
     flex_dir: FlexDir,
     flex_wrap: bool,
@@ -451,6 +459,10 @@ const ROOT_STYLE: Style = Style {
     width: None,
     underline: false,
     pre: false,
+    font_fam: font::Family::Default,
+    font_weight: 400,
+    font_italic: false,
+    font: None,
     flex_dir: FlexDir::Row,
     flex_wrap: false,
     justify: Justify::Start,
@@ -589,6 +601,15 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
                 s.scale = (((px + 8) / 16).max(1) as usize).min(4);
             }
         }
+        "font-family" => s.font_fam = font::match_family(val),
+        "font-weight" => {
+            s.font_weight = match val.trim() {
+                "bold" | "bolder" => 700,
+                "normal" | "lighter" => 400,
+                n => n.parse().unwrap_or(s.font_weight),
+            };
+        }
+        "font-style" => s.font_italic = val.trim().starts_with("italic") || val.trim().starts_with("oblique"),
         "margin" => {
             if let Some(px) = parse_px(val) {
                 s.margin = [px; 4];
@@ -665,6 +686,11 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         width: None,
         underline: inherited.underline,
         pre: inherited.pre,
+        // Typography inherits.
+        font_fam: inherited.font_fam,
+        font_weight: inherited.font_weight,
+        font_italic: inherited.font_italic,
+        font: inherited.font,
         // Flex properties don't inherit — reset to defaults each element.
         flex_dir: FlexDir::Row,
         flex_wrap: false,
@@ -706,11 +732,12 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
             s.display = Display::Block;
             s.margin[2] = 2;
         }
-        "pre" => {
+        "pre" | "code" => {
             s.display = Display::Block;
             s.margin[0] = 8;
             s.margin[2] = 8;
             s.pre = true;
+            s.font_fam = font::Family::Mono; // <pre>/<code> default to monospace
         }
         "a" => {
             s.color = 0xff20_50c0;
@@ -729,6 +756,8 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
             }
         }
     }
+    // Resolve the bitmap font from the (possibly inherited) typography + size.
+    s.font = font::pick(s.font_fam, s.font_weight, s.font_italic, (s.scale * 16) as u16);
     s
 }
 
@@ -736,21 +765,36 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
 
 enum Item {
     Rect { x: isize, y: isize, w: isize, h: isize, color: u32 },
-    Text { x: isize, y: isize, s: String, color: u32, scale: usize },
+    Text { x: isize, y: isize, s: String, color: u32, scale: usize, font: Font },
     Image { x: isize, y: isize, idx: usize },
 }
 
 enum Frag {
-    Word { s: String, color: u32, scale: usize, link: Option<String>, underline: bool },
-    Space { scale: usize },
+    Word { s: String, color: u32, scale: usize, link: Option<String>, underline: bool, font: Font },
+    Space { scale: usize, font: Font },
     Img { idx: usize, w: isize, h: isize },
     Br,
 }
 
+/// Pixel width of a text run in either the chosen bitmap font or the 8x16.
+fn text_w(s: &str, scale: usize, f: Font) -> isize {
+    match f {
+        Some(bm) => font::text_width(bm, s) as isize,
+        None => s.chars().count() as isize * 8 * scale as isize,
+    }
+}
+
+fn text_h(scale: usize, f: Font) -> isize {
+    match f {
+        Some(bm) => bm.height as isize,
+        None => 16 * scale as isize,
+    }
+}
+
 fn frag_w(f: &Frag) -> isize {
     match f {
-        Frag::Word { s, scale, .. } => s.len() as isize * 8 * *scale as isize,
-        Frag::Space { scale } => 8 * *scale as isize,
+        Frag::Word { s, scale, font, .. } => text_w(s, *scale, *font),
+        Frag::Space { scale, font } => text_w(" ", *scale, *font),
         Frag::Img { w, .. } => *w,
         Frag::Br => 0,
     }
@@ -758,7 +802,7 @@ fn frag_w(f: &Frag) -> isize {
 
 fn frag_h(f: &Frag) -> isize {
     match f {
-        Frag::Word { scale, .. } | Frag::Space { scale } => 16 * *scale as isize,
+        Frag::Word { scale, font, .. } | Frag::Space { scale, font } => text_h(*scale, *font),
         Frag::Img { h, .. } => *h,
         Frag::Br => 16,
     }
@@ -783,6 +827,7 @@ fn collect_text(t: &str, style: &Style, link: &Option<String>, buf: &mut Vec<Fra
                 scale: style.scale,
                 link: link.clone(),
                 underline: style.underline,
+                font: style.font,
             });
         }
     };
@@ -790,7 +835,7 @@ fn collect_text(t: &str, style: &Style, link: &Option<String>, buf: &mut Vec<Fra
         if c.is_ascii_whitespace() {
             flush(&mut word, buf);
             if !matches!(buf.last(), Some(Frag::Space { .. }) | None) {
-                buf.push(Frag::Space { scale: style.scale });
+                buf.push(Frag::Space { scale: style.scale, font: style.font });
             }
         } else {
             word.push(c);
@@ -854,27 +899,22 @@ fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> is
         let fh = frag_h(&f);
         let fy = y + lh - fh;
         match f {
-            Frag::Word { s, color, scale, link, underline } => {
-                let fw = s.len() as isize * 8 * scale as isize;
+            Frag::Word { s, color, scale, link, underline, font } => {
+                let fw = text_w(&s, scale, font);
+                let fh = text_h(scale, font);
                 if underline {
                     ctx.items.push(Item::Rect {
                         x: x + dx,
-                        y: fy + 16 * scale as isize - scale as isize,
+                        y: fy + fh - scale as isize,
                         w: fw,
                         h: scale as isize,
                         color,
                     });
                 }
                 if let Some(href) = link {
-                    ctx.links.push(LinkBox {
-                        x: x + dx,
-                        y: fy,
-                        w: fw,
-                        h: 16 * scale as isize,
-                        href,
-                    });
+                    ctx.links.push(LinkBox { x: x + dx, y: fy, w: fw, h: fh, href });
                 }
-                ctx.items.push(Item::Text { x: x + dx, y: fy, s, color, scale });
+                ctx.items.push(Item::Text { x: x + dx, y: fy, s, color, scale, font });
             }
             Frag::Img { idx, .. } => {
                 ctx.img_spots.push((idx, x + dx, fy));
@@ -1017,6 +1057,7 @@ fn layout_block(
             s: m,
             color: style.color,
             scale: 1,
+            font: None,
         });
     }
 
@@ -1024,6 +1065,7 @@ fn layout_block(
         // Verbatim: no wrap, no whitespace collapsing.
         let mut text = String::new();
         node.text(&mut text);
+        let lh = text_h(style.scale, style.font);
         for line in text.trim_matches('\n').lines() {
             ctx.items.push(Item::Text {
                 x: cx,
@@ -1031,8 +1073,9 @@ fn layout_block(
                 s: String::from(line),
                 color: style.color,
                 scale: style.scale,
+                font: style.font,
             });
-            cy += 16 * style.scale as isize;
+            cy += lh;
         }
     } else if style.display == Display::Flex {
         cy = layout_flex(ctx, node, &style, cx, cw, cy);
@@ -1095,7 +1138,7 @@ static FLEX_DONE: AtomicBool = AtomicBool::new(false);
 
 fn item_right(it: &Item, ctx: &Ctx) -> isize {
     match it {
-        Item::Text { x, s, scale, .. } => x + s.chars().count() as isize * 8 * *scale as isize,
+        Item::Text { x, s, scale, font, .. } => x + text_w(s, *scale, *font),
         Item::Image { x, idx, .. } => x + ctx.imgs[*idx].1.w as isize,
         Item::Rect { x, w, .. } => x + w,
     }
@@ -1448,9 +1491,12 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
                     pfb.fill_rect(x.max(0) as usize, y.max(0) as usize, w as usize, h as usize, color);
                 }
             }
-            Item::Text { x, y, s, color, scale } => {
+            Item::Text { x, y, s, color, scale, font } => {
                 if *y >= 0 {
-                    pfb.draw_string_scaled((*x).max(0) as usize, *y as usize, s, *color, *scale);
+                    match font {
+                        Some(bm) => pfb.draw_bm_string((*x).max(0) as usize, *y as usize, s, bm, *color),
+                        None => pfb.draw_string_scaled((*x).max(0) as usize, *y as usize, s, *color, *scale),
+                    }
                 }
             }
             &Item::Image { x, y, idx } => {

@@ -22,6 +22,7 @@ mod exceptions;
 mod fb;
 mod files;
 mod font;
+mod fonts_generated;
 mod frames;
 mod fs;
 mod fwcfg;
@@ -96,6 +97,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     milestone4();
     scheduler::init(kernel_mapper.root());
     crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
+    font::selftest(); // M34: prove the generated bitmap fonts loaded
     milestone9();
     milestone10(&fdt);
     if milestone12(&fdt) {

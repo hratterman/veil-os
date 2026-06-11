@@ -8,6 +8,104 @@ pub const FONT_WIDTH: usize = 8;
 pub const FONT_HEIGHT: usize = 16;
 pub const FIRST_CHAR: u8 = 0x20;
 
+pub use crate::fonts_generated::{BitmapFont, G};
+use crate::fonts_generated as gf;
+
+/// Verify the generated fonts loaded with sane metrics + real ink, and that
+/// the monospace font is actually fixed-width. Emits FONTS_OK.
+pub fn selftest() {
+    let serif = &gf::CORMORANT_400_24;
+    let a = &serif.glyphs[glyph_index('A')];
+    let ink = serif.bits[a.2 as usize..a.2 as usize + a.3 as usize]
+        .iter()
+        .any(|&b| b != 0);
+    let mono = &gf::MONO_400_16;
+    let mono_fixed = advance(mono, 'i') == advance(mono, 'W') && advance(mono, 'i') > 0;
+    if advance(serif, 'A') > 0 && ink && serif.height >= 16 && mono_fixed {
+        crate::kprintln!("FONTS_OK");
+    } else {
+        crate::kprintln!(
+            "FONTS FAIL: adv={} ink={ink} h={} mono_fixed={mono_fixed}",
+            advance(serif, 'A'),
+            serif.height
+        );
+    }
+}
+
+/// Map a printable ASCII char to its glyph index (0x20..0x7E), else '?'.
+pub fn glyph_index(ch: char) -> usize {
+    let c = ch as u32;
+    if (0x20..=0x7e).contains(&c) {
+        (c - 0x20) as usize
+    } else {
+        (b'?' - 0x20) as usize
+    }
+}
+
+/// Horizontal advance of `ch` in `font`.
+pub fn advance(font: &BitmapFont, ch: char) -> usize {
+    font.glyphs[glyph_index(ch)].0 as usize
+}
+
+/// Pixel width of `s` rendered in `font`.
+pub fn text_width(font: &BitmapFont, s: &str) -> usize {
+    s.chars().map(|c| advance(font, c)).sum()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Family {
+    Default, // sans / unknown -> built-in 8x16 font
+    Cormorant,
+    Lora,
+    Barlow,
+    Mono,
+}
+
+/// Map a CSS `font-family` value to one of our pre-rasterized families.
+pub fn match_family(value: &str) -> Family {
+    let f = value.to_ascii_lowercase();
+    let has = |n: &str| f.contains(n);
+    if has("mono") || has("jetbrains") || has("courier") || has("consol") || has("code") {
+        Family::Mono
+    } else if has("cormorant") || has("garamond") {
+        Family::Cormorant
+    } else if has("barlow") {
+        Family::Barlow
+    } else if has("lora") || (has("serif") && !has("sans")) {
+        Family::Lora
+    } else {
+        Family::Default
+    }
+}
+
+/// Pick the pre-rasterized bitmap font for a family/weight/style/size, or None
+/// for `Family::Default` (use the built-in 8x16 font). `px` is the target size.
+pub fn pick(fam: Family, weight: u16, italic: bool, px: u16) -> Option<&'static BitmapFont> {
+    let big = px >= 20;
+    Some(match fam {
+        Family::Default => return None,
+        Family::Mono => if big { &gf::MONO_400_24 } else { &gf::MONO_400_16 },
+        Family::Cormorant => match (italic, weight >= 600, big) {
+            (true, _, _) => &gf::CORMORANT_I_400_16,
+            (false, true, true) => &gf::CORMORANT_600_24,
+            (false, true, false) => &gf::CORMORANT_600_16,
+            (false, false, true) => &gf::CORMORANT_400_24,
+            (false, false, false) => &gf::CORMORANT_400_16,
+        },
+        Family::Barlow => match (weight >= 600, big) {
+            (true, true) => &gf::BARLOW_600_24,
+            (true, false) => &gf::BARLOW_600_16,
+            (false, true) => &gf::BARLOW_400_24,
+            (false, false) => &gf::BARLOW_400_16,
+        },
+        Family::Lora => match (italic, big) {
+            (true, _) => &gf::LORA_I_400_16,
+            (false, true) => &gf::LORA_400_24,
+            (false, false) => &gf::LORA_400_16,
+        },
+    })
+}
+
 /// Indexed by `ascii - 0x20`; 16 row bytes per glyph.
 pub const GLYPHS: [[u8; 16]; 95] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ' '

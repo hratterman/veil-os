@@ -15,6 +15,11 @@ if [ ! -f "$OBJCOPY" ]; then
     OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-objcopy"
 fi
 
+# M34: regenerate the bitmap fonts (src/fonts_generated.rs) if missing. The
+# file is committed, so this only runs on a fresh checkout; needs Pillow +
+# network. Tolerate failure (the committed file is the fallback).
+[ -f src/fonts_generated.rs ] || python3 scripts/gen_fonts.py || true
+
 (cd user && cargo build --release --quiet)
 for bin in hello ls cat echo spin evil; do
     "$OBJCOPY" -O binary \

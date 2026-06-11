@@ -277,7 +277,7 @@ point was never to be fast or complete; it was to be honest.</p>
 WEB = page("""<h1>The Real Web</h1>
 <p><a href="imgtest.htm">External images test</a> -
 <a href="cssvar.htm">CSS variables test</a> -
-<a href="flextest.htm">Flexbox test</a></p>
+<a href="flextest.htm">Flexbox test</a> - <a href="fonttest.htm">Fonts test</a></p>
 <p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
@@ -298,6 +298,19 @@ written from scratch.</p>
 <p class="muted">Slow to load is normal - the proxy is fetching a real site
 across the internet, then this browser lays out every line by hand.</p>
 <p><a href="index.htm">Home</a></p>""")
+
+FONTTEST = page("""<style>
+.serif { font-family: "Cormorant Garamond", serif; font-size: 32px; color: #e8e0c8; }
+.bodytext { font-family: "Lora", serif; color: #d8d0c0; }
+.label { font-family: "Barlow Condensed"; font-weight: 600; color: #88c0a0; }
+</style>
+<h1 class="serif">Cormorant Garamond Heading</h1>
+<p class="bodytext">Lora renders this body text in a real serif typeface, not the
+8x16 bitmap. The quick brown fox jumps over the lazy dog.</p>
+<p class="label">BARLOW CONDENSED LABEL TEXT</p>
+<pre>JetBrains Mono in a &lt;pre&gt; block:
+  (define (sq n) (* n n))</pre>
+<p><a href="web.htm">Back</a></p>""")
 
 FLEXTEST = page("""<style>
 .fnav { display: flex; flex-direction: row; justify-content: space-between; align-items: center; background-color: #1a2e1a; padding: 12px; gap: 8px; }
@@ -593,7 +606,7 @@ def main():
         "index.htm": INDEX, "page2.htm": PAGE2, "news.htm": NEWS,
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
-        "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST,
+        "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST, "fonttest.htm": FONTTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

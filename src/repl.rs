@@ -13,7 +13,17 @@ use alloc::vec::Vec;
 const BG: u32 = 0xff04_140a; // near-black green tint
 const FG: u32 = 0xff30_ff60; // phosphor green
 const DIM: u32 = 0xff20_9040;
-const ROW: usize = 16;
+
+// M34: the REPL renders in the monospace bitmap font (JetBrains Mono 16px).
+fn mono() -> &'static crate::fonts_generated::BitmapFont {
+    &crate::fonts_generated::MONO_400_16
+}
+fn cell_w() -> usize {
+    crate::font::advance(mono(), 'M').max(1)
+}
+fn row_h() -> usize {
+    mono().height as usize
+}
 
 const KEY_UP: u16 = 103;
 const KEY_PGUP: u16 = 104;
@@ -260,7 +270,7 @@ pub fn char_input(win: &mut Window, ch: char) {
 }
 
 fn visible_rows(ch: usize) -> usize {
-    (ch / ROW).saturating_sub(1).max(1) // reserve the bottom row for input
+    (ch / row_h()).saturating_sub(1).max(1) // reserve the bottom row for input
 }
 
 impl LispState {
@@ -275,7 +285,8 @@ impl LispState {
 
 pub fn render(win: &mut Window) {
     let (cw, ch) = (win.cw, win.ch);
-    let cols = (cw / 8).saturating_sub(1).max(1);
+    let (cwp, rh) = (cell_w(), row_h());
+    let cols = (cw / cwp).saturating_sub(1).max(1);
     let vis = visible_rows(ch);
     let (lines, input, top) = {
         let App::Lisp(st) = &win.app else { return };
@@ -287,14 +298,14 @@ pub fn render(win: &mut Window) {
         let Some(line) = lines.get(top + r) else { break };
         let s: String = line.chars().take(cols).collect();
         let color = if s.starts_with("> ") { DIM } else { FG };
-        fb.draw_string(4, r * ROW, &s, color, None);
+        fb.draw_bm_string(4, r * rh, &s, mono(), color);
     }
     // Input line, pinned to the bottom row.
     let prompt = format!("> {input}");
     let shown: String = prompt.chars().rev().take(cols).collect::<Vec<_>>().into_iter().rev().collect();
-    let y = (vis) * ROW;
-    fb.draw_string(4, y, &shown, FG, None);
+    let y = vis * rh;
+    fb.draw_bm_string(4, y, &shown, mono(), FG);
     // Block cursor.
-    let cx = 4 + shown.chars().count() * 8;
-    fb.fill_rect(cx, y, 8, ROW, DIM);
+    let cx = 4 + shown.chars().count() * cwp;
+    fb.fill_rect(cx, y, cwp, rh, DIM);
 }

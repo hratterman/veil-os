@@ -8,7 +8,7 @@
 //! 16-bit-stereo PCM as a ring of period buffers on the tx queue, refilling
 //! each as the device returns it, and STOP at the end.
 
-use crate::{dtb, frames, fs, kprintln, scheduler, virtio};
+use crate::{dtb, frames, fs, kprintln, virtio};
 use alloc::string::String;
 use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -285,12 +285,12 @@ pub fn play(pcm: &[u8]) -> usize {
             }
             None => {
                 // irq_ack forces a TCG vCPU exit so QEMU's audio timer can
-                // run and mark buffers used. yield_now hands a scheduling
-                // slice to the desktop/clock tasks so the UI stays live.
+                // run and mark buffers used. Then wfi suspends this task
+                // until the next IRQ (which triggers preemption back to the
+                // desktop). This gives the UI full scheduling slices while
+                // audio streams without spinning.
                 dev.mmio.irq_ack();
-                scheduler::yield_now();
-                spins += 1;
-                assert!(spins < 200_000_000, "virtio-sound tx hung");
+                unsafe { core::arch::asm!("wfi") };
             }
         }
     }

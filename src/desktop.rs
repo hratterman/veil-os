@@ -64,13 +64,6 @@ pub fn run(screen: Framebuffer, fdt: &dtb::Fdt) {
         if wm.dirty {
             wm.compose();
         }
-        // Skip wfi while audio is playing -- the audio task polls via
-        // irq_ack which wakes us constantly anyway, and we need to repaint
-        // the elapsed-time counter every second.
-        if !crate::snd::is_playing() {
-            unsafe { core::arch::asm!("wfi") };
-        } else {
-            scheduler::yield_now();
-        }
+        unsafe { core::arch::asm!("wfi") };
     }
 }

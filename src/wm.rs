@@ -677,9 +677,9 @@ impl Wm {
     /// Desktop icon hit test (two-column grid, matching compose()).
     fn icon_at(&self, px: isize, py: isize) -> Option<&'static str> {
         const ICON_W: isize = 48;
-        const ICON_SLOT: isize = 60;
+        const ICON_SLOT: isize = 68;
         const COL0_X: isize = 8;
-        const COL1_X: isize = 72;
+        const COL1_X: isize = 76;
         let items = launchers();
         let col0_count = ((items.len() + 1) / 2) as isize;
         // Check column 0
@@ -748,11 +748,11 @@ impl Wm {
         back.clear(DESKTOP_BG);
 
         // Desktop icons: two-column grid so all apps fit without clipping.
-        // Col 0: x=8, Col 1: x=72. Each icon slot is 60px tall (48 icon + 12 label).
+        // Col 0: x=8, Col 1: x=76. Each slot is 68px (48 icon + 12 label + 8 gap).
         const ICON_W: usize = 48;
-        const ICON_SLOT: usize = 60;
+        const ICON_SLOT: usize = 68;
         const COL0_X: usize = 8;
-        const COL1_X: usize = 72;
+        const COL1_X: usize = 76;
         let apps = launchers();
         let col0_count = (apps.len() + 1) / 2;
         for (i, (_, label)) in apps.iter().enumerate() {
@@ -817,7 +817,7 @@ impl Wm {
         // Status text sits just past the last launcher button (its x scales
         // with the number of launchers so they never overlap).
         let sx = 70 + launchers().len() * 78 + 16;
-        back.draw_string(sx, ty + 12, "VEIL OS - from-scratch AArch64", 0xff60_7888, None);
+        back.draw_string(sx, ty + 12, "Veil OS", 0xff60_7888, None);
 
         // Cursor, always on top.
         for (row, line) in CURSOR.iter().enumerate() {

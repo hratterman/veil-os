@@ -557,3 +557,24 @@ multi-class+descendant link colour, @media skipped, overlay hidden,
 scroll-reveal visible, rem gap. Regressions all green: M16 (pixel-exact on-OS
 site), M34 flex/cssvar/font, M32 table/internet, M31 web; the live
 henryratterman render via `scripts/m32_test.sh scripts/drive_m34_hr.py`.
+
+## M35 — "GO CRAZY" (2026-06-11)
+
+The big one. Ten subsystems, 15 acceptance tests. All built from scratch, no crates.
+
+| # | Piece | Status | Proof |
+|---|-------|--------|-------|
+| 1 | **JPEG decoder** (`src/jpeg.rs`) | DONE | baseline **+ progressive** (SOF0/1/2), Huffman, restart markers, integer IDCT, 4:4:4/4:2:2/4:2:0, YCbCr→RGB. JPEG_OK; viewer renders DOG.JPG (progressive) crisply. Wired into viewer/files/browser via `png::decode_any`. |
+| 2 | **Browser text input** | DONE | editable address bar (click/type/Enter/Esc) + on-page `<input>`/`<textarea>` (click-focus, type, focus ring). `drive_m35_input.py`. |
+| 3 | **Clipboard** | DONE | `src/clipboard.rs`; Ctrl+C/Ctrl+A/Ctrl+V across browser/shell/lisp/files. `drive_m35_clip.py` (1235 B browser→shell). |
+| 4 | **Real shell** (`src/shell.rs`) | DONE | ls/cat/cp/mv/rm/echo>file/pipes/grep/pwd/cd/run + history + tab-completion over FAT16 (`fs::delete` added). `drive_m35_shell.py`. |
+| 5 | **App kill** | DONE | `ps`/`kill <id|name>` reclaims an app's heap via Drop, others keep running. `drive_m35_kill.py` (kill browser, lisp survives). |
+| 6 | **GUI overhaul** | DONE | modern dark palette (#0d0d0d/#1a1a1a/#5b8af0), no chunky blue title bars, accent focus border + underline, drop shadows, slim taskbar, desktop grid. `drive_m35_gui.py`; gui_test re-greened. |
+| 7 | **MJPEG video** (`src/video.rs`) | DONE | splits JPEG frames, decodes on tick ~25fps, scale-to-fit, play/pause/seek. DEMO.MJP plays. `drive_m35_video.py`. |
+| 8 | **WASM + JIT** (`src/wasm/`) | DONE | parser + stack interpreter + WASI host (fd_write) + **single-pass AArch64 JIT** (locals/operand stack → x9..x17, native ARM64 into EL1-exec heap, I-cache flush). hello prints; **JIT is 2873× faster** than the interpreter on compute(400k). `drive_m35_wasm.py`. |
+| 9 | **Direct kernel TCP** | DONE | browser `http_direct()` — external http:// goes via the kernel TCP/IP stack (DNS+connect+GET), proxy only as fallback. example.com→104.20.23.154:80, DIRECT_HTTP_OK. `drive_m35_net.py`. |
+| 10 | **Games** | DONE | Snake (`src/snake.rs`, high score → SNAKE.TXT) + Veil Breakout (`src/breakout.rs`). `drive_m35_snake.py`, `drive_m35_breakout.py`. |
+
+**Acceptance tests:** 1 ✓(viewer+upload), 2 ~ (JPEG `<img>` renders — proven on photo.jpg; henryratterman's hero is JS-injected/CSS-bg, a JS limit not a JPEG one), 3 ✓ (Wikipedia QEMU — redirect-following added, 6463 items of article text), 4–15 ✓.
+
+Also added: Alt+Tab task switch, browser **redirect-following** (3xx Location), rgb()/text-decoration already from M34. Regressions green: boot self-tests (JPEG_OK/WASM_OK/WASM_JIT_FAST/CRYPTO/FONTS/HEAP), gui_test, m16, m23, m29, m34 nav/flex/cssvar, m32 table. (m34_img's gnu-logo remains external-network-flaky.)

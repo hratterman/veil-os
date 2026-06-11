@@ -58,13 +58,14 @@ def main():
           CHECK_WHITE in present and CHECK_TEAL in present, str(present))
     first = content_region(img)
 
-    # Right arrow -> next image (DOG.PNG). It must change what's on screen.
+    # Right arrow -> next image (M35: the disk now has JPGs too, so the second
+    # image may be DOG.JPG; just require the viewer to advance to a new file).
     mark = len(d.serial())
     d.send([{"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "right"}}}])
     d.send([{"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "right"}}}])
     check("right arrow advances to next file",
-          d.wait_serial("VIEWER: showing DOG.PNG", 5, mark)
-          or "VIEWER: cannot decode DOG.PNG" in d.serial()[mark:])
+          d.wait_serial("VIEWER: showing ", 5, mark)
+          or "VIEWER: cannot decode " in d.serial()[mark:])
     d.move(1000, 700)
     img2 = d.dump("m23_next")
     check("displayed image changed after right arrow", content_region(img2) != first)

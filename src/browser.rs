@@ -411,6 +411,36 @@ fn tls_get(url: &str) -> Option<(u32, String, Vec<u8>)> {
     Some(parsed)
 }
 
+static DIRECT_HTTP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Direct HTTP/1.1 fetch of an external `http://` URL over the kernel's own
+/// TCP/IP stack — no host proxy. DNS-resolves the host, connects to port 80,
+/// sends the GET, and reads until the response is complete (bounded).
+fn http_direct(url: &str) -> Option<(u32, String, Vec<u8>)> {
+    let rest = url.get(7..)?; // strip "http://"
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h, p.parse().unwrap_or(80)),
+        None => (hostport, 80u16),
+    };
+    let ip = net::dns_resolve(host)?;
+    kprintln!("BROWSER: direct TCP {host} -> {}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+    let h = net::tcp_connect(ip, port)?;
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: VeilOS\r\nConnection: close\r\n\r\n");
+    write_all(h, req.as_bytes());
+    let resp = read_http(h, 1 << 20, FETCH_TIMEOUT, FETCH_TIMEOUT * 4);
+    net::tcp_close(h);
+    let parsed = parse_response(&resp, url)?;
+    if parsed.0 == 200 && !DIRECT_HTTP_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("DIRECT_HTTP_OK: fetched {host} over kernel TCP (no host proxy)");
+    }
+    Some(parsed)
+}
+
 /// GET `path`. Local paths ("/page.htm") hit our own HTTP server on loopback;
 /// `https://` URLs use the from-scratch TLS 1.3 stack directly; other external
 /// `http://` URLs go through the host proxy at 10.0.2.2:7779.
@@ -420,6 +450,12 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
             return Some(r);
         }
         kprintln!("BROWSER: direct TLS failed for {path}, falling back to proxy");
+    } else if is_external(path) {
+        // M35: external http:// goes direct via the kernel TCP stack first.
+        if let Some(r) = http_direct(path) {
+            return Some(r);
+        }
+        kprintln!("BROWSER: direct HTTP failed for {path}, falling back to proxy");
     }
     let external = is_external(path);
     let (ip, port, timeout) = if external {

@@ -309,3 +309,9 @@ pub fn render(win: &mut Window) {
     let cx = 4 + shown.chars().count() * cwp;
     fb.fill_rect(cx, y, cwp, rh, DIM);
 }
+
+/// M35 clipboard: the REPL's visible output, joined as plain text (Ctrl+C).
+pub fn output_text(win: &crate::wm::Window) -> alloc::string::String {
+    let crate::wm::App::Lisp(st) = &win.app else { return alloc::string::String::new() };
+    st.output.join("\n")
+}

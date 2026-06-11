@@ -59,6 +59,35 @@ pub struct BrowserState {
     edit_buf: String,        // address-bar contents while editing
     fields: Vec<InputField>, // <input>/<textarea> on the current page
     focus: Option<usize>,    // index into `fields` of the focused field
+    page_text: String,       // all visible text, for Ctrl+A / Ctrl+C
+}
+
+/// Copy the page's visible text to the clipboard (Ctrl+A selects all, Ctrl+C
+/// copies). Returns the number of bytes copied.
+pub fn copy_text(win: &Window) -> usize {
+    let crate::wm::App::Browser(st) = &win.app else { return 0 };
+    crate::clipboard::set(st.page_text.clone());
+    st.page_text.len()
+}
+
+/// Paste clipboard text into the focused address bar or input field.
+pub fn paste(win: &mut Window) -> bool {
+    let text = crate::clipboard::get();
+    if text.is_empty() {
+        return false;
+    }
+    let crate::wm::App::Browser(st) = &mut win.app else { return false };
+    if st.editing {
+        st.edit_buf.push_str(text.trim());
+        paint_view(win);
+        true
+    } else if let Some(f) = st.focus.and_then(|i| st.fields.get_mut(i)) {
+        f.value.push_str(text.trim());
+        paint_fields(win);
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -96,6 +125,7 @@ impl BrowserState {
             edit_buf: String::new(),
             fields: Vec::new(),
             focus: None,
+            page_text: String::new(),
         }
     }
 }
@@ -1777,6 +1807,14 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     st.doc_h = doc_h;
     st.links = ctx.links;
     st.fields = ctx.fields;
+    let mut text = String::new();
+    for it in &ctx.items {
+        if let Item::Text { s, .. } = it {
+            text.push_str(s);
+            text.push(' ');
+        }
+    }
+    st.page_text = text;
     st.focus = None;
     st.scroll = 0;
     st.page_bg = page_bg;

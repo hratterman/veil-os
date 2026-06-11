@@ -10,8 +10,8 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    browser, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl, scheduler, shell,
-    snd, timer, viewer,
+    browser, clipboard, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl,
+    scheduler, shell, snd, timer, viewer,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -267,6 +267,8 @@ pub struct Wm {
     pend_buttons: u32,
     drag: Option<(usize, isize, isize)>, // (window index AT TOP, grab offset)
     shift: bool,
+    ctrl: bool, // Ctrl held (clipboard shortcuts)
+    alt: bool,  // Alt held (Alt+Tab task switch)
     abs_max: (u32, u32),
     pub dirty: bool,
     icon_order: Vec<&'static str>,     // desktop icon display order
@@ -289,6 +291,8 @@ impl Wm {
             pend_buttons: 0,
             drag: None,
             shift: false,
+            ctrl: false,
+            alt: false,
             abs_max,
             dirty: true,
             icon_order: load_icon_order(),
@@ -489,6 +493,8 @@ impl Wm {
         match ev_type {
             keymap::EV_KEY => match code {
                 keymap::KEY_LEFTSHIFT | keymap::KEY_RIGHTSHIFT => self.shift = value != 0,
+                keymap::KEY_LEFTCTRL | keymap::KEY_RIGHTCTRL => self.ctrl = value != 0,
+                keymap::KEY_LEFTALT => self.alt = value != 0,
                 keymap::BTN_LEFT => {
                     self.pend_buttons = (self.pend_buttons & !1) | (value != 0) as u32;
                 }
@@ -527,6 +533,25 @@ impl Wm {
     }
 
     fn on_key(&mut self, code: u16) {
+        // M35: Alt+Tab task switch; Ctrl+C/V/A clipboard. These take priority
+        // over per-app key handling.
+        if self.alt && code == keymap::KEY_TAB {
+            self.cycle_windows();
+            return;
+        }
+        if self.ctrl {
+            match code {
+                keymap::KEY_C | keymap::KEY_A => {
+                    self.clipboard_copy();
+                    return;
+                }
+                keymap::KEY_V => {
+                    self.clipboard_paste();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Browser scroll keys / viewer arrow keys have no character form.
         if let Some(win) = self.windows.last_mut() {
             if matches!(win.app, App::Browser(_)) && browser::key(win, code) {
@@ -624,6 +649,71 @@ impl Wm {
 
     /// Run a shell command line: kernel built-ins, or a user binary
     /// loaded from the filesystem and run at EL0.
+    /// Alt+Tab: bring the next window to the top (cycle the z-order).
+    fn cycle_windows(&mut self) {
+        if self.windows.len() < 2 {
+            return;
+        }
+        let top = self.windows.pop().unwrap();
+        self.windows.insert(0, top);
+        if let Some(w) = self.windows.last() {
+            kprintln!("WM: Alt+Tab -> '{}'", w.title);
+        }
+        self.dirty = true;
+    }
+
+    /// Ctrl+C / Ctrl+A: copy the focused app's text to the clipboard.
+    fn clipboard_copy(&mut self) {
+        let Some(win) = self.windows.last() else { return };
+        match &win.app {
+            App::Browser(_) => {
+                let n = browser::copy_text(win);
+                kprintln!("BROWSER: Ctrl+C copied {n} bytes of page text");
+            }
+            App::Shell { lines, .. } => {
+                clipboard::set(lines.iter().cloned().collect());
+            }
+            App::Lisp(_) => {
+                clipboard::set(repl::output_text(win));
+            }
+            App::Files(_) => {
+                if let Some(name) = files::selected_name(win) {
+                    clipboard::set(name);
+                }
+            }
+            App::Editor(_) => {}
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Ctrl+V: paste the clipboard into the focused app.
+    fn clipboard_paste(&mut self) {
+        let text = clipboard::get();
+        if text.is_empty() {
+            return;
+        }
+        let Some(win) = self.windows.last_mut() else { return };
+        match &mut win.app {
+            App::Shell { input, .. } => {
+                input.push_str(text.trim());
+                render_shell(win);
+            }
+            App::Browser(_) => {
+                browser::paste(win);
+            }
+            App::Lisp(_) => {
+                for c in text.chars().filter(|c| *c != '\n') {
+                    repl::char_input(win, c);
+                }
+                repl::render(win);
+            }
+            _ => {}
+        }
+        kprintln!("CLIPBOARD: pasted {} bytes", text.len());
+        self.dirty = true;
+    }
+
     fn shell_execute(&mut self, cmd: &str) {
         kprintln!("SHELL: $ {cmd}");
         let cmd = cmd.trim();

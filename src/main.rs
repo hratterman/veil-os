@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod blk;
 mod browser;
+mod clipboard;
 mod clock;
 mod crypto;
 mod css;

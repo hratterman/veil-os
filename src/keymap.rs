@@ -28,6 +28,13 @@ pub fn translate(code: u16, shift: bool) -> Option<char> {
 
 pub const KEY_LEFTSHIFT: u16 = 42;
 pub const KEY_RIGHTSHIFT: u16 = 54;
+pub const KEY_LEFTCTRL: u16 = 29;
+pub const KEY_RIGHTCTRL: u16 = 97;
+pub const KEY_LEFTALT: u16 = 56;
+pub const KEY_TAB: u16 = 15;
+pub const KEY_A: u16 = 30;
+pub const KEY_C: u16 = 46;
+pub const KEY_V: u16 = 47;
 pub const BTN_LEFT: u16 = 0x110;
 pub const BTN_RIGHT: u16 = 0x111;
 

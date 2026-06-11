@@ -180,3 +180,9 @@ pub fn click(win: &mut Window, rx: isize, ry: isize) -> Action {
         Action::Redraw
     }
 }
+
+/// M35 clipboard: the highlighted filename (Ctrl+C in the file manager).
+pub fn selected_name(win: &crate::wm::Window) -> Option<alloc::string::String> {
+    let crate::wm::App::Files(st) = &win.app else { return None };
+    st.files.get(st.sel).cloned()
+}

@@ -1053,7 +1053,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
     // Resolve the FreeType face + pixel size from the (inherited) typography.
     s.font = Font {
         id: pick_ftid(s.font_fam, s.font_weight, s.font_italic),
-        px: ((s.scale * 16) as u16).max(9),
+        px: ((s.scale * 16) as u16).max(13),
     };
     s
 }

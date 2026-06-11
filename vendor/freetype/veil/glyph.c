@@ -17,7 +17,7 @@ int veil_render_glyph(FT_Face face, unsigned long codepoint, unsigned int size_p
                       const unsigned char** out_buf, int* w, int* rows, int* pitch,
                       int* left, int* top, int* advance) {
     if (FT_Set_Pixel_Sizes(face, 0, size_px)) return 1;
-    if (FT_Load_Char(face, codepoint, FT_LOAD_RENDER | FT_LOAD_NO_HINTING)) return 2;
+    if (FT_Load_Char(face, codepoint, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) return 2;
     FT_GlyphSlot g = face->glyph;
     *out_buf = g->bitmap.buffer;
     *w       = (int)g->bitmap.width;

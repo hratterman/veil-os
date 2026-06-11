@@ -61,6 +61,7 @@ fn build_freetype(dir: &str) {
         "src/psnames/psnames.c",
         "veil/veil_ftsystem.c",
         "veil/shim.c",
+        "src/autofit/autofit.c",
         "veil/glyph.c",
     ];
 

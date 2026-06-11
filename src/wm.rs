@@ -973,6 +973,15 @@ impl Wm {
         }
         if self.ctrl {
             match code {
+                keymap::KEY_F => {
+                    if let Some(win) = self.windows.last_mut() {
+                        if matches!(win.app, App::Browser(_)) {
+                            browser::find_toggle(win);
+                            self.dirty = true;
+                        }
+                    }
+                    return;
+                }
                 keymap::KEY_C | keymap::KEY_A => {
                     self.clipboard_copy();
                     return;
@@ -1080,8 +1089,9 @@ impl Wm {
                     self.dirty = true;
                 }
                 App::Browser(_) => {
-                    // Address bar / focused form field text entry.
-                    if browser::char_input(win, ch) {
+                    // Find bar (Ctrl+F) takes input first, then address bar /
+                    // focused form field text entry.
+                    if browser::find_char(win, ch) || browser::char_input(win, ch) {
                         self.dirty = true;
                     }
                 }

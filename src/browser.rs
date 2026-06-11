@@ -77,6 +77,12 @@ pub struct BrowserState {
     fields: Vec<InputField>, // <input>/<textarea> on the current page
     focus: Option<usize>,    // index into `fields` of the focused field
     page_text: String,       // all visible text, for Ctrl+A / Ctrl+C
+    // M36 find-in-page (Ctrl+F).
+    text_runs: Vec<(isize, isize, isize, String)>, // (x, y, w, lowercased) in page coords
+    find_open: bool,
+    find_query: String,
+    find_matches: Vec<usize>, // indices into text_runs that match
+    find_idx: usize,
 }
 
 /// Copy the page's visible text to the clipboard (Ctrl+A selects all, Ctrl+C
@@ -143,6 +149,11 @@ impl BrowserState {
             fields: Vec::new(),
             focus: None,
             page_text: String::new(),
+            text_runs: Vec::new(),
+            find_open: false,
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_idx: 0,
         }
     }
 }
@@ -1841,6 +1852,7 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
 
     // Paint the whole document into the page buffer.
     let mut page = vec![page_bg; view_w * doc_h];
+    let mut text_runs: Vec<(isize, isize, isize, String)> = Vec::new();
     let pfb = unsafe { Framebuffer::new(page.as_mut_ptr(), view_w, doc_h, view_w * 4) };
     for item in &ctx.items {
         match item {
@@ -1856,6 +1868,8 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
                     let color = readable(*color, page_bg);
                     let _ = scale;
                     pfb.draw_text((*x).max(0) as usize, *y as usize, s, font.id, font.px, color);
+                    let rw = pfb.measure_text(s, font.id, font.px).0 as isize;
+                    text_runs.push((*x, *y, rw, s.to_lowercase()));
                 }
             }
             &Item::Image { x, y, idx } => {
@@ -1903,6 +1917,11 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         }
     }
     st.page_text = text;
+    st.text_runs = text_runs;
+    st.find_open = false;
+    st.find_query.clear();
+    st.find_matches.clear();
+    st.find_idx = 0;
     st.focus = None;
     st.scroll = 0;
     st.page_bg = page_bg;
@@ -2004,6 +2023,109 @@ pub fn paint_view(win: &mut Window) {
     fb.fill_rect(0, 0, 18, TOPBAR, if has_history { 0xff90_a8c0 } else { 0xffb0_b4bc });
     fb.draw_string(5, 2, "<", BAR_TEXT, None);
     fb.draw_string(22, 2, &bar, BAR_TEXT, None);
+
+    // M36 find-in-page: highlight matches in view + a find bar at the bottom.
+    if let crate::wm::App::Browser(st) = &win.app {
+        if st.find_open {
+            let view_h = ch - TOPBAR;
+            for (mi, &ri) in st.find_matches.iter().enumerate() {
+                let (rx, ry, rw, _) = &st.text_runs[ri];
+                let py = *ry as usize;
+                if py >= st.scroll && py + 18 < st.scroll + view_h {
+                    let cy = TOPBAR + (py - st.scroll);
+                    let (col, a) = if mi == st.find_idx { (0xffff_a000, 150) } else { (0xffff_e000, 90) };
+                    fb.blend_rect((*rx).max(0) as usize, cy, (*rw).max(6) as usize, 18, col, a);
+                }
+            }
+            let by = ch - 26;
+            fb.fill_rect(0, by, cw, 26, 0xff2a_2a2a);
+            let n = if st.find_matches.is_empty() { 0 } else { st.find_idx + 1 };
+            let label = alloc::format!("Find: {}_    {} of {}", st.find_query, n, st.find_matches.len());
+            fb.draw_text(8, by + 4, &label, crate::freetype::FontId::Ui, 14, 0xffe8_e8e8);
+        }
+    }
+}
+
+// --- M36 find-in-page (Ctrl+F) -------------------------------------------------
+
+pub fn find_toggle(win: &mut Window) {
+    let crate::wm::App::Browser(st) = &mut win.app else { return };
+    st.find_open = !st.find_open;
+    if !st.find_open {
+        st.find_matches.clear();
+    }
+    paint_view(win);
+}
+
+fn find_recompute(win: &mut Window) {
+    {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        let q = st.find_query.to_lowercase();
+        st.find_matches.clear();
+        if !q.is_empty() {
+            for (i, (_, _, _, t)) in st.text_runs.iter().enumerate() {
+                if t.contains(&q) {
+                    st.find_matches.push(i);
+                }
+            }
+        }
+        st.find_idx = 0;
+        scroll_to_match(st);
+        crate::kprintln!("BROWSER: find '{}' -> {} matches", st.find_query, st.find_matches.len());
+    }
+    paint_view(win);
+}
+
+fn scroll_to_match(st: &mut BrowserState) {
+    if let Some(&ri) = st.find_matches.get(st.find_idx) {
+        let y = st.text_runs[ri].1.max(0) as usize;
+        st.scroll = y.saturating_sub(60).min(st.doc_h.saturating_sub(1));
+    }
+}
+
+/// Returns true if the browser consumed the character (find bar is open).
+pub fn find_char(win: &mut Window, ch: char) -> bool {
+    {
+        let crate::wm::App::Browser(st) = &win.app else { return false };
+        if !st.find_open {
+            return false;
+        }
+    }
+    match ch {
+        '\u{1b}' => find_toggle(win), // Esc closes
+        '\n' => find_advance(win, 1),
+        '\u{8}' => {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                st.find_query.pop();
+            }
+            find_recompute(win);
+        }
+        c if !c.is_control() => {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                st.find_query.push(c);
+            }
+            find_recompute(win);
+        }
+        _ => {}
+    }
+    true
+}
+
+pub fn find_advance(win: &mut Window, dir: isize) {
+    {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        if st.find_matches.is_empty() {
+            return;
+        }
+        let n = st.find_matches.len() as isize;
+        st.find_idx = (st.find_idx as isize + dir).rem_euclid(n) as usize;
+        scroll_to_match(st);
+    }
+    paint_view(win);
+}
+
+pub fn find_is_open(win: &Window) -> bool {
+    matches!(&win.app, crate::wm::App::Browser(st) if st.find_open)
 }
 
 /// Canvas-relative click: focus an on-page input field if one was hit.

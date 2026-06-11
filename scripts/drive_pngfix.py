@@ -16,7 +16,20 @@ import sys
 
 from guilib import Driver, check, finish
 
-VIEWER_BTN = (496, 768 - 20)
+import re
+
+
+# Taskbar pills have dynamic widths (M35.5 redesign) and log their position as
+# "TASKBAR_PILL: <app> <x> <w>"; read the viewer pill's centre from serial so
+# the click survives layout changes.
+def viewer_btn(d):
+    hits = re.findall(r"TASKBAR_PILL: viewer (\d+) (\d+)", d.serial())
+    if not hits:
+        return (496, 768 - 20)
+    x, w = int(hits[-1][0]), int(hits[-1][1])
+    return (x + w // 2, 768 - 20)
+
+
 WIN_X, WIN_Y, CW, CH = 220, 80, 560, 460
 CONTENT_X = WIN_X + 2
 CONTENT_Y = WIN_Y + 2 + 22
@@ -49,7 +62,7 @@ def main():
     # Launch the viewer — it opens on AAA2048.PNG (2048x2048), the exact case
     # that used to take the OS down.
     mark = len(d.serial())
-    d.click(*VIEWER_BTN)
+    d.click(*viewer_btn(d))
     check("viewer launched", d.wait_serial("WM: launch 'viewer'", 5, mark))
 
     # The big image must DECODE (downscaled), not crash and not be refused.

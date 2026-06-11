@@ -50,6 +50,7 @@ pub struct BrowserState {
     scroll: usize,
     page_bg: u32,
     history: Vec<String>, // previously-visited paths (newest last), max 20
+    img_cache: Vec<(String, png::Image)>, // decoded images by URL, LRU, cap 10
 }
 
 struct LinkBox {
@@ -71,9 +72,13 @@ impl BrowserState {
             scroll: 0,
             page_bg: 0xffff_ffff,
             history: Vec::new(),
+            img_cache: Vec::new(),
         }
     }
 }
+
+static EXT_IMG_DONE: AtomicBool = AtomicBool::new(false);
+const IMG_CACHE_CAP: usize = 10;
 
 // --- HTTP client over our own TCP, via loopback --------------------------------
 
@@ -628,7 +633,8 @@ fn collect_inline(
                                 h: img.h as isize,
                             });
                         }
-                        None => collect_text("[img]", style, &link, buf),
+                        // Not decoded (failed fetch / non-PNG): render nothing.
+                        None => {}
                     }
                 }
                 _ => {
@@ -951,7 +957,14 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         }
     }
 
-    // Images: fetch + decode each unique PNG src.
+    // Images: fetch + decode each unique PNG src, served by the persistent LRU
+    // cache so navigating back doesn't re-fetch. https -> TLS, http -> proxy,
+    // relative/absolute -> loopback (all via http_get). Non-PNG (JPEG/WebP/SVG)
+    // is skipped silently — no [img] placeholder.
+    let mut cache = match &mut win.app {
+        crate::wm::App::Browser(st) => core::mem::take(&mut st.img_cache),
+        _ => Vec::new(),
+    };
     let mut imgs: Vec<(String, png::Image)> = Vec::new();
     let mut img_nodes = Vec::new();
     doc.find_all("img", &mut img_nodes);
@@ -960,15 +973,31 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         if imgs.iter().any(|(s, _)| *s == src) {
             continue;
         }
+        // Cache hit: move-to-front (LRU) and reuse the decoded image.
+        if let Some(pos) = cache.iter().position(|(s, _)| *s == src) {
+            let entry = cache.remove(pos);
+            imgs.push((entry.0.clone(), entry.1.clone()));
+            cache.insert(0, entry);
+            continue;
+        }
         if let Some((200, _, data)) = http_get(&src) {
             match png::decode(&data) {
                 Some(img) => {
                     kprintln!("BROWSER: decoded {src} ({}x{} px)", img.w, img.h);
+                    if is_external(&src) && !EXT_IMG_DONE.swap(true, Ordering::Relaxed) {
+                        kprintln!("EXT_IMG_OK");
+                    }
+                    cache.insert(0, (src.clone(), img.clone()));
+                    cache.truncate(IMG_CACHE_CAP);
                     imgs.push((src, img));
                 }
-                None => kprintln!("BROWSER: {src} is not a PNG this browser can decode"),
+                None => kprintln!("BROWSER: {src} is not a PNG (skipped, no placeholder)"),
             }
         }
+    }
+    // Return the (possibly grown) cache to the window for the next navigation.
+    if let crate::wm::App::Browser(st) = &mut win.app {
+        st.img_cache = cache;
     }
 
     // Layout at the window's content width.

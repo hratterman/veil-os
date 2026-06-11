@@ -55,7 +55,13 @@ def strip_html(html, base):
     for tag in DROP_TREES:
         html = re.sub(rf"<{tag}\b.*?</{tag}>", " ", html, flags=re.S | re.I)
         html = re.sub(rf"<{tag}\b[^>]*/?>", " ", html, flags=re.I)
-    html = re.sub(r"<img\b[^>]*>", " [image] ", html, flags=re.I)
+    # Keep <img> but reduce it to an absolutized src so the guest can fetch the
+    # image back through the proxy (it decodes PNG, skips other formats). Drop
+    # images with no src.
+    def _img(m):
+        s = re.search(r'src\s*=\s*["\']([^"\']*)["\']', m.group(0), flags=re.I)
+        return '<img src="%s">' % urllib.parse.urljoin(base, s.group(1)) if s else ""
+    html = re.sub(r"<img\b[^>]*>", _img, html, flags=re.I)
     # Absolutise links so the guest's clicks come back through the proxy.
     html = re.sub(
         r'href\s*=\s*"([^"]*)"',
@@ -96,6 +102,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001 — surface any failure to the guest
             return self._send(page("proxy error",
                                     "<p>%s: %s</p><p>%s</p>" % (type(e).__name__, e, url)))
+        if ctype.startswith("image/"):
+            # Serve the raw image so the guest can decode it (PNG) or skip it.
+            sys.stdout.write("proxy: %s -> image %s %d bytes\n" % (url, ctype, len(data)))
+            sys.stdout.flush()
+            return self._send_raw(data, ctype)
         if "html" not in ctype:
             return self._send(page(ctype or "unknown",
                                    "<p>not HTML (%d bytes)</p>" % len(data)))
@@ -109,8 +120,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(body)
 
     def _send(self, body):
+        self._send_raw(body, "text/html")
+
+    def _send_raw(self, body, ctype):
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()

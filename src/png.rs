@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 static INTERLACE_DONE: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone)]
 pub struct Image {
     pub w: usize,
     pub h: usize,

@@ -293,7 +293,15 @@ written from scratch.</p>
 </ul>
 <p class="muted">Slow to load is normal - the proxy is fetching a real site
 across the internet, then this browser lays out every line by hand.</p>
+<p><a href="imgtest.htm">External images test</a></p>
 <p><a href="index.htm">Home</a></p>""")
+
+IMGTEST = page("""<h1>External images</h1>
+<p>A PNG fetched over direct TLS 1.3 (no proxy):</p>
+<img src="https://www.python.org/static/img/python-logo.png">
+<p>A PNG fetched over plain HTTP through the proxy:</p>
+<img src="http://www.gnu.org/graphics/heckert_gnu.small.png">
+<p><a href="web.htm">Back</a></p>""")
 
 CHANGES = page("""<h1>Changelog</h1>
 <p class="muted">Every milestone gated behind an observed proof before the
@@ -551,7 +559,7 @@ def main():
         "index.htm": INDEX, "page2.htm": PAGE2, "news.htm": NEWS,
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
-        "web.htm": WEB,
+        "web.htm": WEB, "imgtest.htm": IMGTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

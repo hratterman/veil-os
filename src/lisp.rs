@@ -235,6 +235,7 @@ const BUILTINS: &[&str] = &[
     "+", "-", "*", "/", "mod", "=", "<", ">", "<=", ">=", "cons", "car", "cdr",
     "list", "null?", "pair?", "length", "append", "number?", "string?",
     "symbol?", "boolean?", "display", "newline", "not", "eq?", "equal?", "map",
+    "read-file", "write-file", "list-files",
     "help",
 ];
 
@@ -586,6 +587,13 @@ fn as_int(v: &Value) -> Result<i64, String> {
     }
 }
 
+fn as_str(v: &Value) -> Result<&str, String> {
+    match v {
+        Value::Str(s) => Ok(s),
+        _ => Err(format!("expected a string, got {}", print_value(v))),
+    }
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -600,7 +608,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-const HELP: &str = "examples:\n  (+ 1 2 3)\n  (define (sq x) (* x x))  (sq 7)\n  (map (lambda (x) (* x x)) (list 1 2 3 4 5))\n  (if (< 3 5) 'yes 'no)\n  (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))  (fact 10)";
+const HELP: &str = "examples:\n  (+ 1 2 3)\n  (define (sq x) (* x x))  (sq 7)\n  (map (lambda (x) (* x x)) (list 1 2 3 4 5))\n  (if (< 3 5) 'yes 'no)\n  (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))  (fact 10)\nfiles (FAT 8.3, UPPERCASE names):\n  (write-file \"NOTE.TXT\" \"hi\")  (read-file \"NOTE.TXT\")\n  (list-files)\ndefines persist across open/close in LISP.TXT";
 
 fn need(a: &[Value], n: usize, name: &str) -> Result<(), String> {
     if a.len() < n {
@@ -708,6 +716,30 @@ fn apply_builtin(name: &str, a: Vec<Value>) -> Result<Value, String> {
             }
             Ok(list_from(out))
         }
+        // File I/O over FAT16 (names are 8.3 UPPERCASE). read-file returns the
+        // file contents as a string, or #f if missing; write-file returns #t/#f.
+        "read-file" => {
+            need(&a, 1, "read-file")?;
+            let name = as_str(&a[0])?;
+            match crate::fs::read_file(name) {
+                Some(bytes) => Ok(Value::Str(
+                    alloc::string::String::from_utf8_lossy(&bytes).into_owned(),
+                )),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "write-file" => {
+            need(&a, 2, "write-file")?;
+            let name = as_str(&a[0])?;
+            let content = as_str(&a[1])?;
+            Ok(Value::Bool(crate::fs::write_file(name, content.as_bytes()).is_ok()))
+        }
+        "list-files" => match crate::fs::list_root() {
+            Some(files) => Ok(list_from(
+                files.into_iter().map(|(n, _)| Value::Str(n)).collect(),
+            )),
+            None => Ok(Value::Nil),
+        },
         "help" => {
             out_push(HELP);
             out_push("\n");

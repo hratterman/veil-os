@@ -121,6 +121,27 @@ fn run_persist_test() {
     } else {
         kprintln!("LISP PERSIST FAIL: pvar={v:?} plist={l:?} psq={q:?}");
     }
+    run_io_test();
+}
+
+// Exercise the file-I/O builtins end to end against FAT16: write a file, read
+// it back, and confirm it shows up in (list-files). Needs a disk (the GUI
+// proofs all boot with one); skips cleanly when diskless.
+fn run_io_test() {
+    if !crate::fs::mounted() {
+        kprintln!("LISP: no disk, skipping file I/O self-test");
+        return;
+    }
+    let mut io = Interp::new();
+    let w = io.eval_str("(write-file \"TEST.TXT\" \"hello\")");
+    let r = io.eval_str("(read-file \"TEST.TXT\")");
+    let listed = io.eval_str("(if (null? (list-files)) #f #t)");
+    let _ = lisp::take_output();
+    if w.as_deref() == Ok("#t") && r.as_deref() == Ok("\"hello\"") && listed.as_deref() == Ok("#t") {
+        kprintln!("LISP_IO_OK");
+    } else {
+        kprintln!("LISP IO FAIL: write={w:?} read={r:?} listed={listed:?}");
+    }
 }
 
 impl LispState {

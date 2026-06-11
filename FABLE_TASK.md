@@ -1,29 +1,24 @@
-# Fable — Overnight Session (M32)
+# Fable — M33 Session
 
-Read this document in full before touching any file. This is a multi-track
-overnight task. You are running unsupervised. There is no one to ask. Make
-every decision yourself. Never pause for approval. Never ask a question. If
-you hit a wall on one track, skip to the next and come back.
+Read this document in full before touching any file. You are running
+autonomously. Make every decision yourself. Never pause for approval. Never
+ask a question. If you hit a wall after 4 consecutive attempts on the same
+problem, write a BLOCKED note in PROGRESS.md and move to the next task.
 
 ---
 
-## Autonomy rules (read these first, they override everything else)
+## Autonomy rules
 
-1. **Never ask for confirmation or approval.** Henry is asleep. If you find
-   yourself wanting to ask "should I...?" — just decide and do it.
-2. **Never pause waiting for input.** If a task requires a decision, make the
-   best one and proceed.
-3. **Stuck rule:** If you fail to make progress on the same problem after 4
-   consecutive attempts (same error, same stall), STOP that sub-task, write a
-   clear note in PROGRESS.md under a "BLOCKED" heading, and move to the next
-   task. Partial progress is better than a loop.
-4. **Build must pass before commit.** Never commit broken code.
-5. **Each task has a serial pass criterion.** A task is DONE when the serial
-   output proves it, not when you think the code looks right.
-6. **Deploy after every task.** Run `scripts/install_sessions.sh` after each
-   completed track so the live demo reflects progress. Don't batch deploys.
-7. **Commit granularly.** One commit per completed sub-task, not one giant
-   commit at the end.
+1. Never ask for confirmation or approval. Make all decisions yourself.
+2. Stuck rule: 4 failed attempts on the same problem → write BLOCKED in
+   PROGRESS.md, move on.
+3. Build must pass before every commit.
+4. Each task has a serial pass criterion. Done = serial token emitted, not
+   "code looks right."
+5. Deploy after every completed task: `scripts/install_sessions.sh`
+6. One commit per task.
+7. Never break existing functionality. Run `scripts/build.sh` before every
+   commit. Fix regressions before moving on.
 
 ---
 
@@ -32,290 +27,224 @@ you hit a wall on one track, skip to the next and come back.
 - Project root: `/Users/henry/projects/veil-os/`
 - Kernel source: `src/` (Rust, no_std, AArch64)
 - QEMU networking: slirp (`-netdev user`), gateway `10.0.2.2`, DNS `10.0.2.3`
-- The OS already has: TCP stack, UDP, DNS (resolves pool.ntp.org), HTTP server
-  on port 80, HTTP client in browser.rs (fetches from loopback only right now)
+- The proxy (`scripts/veil_proxy.py`, launchd `com.veil.proxy`, port 7779)
+  is running and the browser already uses it for external URLs
 - Session manager: `scripts/session_manager.py`, port 6090
+- noVNC page: look in the websockify/novnc install dir (find it with
+  `find /usr/local /opt/homebrew -name "vnc.html" 2>/dev/null` or check
+  NOVNC variable in session_manager.py)
 - Deploy: `scripts/install_sessions.sh`
-- FAT 8.3 filenames: uppercase, max 12 chars
 - No external Rust crates beyond what's already in Cargo.toml
-- The browser (`src/browser.rs`) fetches pages with `http_get(path)` which
-  currently only connects to `net::local_ip()` port 80 (loopback). The DNS
-  resolver is in `src/net.rs` (look for `dns_resolve` or similar -- it already
-  resolves hostnames for NTP). Read the existing code before writing new code.
 
 ---
 
-## Track A — Browser overhaul
+## Task 1 — Browser audio (fix it actually playing)
 
-The in-OS browser currently: can't scroll long pages, has no history, can't
-reach any URL outside the local HTTP server. Fix all of that.
+The WebSocket PCM pipe is built and working (M28/M32). The session manager
+drains the FIFO and forwards PCM to browser clients over WebSocket at
+`/session/<id>/audio`. The noVNC page has `novnc_audio.js` wired in.
 
-### A1 — Scrollable pages
+The problem: browser-side audio doesn't actually play. Diagnose and fix it.
 
-Current: `MAX_DOC_H = 3000` rows are rendered into a buffer but the scroll
-offset only moves by a fixed amount. The issue is scroll is implemented but
-may not be wired to mouse wheel or keyboard properly. Read browser.rs scroll
-handling carefully.
+Likely causes to check in order:
+1. The Web Audio API context needs a user gesture to start (autoplay policy).
+   The ♪ button click should create and resume the AudioContext -- verify
+   this is actually happening and the context state is "running" after click.
+2. PCM format mismatch -- the OS sends 16-bit signed stereo 44100Hz. The JS
+   must create an AudioBuffer with the right sampleRate, 2 channels, and
+   convert Int16 → Float32 before calling `source.start()`.
+3. The WebSocket message framing -- verify the JS is receiving binary messages
+   (not text) and reading them as ArrayBuffer.
+4. Timing -- Web Audio needs buffers queued ahead of playback time. Use a
+   small lookahead (0.1s) and schedule each chunk at `ctx.currentTime + lookahead`.
 
-- Mouse wheel scrolls the page (virtio tablet sends scroll events -- check
-  input.rs for how scroll events arrive)
-- Up/Down arrow keys scroll by 1 line, PgUp/PgDn by half a window
-- Scroll position shown as a thin scrollbar on the right edge (draw a 2px
-  wide rect proportional to doc_h vs window_h)
+Fix `novnc_audio.js` (and any supporting JS) so that:
+- Clicking ♪ starts the audio context
+- PCM streams in and plays continuously without gaps
+- Works in Chrome and Firefox
 
-Pass: serial emits `SCROLL_OK` when a page taller than the window is loaded
-and scrolled past its initial position.
+Pass: manually verify audio plays in the browser when the in-OS Audio app
+plays TONE.WAV. Serial emits `AUDIO_BROWSER_OK` -- add this to the audio
+app's playback path or have session_manager.py log it when a browser client
+receives >10KB of PCM.
 
-### A2 — Browser history (back button)
+---
 
-- The address bar already exists. Add a `<` back button to the left of it.
-- Keep a `history: Vec<String>` of visited paths (max 20).
-- Clicking `<` navigates to the previous path.
-- Keyboard shortcut: Backspace when the address bar is not focused.
+## Task 2 — Lisp persistence
 
-Pass: serial emits `HISTORY_OK` after navigating forward then back.
+The Lisp REPL resets every time the window closes. Fix it so the environment
+persists across open/close cycles.
 
-### A3 — Table rendering
+- On every successful `define`, serialize the top-level environment to
+  `LISP.TXT` on the FAT16 disk (use the existing `fs::write_file` API --
+  check how the editor saves files).
+- On startup, if `LISP.TXT` exists, deserialize and restore the environment
+  before showing the prompt.
+- Format: simple s-expression dump is fine -- one `(define name value)` per
+  line for atoms/numbers/strings. Lambdas can be serialized as their source
+  form `(lambda (args) body)` if you stored the AST, or skipped (write a
+  comment `; lambda <name> not serialized`).
+- If `LISP.TXT` is corrupt or unparseable, silently start fresh (don't crash).
 
-The browser's layout engine handles block and inline boxes. Add basic table
-support: `<table>`, `<tr>`, `<td>`, `<th>`. Layout: equal-width columns,
-cells are block containers. No rowspan/colspan needed. Border: 1px line
-between cells in a contrasting color.
+Pass: serial emits `LISP_PERSIST_OK`. Test: define a variable, close the REPL
+window, reopen it, verify the variable is still bound.
 
-Pass: serial emits `TABLE_OK` when a page with a `<table>` is rendered without
-crashing.
+---
 
-Update `mksite.py` to add a table to one of the existing pages (the changelog
-or the milestone ladder work well) so there's something to test against.
+## Task 3 — Lisp file I/O builtins
 
-### A4 — Real internet access (the big one)
+Add these builtins to the interpreter:
 
-This is the most important task in the brief. The goal: type a URL like
-`http://example.com` in the browser address bar and have it load the real page.
+- `(read-file "FILENAME.TXT")` -- reads the named file from FAT16, returns
+  its contents as a string. Returns `#f` if the file doesn't exist.
+- `(write-file "FILENAME.TXT" string)` -- writes a string to a file on FAT16.
+  Returns `#t` on success, `#f` on failure.
+- `(list-files)` -- returns a list of filename strings on the disk.
 
-**Step 1 — Hostname resolution in the browser**
+Filenames are FAT 8.3 uppercase. Document this in the `(help)` output.
 
-`net::dns_resolve` (or equivalent) already exists and works -- NTP uses it.
-Wire it into the browser's `http_get` function: if the URL contains a hostname
-(not an IP and not a path-only request to loopback), resolve it to an IP first,
-then connect to that IP on port 80.
+Pass: serial emits `LISP_IO_OK`. Self-test in `LispState::new()`:
+  `(write-file "TEST.TXT" "hello")` then `(read-file "TEST.TXT")` returns
+  `"hello"`.
 
-The browser address bar currently takes paths like `/page2.htm`. Extend it to
-also accept full URLs: `http://hostname/path`. Parse the URL, extract host and
-path, resolve host, connect.
+---
 
-**Step 2 — TLS 1.3 (attempt this first)**
+## Task 4 — Desktop icon drag-to-reorganize
 
-Almost everything worth hitting is HTTPS. Implement TLS 1.3 in `src/tls.rs`.
+Users can't rearrange desktop icons. Add drag-and-drop reordering.
 
-Required:
-- X25519 key exchange (ECDH over Curve25519)
-- AES-128-GCM symmetric encryption
-- SHA-256 and HMAC-SHA256 (for key derivation)
-- TLS 1.3 handshake state machine (ClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished)
-- Skip certificate chain validation entirely -- accept any cert. This is a
-  demo OS, not a bank. Just verify the Finished MAC.
-- After handshake: wrap `tcp_write`/`tcp_read` with encrypt/decrypt so the
-  rest of the browser code sees a transparent byte stream.
+- Click and hold on an icon for 200ms to start dragging (distinguish from
+  a tap/click which launches the app).
+- While dragging, render the icon semi-transparent at the cursor position.
+- On release, swap the dragged icon with whichever slot the cursor is nearest
+  to, or insert into the nearest slot.
+- Persist the order to `ICONS.TXT` on the FAT16 disk (one icon name per line).
+  On startup, read `ICONS.TXT` and restore the order. If absent, use default.
 
-This is ~1200-1500 lines of careful Rust. The crypto is pure integer math,
-no_std compatible. Suggested approach:
-- X25519: implement the RFC 7748 scalar multiplication using a 32-byte field
-  arithmetic (Montgomery ladder, ~150 lines)
-- AES-128: standard 4-round key schedule + SubBytes/ShiftRows/MixColumns (~200
-  lines), then GCM mode on top (~150 lines)
-- SHA-256: standard FIPS 180-4 (~100 lines)
-- HKDF-Extract/Expand for key schedule (~50 lines)
-- Handshake: follow RFC 8446 Section 4 strictly. Use Wireshark or tls13.xargs.org
-  to understand the exact byte layout if needed.
+Pass: serial emits `DRAG_OK` when an icon is dragged and dropped. The order
+must survive a reboot (verified by reading ICONS.TXT content from the disk).
 
-Test: after implementing, try connecting to `http://neverssl.com` (pure HTTP,
-no TLS needed, great for testing HTTP) and `https://example.com` (simple TLS
-target).
+---
 
-**Step 3 — HTTP proxy fallback**
+## Task 5 — TLS 1.3 from scratch
 
-If TLS is not working after a serious attempt (define "serious" as: you have
-a ClientHello being sent and a ServerHello being received but the handshake
-fails), fall back to this:
+This is the main event. Implement TLS 1.3 in `src/tls.rs` so the browser can
+connect directly to HTTPS sites without the proxy. The proxy stays as a
+fallback for sites that break, but direct TLS should work for well-behaved
+servers.
 
-Add a tiny Python HTTP proxy to `scripts/veil_proxy.py`:
-- Listens on `127.0.0.1:7779` on the host
-- Accepts plain HTTP requests from the guest in the form:
-  `GET http://example.com/path HTTP/1.1`
-- Fetches the real URL on the host (using Python `urllib` or `requests`)
-  over HTTPS if needed
-- Strips the response down: remove all `<script>` tags, remove `<style>`
-  blocks (keep inline style attrs), remove `<link rel="stylesheet">` except
-  our own, convert `<img src="...">` to text `[image]` unless it's a PNG
-  we can fetch (optional), strip everything the Veil browser can't render
-- Returns clean HTML/1.1 200 response the guest can parse
+**Do not skip this. Make a serious attempt. The proxy was the right call
+overnight under time pressure. Today there's time to do it right.**
 
-The guest connects to `10.0.2.2:7779` (the slirp gateway) for proxy requests.
-Wire this into `browser.rs`: if the URL is `http://...` with a real hostname,
-send the full URL as the GET path to the proxy IP instead of resolving DNS.
+### Crypto primitives needed
 
-Add the proxy as a launchd agent `com.veil.proxy` (plist in `~/Library/
-LaunchAgents/`), started automatically, logged to `/tmp/veil-proxy.log`.
+All pure Rust, no_std, no external crates. Implement in separate files or
+modules:
 
-Also add the proxy port to `session_manager.py`'s QEMU `-fw_cfg` so the guest
-kernel knows where it is (or just hardcode `10.0.2.2:7779` in browser.rs --
-simpler).
+**src/crypto/sha256.rs** -- SHA-256 (FIPS 180-4)
+- `fn sha256(data: &[u8]) -> [u8; 32]`
+- `fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32]`
+- ~100 lines
 
-**Good sites to target with the proxy:**
-- `http://neverssl.com` -- plain HTTP, always works, great test
-- `https://news.ycombinator.com` -- simple HTML, no heavy JS
-- `https://example.com` -- minimal, reliable
-- `https://en.wikipedia.org/wiki/AArch64` -- text-heavy, renders well stripped
-- `https://lite.cnn.com` -- CNN's text-only site, designed for low-bandwidth
+**src/crypto/hkdf.rs** -- HKDF (RFC 5869) using HMAC-SHA256
+- `fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32]`
+- `fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8>`
+- ~50 lines
+
+**src/crypto/x25519.rs** -- X25519 ECDH (RFC 7748)
+- `fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32]`
+- `fn x25519_base(scalar: &[u8; 32]) -> [u8; 32]` (multiply by base point)
+- Implement using the Montgomery ladder on the Curve25519 field (p = 2^255 - 19)
+- Field arithmetic: 256-bit integers as [u64; 4] or [u32; 8], modular add/sub/mul/reduce
+- ~250 lines. This is the hardest part. Take your time and get it right.
+- Test: the RFC 7748 Section 6.1 test vectors MUST pass before you proceed.
+
+**src/crypto/chacha20.rs** -- ChaCha20-Poly1305 (RFC 8439)
+- Prefer this over AES-GCM -- simpler to implement correctly without hardware
+  acceleration, constant-time naturally
+- `fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64]`
+- `fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16]`
+- `fn chacha20poly1305_encrypt(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Vec<u8>`
+- `fn chacha20poly1305_decrypt(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>>`
+- ~250 lines. Test against RFC 8439 test vectors before proceeding.
+
+### TLS 1.3 handshake (src/tls.rs)
+
+Follow RFC 8446. The cipher suite to negotiate: `TLS_CHACHA20_POLY1305_SHA256`.
+
+**ClientHello:**
+- TLS version: 0x0303 (TLS 1.2 compat) with supported_versions extension = 0x0304
+- Random: 32 random bytes (use the timer tick XOR'd with some constants as a
+  PRNG seed -- not cryptographically secure but fine for a demo OS)
+- Cipher suites: [TLS_CHACHA20_POLY1305_SHA256 (0x1303)]
+- Extensions: supported_versions, supported_groups (x25519), key_share
+  (x25519 public key), signature_algorithms (ecdsa_secp256r1_sha256 +
+  rsa_pkcs1_sha256), server_name (SNI)
+
+**ServerHello parsing:**
+- Extract server's x25519 key share
+- Compute shared secret via x25519(our_private, server_public)
+- Derive handshake keys using HKDF as per RFC 8446 Section 7.1
+
+**After ServerHello:**
+- Decrypt EncryptedExtensions, Certificate, CertificateVerify, Finished
+  using the handshake traffic keys
+- Skip certificate chain verification entirely -- accept any cert
+- Verify the server Finished MAC (compute expected_finished using
+  HMAC-SHA256 of the handshake transcript hash, verify it matches)
+- Send client Finished
+
+**Application data:**
+- After handshake: wrap send/recv with ChaCha20-Poly1305 using the
+  application traffic keys
+- Expose: `fn tls_connect(host: &str, port: u16) -> Option<TlsConn>`
+  where TlsConn has `fn write(&mut self, data: &[u8])` and
+  `fn read(&mut self, buf: &mut [u8]) -> TcpRead`
+
+**Wire into the browser:**
+- In `browser.rs`, if the URL starts with `https://`, use `tls_connect`
+  instead of plain `tcp_connect`
+- The proxy remains for HTTP URLs to avoid double-fetching
+
+**Testing strategy:**
+- First test X25519 with RFC 7748 vectors (offline, no network needed)
+- Then test ChaCha20-Poly1305 with RFC 8439 vectors
+- Then attempt a TLS handshake against `example.com:443` -- capture the
+  raw bytes with `kprintln!` to debug if the handshake fails
+- Use the serial log to trace exactly where the handshake diverges
+- `tls13.xargs.org` and Wireshark packet captures are useful references
+  for exact byte layout if needed
 
 **Pass criterion:**
+Serial emits `TLS_OK` when a complete TLS 1.3 handshake with `example.com`
+succeeds and application data is exchanged (i.e., an HTTP GET returns a
+200 response). Then emit `HTTPS_OK` when `https://example.com` renders in
+the browser.
 
-Serial emits `INTERNET_OK` when a page from a real external hostname
-(not 127.0.0.1 or 10.0.2.x) is successfully fetched and rendered in the
-browser. The page title or first heading must be visible on screen.
-
----
-
-## Track B — Lisp REPL
-
-Add a new app `App::Lisp` -- a Lisp interpreter with an interactive REPL.
-This is a real CS challenge: parser, evaluator, environment model, tail-call
-optimization. When someone sees "this from-scratch OS has a Lisp REPL" it's
-a jaw-drop moment.
-
-### The language spec
-
-A subset of Scheme/Lisp sufficient to be interesting:
-
-**Types:** integer (i64), boolean (#t/#f), symbol, string (double-quoted),
-nil, pair (cons cell), lambda, builtin.
-
-**Special forms:**
-- `(define x expr)` -- bind in current env
-- `(lambda (args...) body...)` -- create closure
-- `(if cond then else)` -- conditional
-- `(begin expr...)` -- sequence, returns last
-- `(quote x)` / `'x` -- literal
-- `(let ((x v)...) body...)` -- local bindings
-- `(cond (test expr)... (else expr))` -- multi-branch
-- `(and expr...)`, `(or expr...)` -- short-circuit
-
-**Builtins:**
-- Arithmetic: `+`, `-`, `*`, `/`, `mod`, `=`, `<`, `>`, `<=`, `>=`
-- List: `cons`, `car`, `cdr`, `list`, `null?`, `pair?`, `length`, `append`
-- Type predicates: `number?`, `string?`, `symbol?`, `boolean?`
-- I/O: `display`, `newline` (output to REPL)
-- `not`, `eq?`, `equal?`
-
-**Tail-call optimization:** implement TCO for `(if ...)` and `(begin ...)` so
-recursive functions don't blow the stack. Use a trampoline or explicit loop.
-
-### REPL UI
-
-New file `src/lisp.rs` for the interpreter. New file `src/repl.rs` for the UI.
-
-The REPL window looks like a terminal:
-- Black background, green text (classic Lisp terminal aesthetic)
-- Scrollable output history (same scroll model as the browser fix)
-- Single-line input at the bottom with a `> ` prompt
-- Enter evaluates the expression, output appears above
-- Up/Down arrows cycle through input history (last 50 entries)
-- On startup, print a welcome banner:
-  ```
-  Veil Lisp 1.0
-  A Lisp interpreter in a from-scratch OS.
-  Type (help) for examples.
-  ```
-- `(help)` prints a short list of example expressions
-
-Desktop icon: dark purple box, label "Lisp". Window size ~480x320.
-
-### Pass criterion
-
-Serial emits `LISP_OK` when the REPL starts and evaluates `(+ 1 2)` returning
-`3`. Add an automated self-test in `LispState::new()`: evaluate a handful of
-expressions and kprintln their results, then emit `LISP_OK` if they all match.
-
-Self-test expressions:
-```scheme
-(+ 1 2)                    ; => 3
-(define x 10) x            ; => 10
-(lambda (n) (* n n))       ; => #<lambda>
-((lambda (n) (* n n)) 5)   ; => 25
-(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10) ; => 3628800
-(car (list 1 2 3))         ; => 1
-(map (lambda (x) (* x x)) (list 1 2 3 4 5)) ; => (1 4 9 16 25)
-```
-
----
-
-## Track C — Adam7 interlaced PNG
-
-The one remaining gap in the PNG decoder. Some real PNGs (especially older
-ones from the web) use Adam7 interlacing. Currently they return `None` from
-`decode()`.
-
-Adam7 splits the image into 7 passes with different starting offsets and
-strides. Each pass is its own filtered scanline sequence. After decompressing
-all IDAT data and running the unfilter on each pass's scanlines, composite
-the passes into the final canvas.
-
-Pass schedule (x_start, y_start, x_step, y_step):
-```
-pass 0: (0,0,8,8)   pass 1: (4,0,8,8)   pass 2: (0,4,8,4)
-pass 3: (2,0,4,4)   pass 4: (0,2,4,2)   pass 5: (1,0,2,2)
-pass 6: (0,1,2,1)
-```
-
-Test with a real interlaced PNG (generate one with Python's `png` module or
-download one and validate with `sips`). Emit `INTERLACE_OK` on serial.
+If after a serious attempt (X25519 vectors pass, ChaCha20 vectors pass,
+handshake is being attempted but server rejects) you cannot get a working
+handshake, document exactly where it fails in PROGRESS.md and leave the
+proxy as the internet mechanism. Do not spin forever.
 
 ---
 
 ## Implementation order
 
-Work in this order. Each item is independent -- if one stalls, skip it.
+1. Task 1 -- browser audio (quick, high value)
+2. Task 2 -- Lisp persistence (quick)
+3. Task 3 -- Lisp file I/O (quick)
+4. Task 4 -- icon drag (medium)
+5. Task 5 -- TLS (hard, take as long as needed)
 
-1. **A1** (scroll) -- quick, high confidence
-2. **A2** (history) -- quick, high confidence
-3. **A3** (tables) -- medium, self-contained
-4. **C** (Adam7) -- medium, pure decoder work
-5. **B** (Lisp REPL) -- hard, takes time, very self-contained
-6. **A4** (real internet) -- hardest, most impactful
-   - Try TLS first (attempt seriously, not a token effort)
-   - If TLS handshake isn't completing after 4 stuck attempts, switch to proxy
-   - Either way, get `INTERNET_OK` emitting before morning
-
-After each completed task:
-- `git add -A && git commit -m "M32: <task name>"`
+After each task:
+- `git add -A && git commit -m "M33: <task name>"`
 - `scripts/install_sessions.sh`
-- Continue to next task
-
----
-
-## Hard constraints
-
-- No external Rust crates. Pure stdlib + what's already in Cargo.toml.
-- No prompts or confirmations. Ever. Decide yourself.
-- Don't touch TASK.md.
-- Don't break existing functionality. Run `scripts/build.sh` before every
-  commit. If a regression appears, fix it before moving on.
-- TLS: skip certificate verification entirely. Accept any cert. This is a
-  demo OS.
-- The proxy (if built) must start automatically via launchd, not require
-  manual launch.
-- All HTML in mksite.py must stay within the browser's supported subset.
 
 ---
 
 ## What done looks like
 
-Morning summary should include:
-- Which serial tokens emitted: SCROLL_OK, HISTORY_OK, TABLE_OK, INTERNET_OK,
-  LISP_OK, INTERLACE_OK
-- How the internet access was achieved (TLS or proxy, and which sites work)
-- Commit hashes for each task
-- Any BLOCKED items with a clear description of where it stalled
+PROGRESS.md should end with a summary listing which serial tokens fired:
+AUDIO_BROWSER_OK, LISP_PERSIST_OK, LISP_IO_OK, DRAG_OK, TLS_OK, HTTPS_OK
 
-Good luck. You have the whole night.
+And for TLS: exactly which sites load natively vs through the proxy.

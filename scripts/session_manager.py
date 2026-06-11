@@ -129,6 +129,8 @@ class Session:
         self.wsproc = None
         self.fifo_rd = None   # read-end fd; a thread drains it (see drain_fifo)
         self.audio_clients = set()       # browser audio WebSocket sockets
+        self.audio_bytes = {}            # client sock -> total PCM bytes sent
+        self.audio_ok_logged = False     # AUDIO_BROWSER_OK emitted once/session
         self.audio_lock = threading.Lock()
         self.closed = False
         self.last_active = time.time()
@@ -204,19 +206,30 @@ class Manager:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def broadcast_audio(self, s, pcm):
-        """Send PCM to this session's browser audio clients (WS binary)."""
+        """Send PCM to this session's browser audio clients (WS binary). Once a
+        client has been sent >10 KB of PCM, log AUDIO_BROWSER_OK once — the
+        proof that browser audio actually streams end to end (Task 1)."""
         if not pcm:
             return
         with s.audio_lock:
             clients = list(s.audio_clients)
         for off in range(0, len(pcm), AUDIO_CHUNK):
-            frame = ws_binary_frame(pcm[off:off + AUDIO_CHUNK])
+            payload = pcm[off:off + AUDIO_CHUNK]
+            frame = ws_binary_frame(payload)
             for sock in clients:
                 try:
                     sock.sendall(frame)
                 except OSError:
                     with s.audio_lock:
                         s.audio_clients.discard(sock)
+                        s.audio_bytes.pop(sock, None)
+                    continue
+                with s.audio_lock:
+                    s.audio_bytes[sock] = s.audio_bytes.get(sock, 0) + len(payload)
+                    if not s.audio_ok_logged and s.audio_bytes[sock] > 10240:
+                        s.audio_ok_logged = True
+                        print(f"AUDIO_BROWSER_OK session={s.sid} "
+                              f"client_bytes={s.audio_bytes[sock]}", flush=True)
 
     def drain_fifo(self, s):
         """Continuously read the QEMU `wav` audiodev FIFO and forward the PCM
@@ -464,6 +477,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with s.audio_lock:
                 s.audio_clients.discard(sock)
+                s.audio_bytes.pop(sock, None)
             try:
                 sock.close()
             except OSError:

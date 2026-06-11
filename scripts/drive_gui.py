@@ -16,9 +16,9 @@ ABS_MAX = 32767
 
 # Colors (RGB) — must match wm.rs.
 PURPLE = (144, 80, 192)       # beta static canvas
-T_FOCUS = (48, 96, 192)       # focused title bar
-T_UNFOCUS = (112, 120, 128)   # unfocused title bar
-DESKTOP = (40, 72, 88)
+T_FOCUS = (26, 26, 26)        # M35 dark focused title bar (SURFACE)
+T_UNFOCUS = (20, 20, 20)      # M35 dark unfocused title bar
+DESKTOP = (13, 13, 13)        # M35 near-black desktop
 RED = (224, 48, 48)           # palette[1]
 BLUE = (48, 96, 224)          # palette[3]
 WHITE = (255, 255, 255)

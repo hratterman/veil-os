@@ -34,11 +34,16 @@ const ICON_TOP: isize = 8;
 const ICON_HOLD_TICKS: u64 = 10; // 200 ms at the desktop's 50 Hz tick
 const ICONS_FILE: &str = "ICONS.TXT";
 
-const DESKTOP_BG: u32 = 0xff28_4858;
-const TASKBAR_BG: u32 = 0xff18_2028;
-const TASKBAR_BTN: u32 = 0xff30_4050;
-const TASKBAR_BTN_OPEN: u32 = 0xff48_70a0;
-const TASKBAR_TEXT: u32 = 0xffe8_eef4;
+// M35 modern dark palette.
+const ACCENT: u32 = 0xff5b_8af0; // soft blue
+const SURFACE: u32 = 0xff1a_1a1a; // window/title surface
+const MUTED: u32 = 0xff88_8888;
+const DESKTOP_BG: u32 = 0xff0d_0d0d; // near-black
+const DESKTOP_GRID: u32 = 0xff14_1414; // subtle grid lines on the desktop
+const TASKBAR_BG: u32 = 0xff12_1212;
+const TASKBAR_BTN: u32 = 0xff1e_1e1e;
+const TASKBAR_BTN_OPEN: u32 = 0xff2b_3a5c; // accent-tinted pill for the active app
+const TASKBAR_TEXT: u32 = 0xffe8_e8e8;
 
 /// Launchable apps: (window title, button/icon label). Chat is filtered
 /// out when no NIC is attached.
@@ -136,10 +141,11 @@ fn load_icon_order() -> Vec<&'static str> {
     kprintln!("ICONS: order = {joined}");
     order
 }
-const FRAME_COLOR: u32 = 0xff10_1418;
-const TITLE_FOCUSED: u32 = 0xff30_60c0;
-const TITLE_UNFOCUSED: u32 = 0xff70_7880;
-const TITLE_TEXT: u32 = 0xffff_ffff;
+const FRAME_COLOR: u32 = 0xff2a_2a2a; // thin muted border
+const FRAME_FOCUSED: u32 = ACCENT; // focused windows get an accent border
+const TITLE_FOCUSED: u32 = SURFACE; // dark title bar, not a chunky blue one
+const TITLE_UNFOCUSED: u32 = 0xff14_1414;
+const TITLE_TEXT: u32 = 0xffe8_e8e8;
 const ECHO_TEXT: u32 = 0xff20_2840;
 
 // Paint app layout (canvas-relative).
@@ -1149,6 +1155,17 @@ impl Wm {
         let back =
             unsafe { Framebuffer::new(self.back.as_mut_ptr(), w, h, w * 4) };
         back.clear(DESKTOP_BG);
+        // Subtle grid texture on the desktop background.
+        let mut gx = 0;
+        while gx < w {
+            back.fill_rect(gx, 0, 1, h, DESKTOP_GRID);
+            gx += 48;
+        }
+        let mut gy = 0;
+        while gy < h {
+            back.fill_rect(0, gy, w, 1, DESKTOP_GRID);
+            gy += 48;
+        }
 
         // Desktop icons: two-column grid in the user-defined order. Each slot
         // is 68px (48 icon + 12 label + 8 gap). The icon being dragged is drawn
@@ -1171,14 +1188,25 @@ impl Wm {
         let top = self.windows.len().saturating_sub(1);
         for (idx, win) in self.windows.iter().enumerate() {
             let focused = idx == top;
-            // Frame (border) as one filled rect behind everything.
+            // Soft drop shadow (offset, semi-transparent) behind the window.
+            {
+                let sx = (win.x + 3).max(0) as usize;
+                let sy = (win.y + 3).max(0) as usize;
+                let sw = (win.x + win.frame_w() + 3).min(w as isize) - sx as isize;
+                let sh = (win.y + win.frame_h() + 3).min(h as isize) - sy as isize;
+                if sw > 0 && sh > 0 {
+                    back.blend_rect(sx, sy, sw as usize, sh as usize, 0xff00_0000, 90);
+                }
+            }
+            // Frame (thin border) as one filled rect behind everything; the
+            // focused window's border is the accent colour.
             if win.x + win.frame_w() > 0 && win.y + win.frame_h() > 0 {
                 let fx = win.x.max(0) as usize;
                 let fy = win.y.max(0) as usize;
                 let fw = (win.x + win.frame_w()).min(w as isize) - fx as isize;
                 let fh = (win.y + win.frame_h()).min(h as isize) - fy as isize;
                 if fw > 0 && fh > 0 {
-                    back.fill_rect(fx, fy, fw as usize, fh as usize, FRAME_COLOR);
+                    back.fill_rect(fx, fy, fw as usize, fh as usize, if focused { FRAME_FOCUSED } else { FRAME_COLOR });
                 }
             }
             // Title bar + caption.
@@ -1192,16 +1220,15 @@ impl Wm {
                     TITLE_H as usize,
                     if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED },
                 );
-                back.draw_string(tx as usize + 6, ty as usize + 3, &win.title, TITLE_TEXT, None);
+                // A thin accent underline marks the focused window.
+                if focused {
+                    back.fill_rect(tx as usize, (ty + TITLE_H - 1) as usize, win.cw, 1, ACCENT);
+                }
+                let tcol = if focused { TITLE_TEXT } else { MUTED };
+                back.draw_string(tx as usize + 6, ty as usize + 3, &win.title, tcol, None);
                 // Close button: the rightmost CLOSE_W px of the title bar.
-                back.fill_rect(
-                    (tx + win.cw as isize - CLOSE_W) as usize,
-                    ty as usize + 2,
-                    CLOSE_W as usize - 2,
-                    TITLE_H as usize - 4,
-                    0xffc0_4848,
-                );
-                back.draw_string((tx + win.cw as isize - CLOSE_W) as usize + 4, ty as usize + 3, "x", TITLE_TEXT, None);
+                let close_col = if focused { 0xffd0_5a4a } else { MUTED };
+                back.draw_string((tx + win.cw as isize - CLOSE_W) as usize + 5, ty as usize + 3, "x", close_col, None);
             }
             // Content.
             back.blit(win.x + BORDER, win.y + BORDER + TITLE_H, &win.canvas, win.cw, win.ch);

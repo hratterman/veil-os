@@ -423,6 +423,14 @@ impl Wm {
                     _ => {}
                 }
             }
+            keymap::EV_REL if code == keymap::REL_WHEEL => {
+                // Mouse-wheel scroll, routed to the focused browser window.
+                if let Some(win) = self.windows.last_mut() {
+                    if matches!(win.app, App::Browser(_)) && browser::wheel(win, value as i32) {
+                        self.dirty = true;
+                    }
+                }
+            }
             keymap::EV_SYN => self.commit(),
             _ => {}
         }

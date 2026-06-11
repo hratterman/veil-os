@@ -818,7 +818,19 @@ pub fn paint_view(win: &mut Window) {
         };
         format!("http://{}{}  [{pct}%]", net::fmt_ip(&ip), st.path)
     };
+    // Scrollbar: a 2px gutter on the right edge with a proportional thumb.
+    let (doc_h, scroll) = {
+        let crate::wm::App::Browser(st) = &win.app else { return };
+        (st.doc_h, st.scroll)
+    };
+    let view_h = ch - TOPBAR;
     let fb = win.canvas_fb();
+    if doc_h > view_h {
+        fb.fill_rect(cw - 2, TOPBAR, 2, view_h, 0xff20_2830); // track
+        let thumb_h = (view_h * view_h / doc_h).max(8).min(view_h);
+        let thumb_y = TOPBAR + scroll * (view_h - thumb_h) / (doc_h - view_h);
+        fb.fill_rect(cw - 2, thumb_y, 2, thumb_h, 0xff70_90b0); // thumb
+    }
     fb.fill_rect(0, 0, cw, TOPBAR, BAR_BG);
     fb.draw_string(6, 2, &bar, BAR_TEXT, None);
 }
@@ -836,31 +848,58 @@ pub fn link_at(win: &Window, rx: isize, ry: isize) -> Option<String> {
         .map(|l| l.href.clone())
 }
 
-/// Arrow/page keys scroll. Returns true if the key was consumed.
+static SCROLL_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Scroll to an absolute offset (clamped to the document), repaint, and emit
+/// SCROLL_OK the first time a taller-than-window page moves off its top.
+fn scroll_to(win: &mut Window, target: isize) -> bool {
+    let view_h = win.ch - TOPBAR;
+    let (new, tall) = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return false };
+        let max = st.doc_h.saturating_sub(view_h);
+        let new = target.clamp(0, max as isize) as usize;
+        if new == st.scroll {
+            return true;
+        }
+        st.scroll = new;
+        (new, st.doc_h > view_h)
+    };
+    kprintln!("BROWSER: scroll y={new}");
+    if tall && new > 0 && !SCROLL_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("SCROLL_OK");
+    }
+    paint_view(win);
+    true
+}
+
+fn cur_scroll(win: &Window) -> isize {
+    match &win.app {
+        crate::wm::App::Browser(st) => st.scroll as isize,
+        _ => 0,
+    }
+}
+
+/// Arrow/page keys scroll: arrows one line, Page keys half a window.
 pub fn key(win: &mut Window, code: u16) -> bool {
     const KEY_UP: u16 = 103;
     const KEY_PGUP: u16 = 104;
     const KEY_DOWN: u16 = 108;
     const KEY_PGDN: u16 = 109;
-    let view_h = win.ch - TOPBAR;
-    let new = {
-        let crate::wm::App::Browser(st) = &mut win.app else { return false };
-        let max = st.doc_h.saturating_sub(view_h);
-        let page = view_h.saturating_sub(24);
-        let new = match code {
-            KEY_UP => st.scroll.saturating_sub(40),
-            KEY_DOWN => (st.scroll + 40).min(max),
-            KEY_PGUP => st.scroll.saturating_sub(page),
-            KEY_PGDN => (st.scroll + page).min(max),
-            _ => return false,
-        };
-        if new == st.scroll {
-            return true;
-        }
-        st.scroll = new;
-        new
+    let line = 16isize; // one text line
+    let half = (win.ch - TOPBAR) as isize / 2;
+    let s = cur_scroll(win);
+    let target = match code {
+        KEY_UP => s - line,
+        KEY_DOWN => s + line,
+        KEY_PGUP => s - half,
+        KEY_PGDN => s + half,
+        _ => return false,
     };
-    kprintln!("BROWSER: scroll y={new}");
-    paint_view(win);
-    true
+    scroll_to(win, target)
+}
+
+/// Mouse-wheel scroll. `notches` is the signed REL_WHEEL delta (positive =
+/// wheel up / scroll toward the top); three lines per notch.
+pub fn wheel(win: &mut Window, notches: i32) -> bool {
+    scroll_to(win, cur_scroll(win) - notches as isize * 48)
 }

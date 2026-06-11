@@ -33,6 +33,8 @@ pub const BTN_RIGHT: u16 = 0x111;
 
 pub const EV_SYN: u16 = 0;
 pub const EV_KEY: u16 = 1;
+pub const EV_REL: u16 = 2;
 pub const EV_ABS: u16 = 3;
 pub const ABS_X: u16 = 0;
 pub const ABS_Y: u16 = 1;
+pub const REL_WHEEL: u16 = 8; // mouse/tablet scroll wheel (signed notches)

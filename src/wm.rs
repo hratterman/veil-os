@@ -570,6 +570,14 @@ pub struct Wm {
     shot_seq: u32,                     // screenshot file counter
     menu: Option<ContextMenu>,         // open right-click menu
     flash: u64,                        // screenshot flash effect expiry tick
+    file_drag: Option<FileDrag>,       // dragging a file out of the file manager
+}
+
+/// A file being dragged out of the file manager.
+struct FileDrag {
+    name: String,
+    start: (isize, isize),
+    active: bool, // true once moved past the drag threshold
 }
 
 /// A right-click context menu: items + screen anchor + the target it acts on.
@@ -615,6 +623,7 @@ impl Wm {
             shot_seq: 0,
             menu: None,
             flash: 0,
+            file_drag: None,
         }
     }
 
@@ -1306,6 +1315,11 @@ impl Wm {
                 win.x = self.mx - ox;
                 let max_y = self.screen.height as isize - TASKBAR_H as isize - win.frame_h();
                 win.y = (self.my - oy).min(max_y).max(0);
+            } else if let Some(fd) = self.file_drag.as_mut() {
+                if !fd.active && ((self.mx - fd.start.0).abs() > 6 || (self.my - fd.start.1).abs() > 6) {
+                    fd.active = true;
+                    self.cursor = CursorShape::Hand;
+                }
             } else if self.icon_drag.is_some() {
                 // The floating icon follows the cursor; just need a recompose
                 // (dirty already set above).
@@ -1681,11 +1695,17 @@ impl Wm {
                         chat_click(win, rx, ry);
                         self.dirty = true;
                     }
-                    App::Files(_) => match files::click(win, rx, ry) {
-                        files::Action::Open(name) => self.open_file(&name),
-                        files::Action::Redraw => self.dirty = true,
-                        files::Action::None => {}
-                    },
+                    App::Files(_) => {
+                        // Record a potential drag-out; selection happens now,
+                        // the open is deferred to release (so a press-move-drop
+                        // can route the file to another app).
+                        let name = files::name_at(win, rx, ry);
+                        files::click(win, rx, ry); // updates selection / redraw
+                        self.dirty = true;
+                        if let Some(name) = name {
+                            self.file_drag = Some(FileDrag { name, start: (self.mx, self.my), active: false });
+                        }
+                    }
                     App::Gif(_) => {
                         gifplayer::click(win);
                         self.dirty = true;
@@ -1804,6 +1824,24 @@ impl Wm {
     }
 
     fn on_left_up(&mut self) {
+        // Finish a file drag-and-drop (or a plain click in the file manager).
+        if let Some(fd) = self.file_drag.take() {
+            if fd.active {
+                // Dropped somewhere: route to the window under the cursor.
+                let target = self
+                    .hit_test(self.mx, self.my)
+                    .filter(|(idx, _)| !matches!(self.windows[*idx].app, App::Files(_)))
+                    .map(|(idx, _)| self.windows[idx].title.clone());
+                kprintln!("WM: dropped '{}' on {}", fd.name, target.as_deref().unwrap_or("desktop"));
+                self.open_file(&fd.name);
+                self.notify(&format!("Opened {}", fd.name));
+            } else {
+                // A plain click opens the file in its default app.
+                self.open_file(&fd.name);
+            }
+            self.dirty = true;
+            return;
+        }
         // Finish an active resize.
         if let Some((idx, _)) = self.resize.take() {
             let win = &self.windows[idx];
@@ -2054,6 +2092,17 @@ impl Wm {
                 let fy = (self.my - ICON_W / 2).max(0) as usize;
                 back.blend_rect(fx, fy, iw, iw, icon_color(*app), 150);
                 ui_centered(&back, fx + iw / 2, fy + 7, icon_abbrev(app), FontId::UiBold, 19, 0xfff4f4f4);
+            }
+        }
+
+        // Drag-and-drop ghost: a semi-transparent filename chip under the cursor.
+        if let Some(fd) = &self.file_drag {
+            if fd.active {
+                let gw = back.measure_text(&fd.name, FontId::Ui, 13).0 + 20;
+                let gx = (self.mx + 10).max(0) as usize;
+                let gy = (self.my + 6).max(0) as usize;
+                back.blend_rect(gx, gy, gw, 22, ACCENT, 170);
+                back.draw_text(gx + 10, gy + 3, &fd.name, FontId::Ui, 13, 0xffffffff);
             }
         }
 

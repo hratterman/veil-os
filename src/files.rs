@@ -162,6 +162,19 @@ pub fn key(win: &mut Window, code: u16) -> Action {
     }
 }
 
+/// The filename under a content coordinate (for drag-and-drop), without
+/// changing selection.
+pub fn name_at(win: &Window, rx: isize, ry: isize) -> Option<alloc::string::String> {
+    if ry < 0 || rx < 0 {
+        return None;
+    }
+    let col_w = 4 + 48 + 4 + 12 * 8 + 8;
+    let rows = (win.ch / ROW_H).max(1);
+    let (col, row) = (rx as usize / col_w, ry as usize / ROW_H);
+    let App::Files(st) = &win.app else { return None };
+    st.files.get(st.scroll + col * rows + row).cloned()
+}
+
 /// Click a row: select it and, if it's openable, dispatch it.
 pub fn click(win: &mut Window, rx: isize, ry: isize) -> Action {
     if ry < 0 || rx < 0 {

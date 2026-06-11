@@ -49,6 +49,7 @@ mod setup;
 mod snd;
 mod syscall;
 mod timer;
+mod tls;
 mod uart;
 mod viewer;
 mod virtio;
@@ -101,6 +102,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         // M14/M15 services (tcp echo, http) as a preemptible kernel task.
         scheduler::spawn_kernel("net-services", http::services_task);
         milestone19b();
+        milestone33_tls(&fdt);
         if read_mode(&fdt).as_deref() == Some(b"net") {
             // Headless serving mode: stay alive, everything is IRQ-driven.
             kprintln!("NET_READY: serving icmp echo, udp echo :7, tcp echo :7777, http :80");
@@ -300,6 +302,44 @@ fn milestone19b() {
             kprintln!("M19b_OK");
         }
         None => kprintln!("NTP: no sync (network unreachable); clock uses time-since-boot"),
+    }
+}
+
+/// M33: boot-time TLS 1.3 proof. Only runs when `-fw_cfg opt/veil.tls,string=1`
+/// is set (it hits the real internet, so normal/hosted boots skip it). Does a
+/// full TLS 1.3 handshake to example.com:443, sends an HTTP GET, and emits
+/// TLS_OK when a 200 comes back over the encrypted channel.
+fn milestone33_tls(fdt: &dtb::Fdt) {
+    let want = fwcfg::FwCfg::from_dtb(fdt)
+        .and_then(|fw| {
+            let f = fw.find_file("opt/veil.tls")?;
+            let mut b = [0u8; 4];
+            let n = fw.read_file(f, &mut b).ok()?;
+            Some(b[..n].first() == Some(&b'1'))
+        })
+        .unwrap_or(false);
+    if !want {
+        return;
+    }
+    let Some(mut conn) = tls::tls_connect("example.com", 443) else {
+        kprintln!("TLS: handshake failed");
+        return;
+    };
+    conn.write(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+    let deadline = timer::ticks() + 600;
+    let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    while let Some(chunk) = conn.read(deadline) {
+        resp.extend_from_slice(&chunk);
+        if resp.len() > 200_000 {
+            break;
+        }
+    }
+    conn.close();
+    kprintln!("TLS: received {} bytes of application data", resp.len());
+    if resp.windows(12).any(|w| w == b"HTTP/1.1 200") {
+        kprintln!("TLS_OK");
+    } else {
+        kprintln!("TLS: no 200 status in response");
     }
 }
 

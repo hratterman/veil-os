@@ -1121,6 +1121,32 @@ pub fn ntp_sync(host: &str) -> Option<u64> {
     ntp_parse(&reply)
 }
 
+/// M33: resolve `host` to an IPv4 address via the configured DNS server.
+/// Blocking, few-second budget; None on no-DNS / timeout / NXDOMAIN.
+pub fn dns_resolve(host: &str) -> Option<[u8; 4]> {
+    let dns = dns_server()?;
+    let txid = (isn() as u16) | 1;
+    let query = dns_build(host, txid);
+    let reply = udp_request(dns, 53, 50002, &query, 4000, 300)?;
+    dns_parse(&reply, txid)
+}
+
+/// M33: fill `buf` with pseudo-random bytes seeded from the cycle counter.
+/// NOT cryptographically secure — adequate for a demo OS's TLS nonces/keys.
+pub fn rng_fill(buf: &mut [u8]) {
+    let mut x: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) x, options(nomem, nostack)) };
+    x ^= 0x9e37_79b9_7f4a_7c15;
+    for b in buf.iter_mut() {
+        // xorshift64*
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let r = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        *b = (r >> 33) as u8;
+    }
+}
+
 /// M20: pop one received chat datagram (the desktop loop polls this).
 pub fn chat_take() -> Option<Vec<u8>> {
     critical(|| {

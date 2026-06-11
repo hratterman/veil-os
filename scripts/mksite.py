@@ -286,6 +286,7 @@ written from scratch.</p>
 <ul>
 <li><a href="http://neverssl.com">neverssl.com</a> - plain HTTP, always up</li>
 <li><a href="http://example.com">example.com</a> - the minimal classic</li>
+<li><a href="https://example.com">example.com (HTTPS)</a> - direct TLS 1.3, no proxy</li>
 <li><a href="https://lite.cnn.com">lite.cnn.com</a> - CNN, text-only edition</li>
 <li><a href="https://en.wikipedia.org/wiki/ARM_architecture_family">Wikipedia: ARM</a> - text-heavy, renders well</li>
 <li><a href="https://news.ycombinator.com">Hacker News</a> - simple HTML</li>

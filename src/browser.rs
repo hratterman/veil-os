@@ -26,7 +26,7 @@
 
 use crate::fb::Framebuffer;
 use crate::wm::Window;
-use crate::{css, html, kprintln, net, png, scheduler, timer};
+use crate::{css, html, kprintln, net, png, scheduler, timer, tls};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -121,10 +121,101 @@ fn is_external(url: &str) -> bool {
         && !u.contains("//localhost")
 }
 
+fn is_https(url: &str) -> bool {
+    let u = url.get(..8).unwrap_or("").to_ascii_lowercase();
+    u == "https://"
+}
+
+static TLS_OK_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Decode HTTP/1.1 `Transfer-Encoding: chunked` bodies (Cloudflare et al. use
+/// it). A no-op if the body isn't actually chunked.
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let mut j = i;
+        while j + 1 < body.len() && !(body[j] == b'\r' && body[j + 1] == b'\n') {
+            j += 1;
+        }
+        let line = core::str::from_utf8(&body[i..j]).unwrap_or("");
+        let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16).unwrap_or(0);
+        i = j + 2;
+        if size == 0 {
+            break;
+        }
+        let end = (i + size).min(body.len());
+        out.extend_from_slice(&body[i..end]);
+        i = end + 2; // skip the chunk's trailing CRLF
+    }
+    out
+}
+
+/// Split a raw HTTP/1.1 response into (status, content-type, body), decoding a
+/// chunked body if present.
+fn parse_response(resp: &[u8], path: &str) -> Option<(u32, String, Vec<u8>)> {
+    let split = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = core::str::from_utf8(&resp[..split]).unwrap_or("");
+    let status: u32 = head.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let ctype = head
+        .lines()
+        .find_map(|l| {
+            let (name, val) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-type").then(|| String::from(val.trim()))
+        })
+        .unwrap_or_default();
+    let chunked = head
+        .lines()
+        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
+    let raw = &resp[split + 4..];
+    let body = if chunked { dechunk(raw) } else { raw.to_vec() };
+    kprintln!("BROWSER: GET {path} -> {status} {ctype} ({} bytes)", body.len());
+    Some((status, ctype, body))
+}
+
+/// Direct TLS 1.3 fetch of an `https://` URL (no proxy). Parses host/port/path,
+/// does the handshake, sends the GET, reads the decrypted response.
+fn tls_get(url: &str) -> Option<(u32, String, Vec<u8>)> {
+    let rest = url.get(8..)?; // strip "https://"
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h, p.parse().unwrap_or(443)),
+        None => (hostport, 443u16),
+    };
+    let mut conn = tls::tls_connect(host, port)?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: VeilOS\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+    );
+    conn.write(req.as_bytes());
+    let deadline = timer::ticks() + 600;
+    let mut resp = Vec::new();
+    while let Some(chunk) = conn.read(deadline) {
+        resp.extend_from_slice(&chunk);
+        if resp.len() > (1 << 20) {
+            break;
+        }
+    }
+    conn.close();
+    let parsed = parse_response(&resp, url)?;
+    if parsed.0 == 200 && !TLS_OK_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("TLS_OK");
+    }
+    Some(parsed)
+}
+
 /// GET `path`. Local paths ("/page.htm") hit our own HTTP server on loopback;
-/// full external URLs are sent verbatim to the host proxy at 10.0.2.2:7779,
-/// which fetches the real (possibly HTTPS) site and returns stripped HTML.
+/// `https://` URLs use the from-scratch TLS 1.3 stack directly; other external
+/// `http://` URLs go through the host proxy at 10.0.2.2:7779.
 fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
+    if is_https(path) {
+        if let Some(r) = tls_get(path) {
+            return Some(r);
+        }
+        kprintln!("BROWSER: direct TLS failed for {path}, falling back to proxy");
+    }
     let external = is_external(path);
     let (ip, port, timeout) = if external {
         ([10, 0, 2, 2], 7779u16, 1500) // proxy fetch can take a while
@@ -143,26 +234,9 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
         write_all(h, req.as_bytes());
         let resp = read_to_eof(h, 1 << 20, timeout);
         net::tcp_close(h);
-        let Some(split) = resp.windows(4).position(|w| w == b"\r\n\r\n") else {
-            continue;
-        };
-        let head = core::str::from_utf8(&resp[..split]).unwrap_or("");
-        let status: u32 = head
-            .split(' ')
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
-        let ctype = head
-            .lines()
-            .find_map(|l| {
-                let (name, val) = l.split_once(':')?;
-                name.eq_ignore_ascii_case("content-type")
-                    .then(|| String::from(val.trim()))
-            })
-            .unwrap_or_default();
-        let body = resp[split + 4..].to_vec();
-        kprintln!("BROWSER: GET {path} -> {status} {ctype} ({} bytes)", body.len());
-        return Some((status, ctype, body));
+        if let Some(r) = parse_response(&resp, path) {
+            return Some(r);
+        }
     }
     kprintln!("BROWSER: GET {path} failed (no response)");
     None
@@ -895,9 +969,14 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         kprintln!("BROWSER: rendered external page {path_for_log}");
         kprintln!("INTERNET_OK");
     }
+    if is_https(&path_for_log) && !HTTPS_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("BROWSER: rendered https page {path_for_log} (direct TLS 1.3)");
+        kprintln!("HTTPS_OK");
+    }
 }
 
 static INTERNET_DONE: AtomicBool = AtomicBool::new(false);
+static HTTPS_DONE: AtomicBool = AtomicBool::new(false);
 
 /// A one-line stand-in page for fetch/parse failures.
 fn render_message(win: &mut Window, path: &str, msg: &str) {

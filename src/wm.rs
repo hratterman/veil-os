@@ -11,7 +11,7 @@
 use crate::fb::Framebuffer;
 use crate::{
     browser, clipboard, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl,
-    scheduler, shell, snake, snd, timer, viewer,
+    scheduler, shell, snake, snd, timer, video, viewer,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -190,6 +190,7 @@ pub enum App {
     Gif(gifplayer::GifPlayerState),
     Lisp(repl::LispState),
     Snake(snake::SnakeState),
+    Video(video::VideoState),
 }
 
 /// One rendered chat log entry: the display text and its ink colour
@@ -428,10 +429,13 @@ impl Wm {
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
             | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_)
-            | App::Gif(_) | App::Lisp(_) | App::Snake(_) => {}
+            | App::Gif(_) | App::Lisp(_) | App::Snake(_) | App::Video(_) => {}
         }
         if matches!(win.app, App::Snake(_)) {
             snake::render(&mut win);
+        }
+        if matches!(win.app, App::Video(_)) {
+            video::render(&mut win);
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -489,6 +493,9 @@ impl Wm {
         } else if name.ends_with(".GIF") {
             self.add_window(name, 200, 90, 280, 240, App::Gif(gifplayer::GifPlayerState::with_file(name)));
             kprintln!("FILES: open {name} in GIF player");
+        } else if name.ends_with(".MJP") || name.ends_with(".AVI") {
+            self.add_window(name, 200, 80, 360, 300, App::Video(video::VideoState::with_file(name)));
+            kprintln!("FILES: open {name} in Video player");
         } else {
             kprintln!("FILES: no app registered for {name}");
         }
@@ -595,6 +602,11 @@ impl Wm {
             }
             // M35 Snake: arrow / WASD direction keys.
             if matches!(win.app, App::Snake(_)) && snake::key(win, code) {
+                self.dirty = true;
+                return;
+            }
+            // M35 Video: space play/pause, left/right seek.
+            if matches!(win.app, App::Video(_)) && video::key(win, code) {
                 self.dirty = true;
                 return;
             }
@@ -1122,6 +1134,9 @@ impl Wm {
                 self.dirty = true;
             }
             if matches!(win.app, App::Snake(_)) && snake::tick(win, now) {
+                self.dirty = true;
+            }
+            if matches!(win.app, App::Video(_)) && video::tick(win, now) {
                 self.dirty = true;
             }
         }

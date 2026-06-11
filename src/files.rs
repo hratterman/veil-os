@@ -74,7 +74,7 @@ fn tag(name: &str) -> &'static str {
         "[WAV]"
     } else if name.ends_with(".TXT") {
         "[TXT]"
-    } else if name.ends_with(".MJPEG") || name.ends_with(".AVI") || name.ends_with(".MJPG") {
+    } else if name.ends_with(".MJP") || name.ends_with(".AVI") {
         "[VID]"
     } else if name.ends_with(".WASM") {
         "[WSM]"
@@ -89,8 +89,8 @@ fn openable(name: &str) -> bool {
         || name.ends_with(".GIF")
         || name.ends_with(".WAV")
         || name.ends_with(".TXT")
-        || name.ends_with(".MJPEG")
-        || name.ends_with(".MJPG")
+        || name.ends_with(".MJP")
+        || name.ends_with(".MJP")
         || name.ends_with(".AVI")
         || name.ends_with(".WASM")
 }

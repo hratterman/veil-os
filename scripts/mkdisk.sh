@@ -47,6 +47,8 @@ for f in assets/photos/*.png assets/photos/*.jpg; do
     cp "$f" "$MNT/$(basename "$f" | tr a-z A-Z)"
 done
 cp assets/dog_baseline.jpg "$MNT/DOGBASE.JPG" 2>/dev/null || true
+# M35: a demo MJPEG video (a sequence of baseline JPEG frames).
+cp assets/demo.mjpeg "$MNT/DEMO.MJP" 2>/dev/null || true
 # M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
 python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
 # M25/M27: USER.TXT labels Chat and gates the first-boot setup screen.

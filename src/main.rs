@@ -56,6 +56,7 @@ mod syscall;
 mod timer;
 mod tls;
 mod uart;
+mod video;
 mod viewer;
 mod virtio;
 mod wm;

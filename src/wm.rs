@@ -24,6 +24,7 @@ pub const TITLE_H: isize = 22;
 /// are clamped so their frames stay above it.
 pub const TASKBAR_H: usize = 32;
 const CLOSE_W: isize = 18; // rightmost title-bar pixels = close hit zone
+const TBTN_W: isize = 20; // width of each title-bar button (close/max/min)
 
 // Desktop icon grid (shared by compose(), hit-testing, and drag drop-targets).
 const ICON_W: isize = 48;
@@ -246,6 +247,87 @@ const CURSOR: [&[u8]; 10] = [
     b"XXXXXXXXXX",
 ];
 
+const HAND: [&[u8]; 13] = [
+    b"..XX....",
+    b"..XOX...",
+    b"..XOX...",
+    b"..XOX...",
+    b"..XOXXX.",
+    b"XX.XOXOX",
+    b"XOXXOXOX",
+    b"XOXOOXOX",
+    b"XXOOOOOX",
+    b".XOOOOX.",
+    b".XOOOOX.",
+    b"..XOOOX.",
+    b"..XXXX..",
+];
+
+/// Render the pointer at (mx, my) in the requested shape. White fill with a
+/// black outline so it reads on any background.
+fn draw_cursor(fb: &Framebuffer, mx: isize, my: isize, shape: CursorShape) {
+    const W: u32 = 0xffff_ffff;
+    const B: u32 = 0xff00_0000;
+    let put = |x: isize, y: isize, c: u32| {
+        if x >= 0 && y >= 0 {
+            fb.put_pixel(x as usize, y as usize, c);
+        }
+    };
+    let blit = |bm: &[&[u8]], ox: isize, oy: isize| {
+        for (r, line) in bm.iter().enumerate() {
+            for (c, &ch) in line.iter().enumerate() {
+                let col = match ch {
+                    b'X' => B,
+                    b'O' => W,
+                    _ => continue,
+                };
+                put(mx + ox + c as isize, my + oy + r as isize, col);
+            }
+        }
+    };
+    // A double-headed arrow shaft from -len..len along (dx,dy) with arrowheads.
+    let arrows = |dx: isize, dy: isize| {
+        for t in -7..=7 {
+            // shaft (white core, black outline on both sides)
+            put(mx + dx * t, my + dy * t, W);
+            put(mx + dx * t - dy, my + dy * t - dx, B);
+            put(mx + dx * t + dy, my + dy * t + dx, B);
+        }
+        for (sx, sy) in [(dx, dy), (-dx, -dy)] {
+            for i in 0..4 {
+                let bx = mx + sx * (7 - i);
+                let by = my + sy * (7 - i);
+                // arrowhead wings perpendicular-ish
+                put(bx + sy * i, by + sx * i, W);
+                put(bx - sy * i, by - sx * i, W);
+                put(bx + sy * (i + 1), by + sx * (i + 1), B);
+                put(bx - sy * (i + 1), by - sx * (i + 1), B);
+            }
+        }
+    };
+    match shape {
+        CursorShape::Arrow => blit(&CURSOR, 0, 0),
+        CursorShape::Hand => blit(&HAND, -3, 0),
+        CursorShape::IBeam => {
+            for dy in -7..=7 {
+                put(mx, my + dy, W);
+                put(mx - 1, my + dy, B);
+                put(mx + 1, my + dy, B);
+            }
+            for dx in -2..=2 {
+                put(mx + dx, my - 7, W);
+                put(mx + dx, my + 7, W);
+                put(mx + dx, my - 8, B);
+                put(mx + dx, my + 8, B);
+            }
+        }
+        CursorShape::ResizeH => arrows(1, 0),
+        CursorShape::ResizeV => arrows(0, 1),
+        CursorShape::ResizeNWSE => arrows(1, 1),
+        CursorShape::ResizeNESW => arrows(1, -1),
+    }
+}
+
 pub struct PaintState {
     pub color: usize, // palette index
     pub brush: usize, // radius index
@@ -318,6 +400,39 @@ pub struct Window {
     pub ch: usize,
     pub canvas: Vec<u32>,
     pub app: App,
+    pub minimized: bool,
+    /// Saved (x, y, cw, ch) before maximize/snap, for restore.
+    pub restore: Option<(isize, isize, usize, usize)>,
+}
+
+pub const MIN_CW: usize = 160;
+pub const MIN_CH: usize = 120;
+
+/// Re-render an app's content into its (possibly resized) canvas.
+pub fn render_window_content(win: &mut Window) {
+    match win.app {
+        App::Snake(_) => snake::render(win),
+        App::Video(_) => video::render(win),
+        App::Wasm(_) => wasmapp::render(win),
+        App::Breakout(_) => breakout::render(win),
+        App::Shell { .. } => render_shell(win),
+        App::Editor(_) => render_editor(win),
+        App::Clock(_) => clock::render(win, timer::ticks()),
+        App::Chat(_) => render_chat(win),
+        App::Viewer(_) => viewer::render(win),
+        App::Audio(_) => render_audio(win),
+        App::Files(_) => files::render(win),
+        App::Gif(_) => gifplayer::render(win),
+        App::Lisp(_) => repl::render(win),
+        App::Browser(_) => browser::paint_view(win),
+        App::Paint(_) => {
+            let (c, b) = if let App::Paint(p) = &win.app { (p.color, p.brush) } else { (0, 1) };
+            let cw = win.cw;
+            let fb = win.canvas_fb();
+            render_paint_toolbar(&fb, cw, c, b);
+        }
+        App::Echo { .. } | App::Static => {}
+    }
 }
 
 impl Window {
@@ -343,6 +458,37 @@ enum Hit {
     Content(isize, isize), // canvas-relative
 }
 
+/// Pointer shapes the WM renders depending on what is under the cursor.
+#[derive(Clone, Copy, PartialEq)]
+pub enum CursorShape {
+    Arrow,
+    IBeam,
+    Hand,
+    ResizeH,    // <->
+    ResizeV,    // up/down
+    ResizeNWSE, // \ corner
+    ResizeNESW, // / corner
+}
+
+// Resize edge bitmask.
+const E_L: u8 = 1;
+const E_R: u8 = 2;
+const E_T: u8 = 4;
+const E_B: u8 = 8;
+const RESIZE_ZONE: isize = 7; // px hit zone outside/inside the frame edge
+
+fn edge_cursor(edge: u8) -> CursorShape {
+    if edge == E_L | E_T || edge == E_R | E_B {
+        CursorShape::ResizeNWSE
+    } else if edge == E_R | E_T || edge == E_L | E_B {
+        CursorShape::ResizeNESW
+    } else if edge == E_L || edge == E_R {
+        CursorShape::ResizeH
+    } else {
+        CursorShape::ResizeV
+    }
+}
+
 pub struct Wm {
     screen: Framebuffer,
     back: Vec<u32>,
@@ -354,6 +500,9 @@ pub struct Wm {
     pend_y: isize,
     pend_buttons: u32,
     drag: Option<(usize, isize, isize)>, // (window index AT TOP, grab offset)
+    resize: Option<(usize, u8)>,         // (window index AT TOP, edge bitmask LRTB)
+    last_title_click: (u64, isize, isize), // (tick, x, y) for double-click detect
+    cursor: CursorShape,
     shift: bool,
     ctrl: bool, // Ctrl held (clipboard shortcuts)
     alt: bool,  // Alt held (Alt+Tab task switch)
@@ -378,6 +527,9 @@ impl Wm {
             pend_y: 0,
             pend_buttons: 0,
             drag: None,
+            resize: None,
+            last_title_click: (0, 0, 0),
+            cursor: CursorShape::Arrow,
             shift: false,
             ctrl: false,
             alt: false,
@@ -504,6 +656,8 @@ impl Wm {
             ch,
             canvas: vec![0xffff_ffff; cw * ch],
             app,
+            minimized: false,
+            restore: None,
         };
         // Reserve the taskbar strip: frames may not extend over it.
         let max_y = self.screen.height as isize - TASKBAR_H as isize - win.frame_h();
@@ -974,17 +1128,30 @@ impl Wm {
             self.mx = self.pend_x;
             self.my = self.pend_y;
             self.dirty = true;
-            if let Some((idx, ox, oy)) = self.drag {
+            if let Some((idx, edge)) = self.resize {
+                self.apply_resize(idx, edge, self.mx, self.my);
+            } else if let Some((idx, ox, oy)) = self.drag {
+                // Dragging a maximized/snapped window un-snaps it to follow the cursor.
+                let (ox, oy) = if self.windows[idx].restore.is_some() {
+                    let (_, _, rw, rh) = self.windows[idx].restore.take().unwrap();
+                    self.resize_window(idx, self.mx - rw as isize / 2, self.my - 10, rw, rh);
+                    let no = (rw as isize / 2, 10);
+                    self.drag = Some((idx, no.0, no.1));
+                    no
+                } else {
+                    (ox, oy)
+                };
                 let win = &mut self.windows[idx];
                 win.x = self.mx - ox;
                 let max_y = self.screen.height as isize - TASKBAR_H as isize - win.frame_h();
-                win.y = (self.my - oy).min(max_y);
+                win.y = (self.my - oy).min(max_y).max(0);
             } else if self.icon_drag.is_some() {
                 // The floating icon follows the cursor; just need a recompose
                 // (dirty already set above).
             } else if self.buttons & 1 != 0 {
                 self.forward_mouse_move();
             }
+            self.update_cursor();
         }
         let pressed = self.pend_buttons & !self.buttons;
         let released = self.buttons & !self.pend_buttons;
@@ -1025,23 +1192,220 @@ impl Wm {
         top
     }
 
+    /// Which window edges (bitmask) the point is within RESIZE_ZONE of, for the
+    /// topmost non-maximized window under it.
+    fn edge_at(&self, px: isize, py: isize) -> Option<(usize, u8)> {
+        for idx in (0..self.windows.len()).rev() {
+            let win = &self.windows[idx];
+            if win.minimized || win.restore.is_some() {
+                continue;
+            }
+            let (fx, fy) = (win.x, win.y);
+            let (fw, fh) = (win.frame_w(), win.frame_h());
+            if px < fx - RESIZE_ZONE || px >= fx + fw + RESIZE_ZONE || py < fy - RESIZE_ZONE
+                || py >= fy + fh + RESIZE_ZONE
+            {
+                continue;
+            }
+            let mut e = 0u8;
+            if (px - fx).abs() <= RESIZE_ZONE {
+                e |= E_L;
+            }
+            if (px - (fx + fw)).abs() <= RESIZE_ZONE {
+                e |= E_R;
+            }
+            if (py - fy).abs() <= RESIZE_ZONE {
+                e |= E_T;
+            }
+            if (py - (fy + fh)).abs() <= RESIZE_ZONE {
+                e |= E_B;
+            }
+            if e != 0 {
+                return Some((idx, e));
+            }
+            if win.contains(px, py) {
+                return None; // inside content, not on an edge
+            }
+        }
+        None
+    }
+
+    /// Resize/move a window to a new geometry, reallocating its canvas
+    /// (preserving the overlapping pixels) and re-rendering the app.
+    fn resize_window(&mut self, idx: usize, nx: isize, ny: isize, nw: usize, nh: usize) {
+        let nw = nw.max(MIN_CW);
+        let nh = nh.max(MIN_CH);
+        let win = &mut self.windows[idx];
+        if win.cw == nw && win.ch == nh && win.x == nx && win.y == ny {
+            return;
+        }
+        let mut nc = vec![0xff1a_1a1a_u32; nw * nh];
+        let (cw, ch) = (win.cw.min(nw), win.ch.min(nh));
+        for r in 0..ch {
+            nc[r * nw..r * nw + cw].copy_from_slice(&win.canvas[r * win.cw..r * win.cw + cw]);
+        }
+        win.x = nx;
+        win.y = ny;
+        win.cw = nw;
+        win.ch = nh;
+        win.canvas = nc;
+        render_window_content(win);
+        self.dirty = true;
+    }
+
+    /// Live resize from a dragged edge: cursor at (mx, my).
+    fn apply_resize(&mut self, idx: usize, edge: u8, mx: isize, my: isize) {
+        let win = &self.windows[idx];
+        let (mut nx, mut ny) = (win.x, win.y);
+        let right = win.x + win.frame_w();
+        let bottom = win.y + win.frame_h();
+        let (mut nw, mut nh) = (win.cw as isize, win.ch as isize);
+        if edge & E_L != 0 {
+            nx = mx.min(right - (MIN_CW as isize + 2 * BORDER)).max(0);
+            nw = right - nx - 2 * BORDER;
+        }
+        if edge & E_R != 0 {
+            nw = mx - win.x - 2 * BORDER;
+        }
+        if edge & E_T != 0 {
+            ny = my.min(bottom - (MIN_CH as isize + TITLE_H + 2 * BORDER)).max(0);
+            nh = bottom - ny - TITLE_H - 2 * BORDER;
+        }
+        if edge & E_B != 0 {
+            nh = my - win.y - TITLE_H - 2 * BORDER;
+        }
+        self.resize_window(idx, nx, ny, nw.max(MIN_CW as isize) as usize, nh.max(MIN_CH as isize) as usize);
+    }
+
+    /// Toggle maximize (fill desktop minus taskbar) / restore.
+    fn maximize_toggle(&mut self, idx: usize) {
+        if let Some((rx, ry, rw, rh)) = self.windows[idx].restore.take() {
+            self.resize_window(idx, rx, ry, rw, rh);
+            kprintln!("WM: restored '{}'", self.windows[idx].title);
+        } else {
+            let win = &self.windows[idx];
+            self.windows[idx].restore = Some((win.x, win.y, win.cw, win.ch));
+            let nw = self.screen.width - 2 * BORDER as usize;
+            let nh = self.screen.height - TASKBAR_H - TITLE_H as usize - 2 * BORDER as usize;
+            self.resize_window(idx, 0, 0, nw, nh);
+            kprintln!("WM: maximized '{}'", self.windows[idx].title);
+        }
+    }
+
+    fn minimize(&mut self, idx: usize) {
+        self.windows[idx].minimized = true;
+        kprintln!("WM: minimized '{}'", self.windows[idx].title);
+        self.dirty = true;
+    }
+
+    /// Snap a dragged window to a screen-edge zone (left/right half, top=max).
+    fn try_snap(&mut self, idx: usize) {
+        let (w, h) = (self.screen.width as isize, self.screen.height as isize);
+        let avail_h = h - TASKBAR_H as isize;
+        const SNAP: isize = 6;
+        let win = &self.windows[idx];
+        if win.restore.is_some() {
+            return;
+        }
+        let cur = (win.x, win.y, win.cw, win.ch);
+        if self.my <= SNAP {
+            self.windows[idx].restore = Some(cur);
+            self.maximize_toggle_from(idx);
+        } else if self.mx <= SNAP {
+            self.windows[idx].restore = Some(cur);
+            let hw = (w / 2 - 2 * BORDER) as usize;
+            self.resize_window(idx, 0, 0, hw, (avail_h - TITLE_H - 2 * BORDER) as usize);
+            kprintln!("WM: snapped left '{}'", self.windows[idx].title);
+        } else if self.mx >= w - SNAP {
+            self.windows[idx].restore = Some(cur);
+            let hw = (w / 2 - 2 * BORDER) as usize;
+            self.resize_window(idx, w / 2, 0, hw, (avail_h - TITLE_H - 2 * BORDER) as usize);
+            kprintln!("WM: snapped right '{}'", self.windows[idx].title);
+        }
+    }
+
+    fn maximize_toggle_from(&mut self, idx: usize) {
+        // restore already saved by caller; fill the desktop.
+        let nw = self.screen.width - 2 * BORDER as usize;
+        let nh = self.screen.height - TASKBAR_H - TITLE_H as usize - 2 * BORDER as usize;
+        self.resize_window(idx, 0, 0, nw, nh);
+        kprintln!("WM: snapped top->max '{}'", self.windows[idx].title);
+    }
+
+    /// Recompute the pointer shape from what's under the cursor.
+    fn update_cursor(&mut self) {
+        let cur = if self.resize.is_some() {
+            edge_cursor(self.resize.unwrap().1)
+        } else if self.my >= self.screen.height as isize - TASKBAR_H as isize {
+            CursorShape::Arrow
+        } else if let Some((_, e)) = self.edge_at(self.mx, self.my) {
+            edge_cursor(e)
+        } else {
+            self.content_cursor()
+        };
+        if cur != self.cursor {
+            self.cursor = cur;
+            self.dirty = true;
+        }
+    }
+
+    fn content_cursor(&self) -> CursorShape {
+        if let Some((idx, Hit::Content(rx, ry))) = self.hit_test(self.mx, self.my) {
+            let win = &self.windows[idx];
+            return match &win.app {
+                App::Browser(_) => {
+                    if ry >= browser::TOPBAR as isize && browser::link_at(win, rx, ry).is_some() {
+                        CursorShape::Hand
+                    } else {
+                        CursorShape::IBeam
+                    }
+                }
+                App::Editor(_) | App::Shell { .. } | App::Lisp(_) | App::Echo { .. } => CursorShape::IBeam,
+                _ => CursorShape::Arrow,
+            };
+        }
+        CursorShape::Arrow
+    }
+
     fn on_left_down(&mut self) {
         kprintln!("CLICK: left down @ ({}, {})", self.mx, self.my);
         if self.my >= self.screen.height as isize - TASKBAR_H as isize {
             self.taskbar_click(self.mx);
             return;
         }
+        // Resize edge takes priority over the (overlapping) title/content hit.
+        if let Some((idx, edge)) = self.edge_at(self.mx, self.my) {
+            let top = self.raise(idx);
+            self.resize = Some((top, edge));
+            return;
+        }
         match self.hit_test(self.mx, self.my) {
             Some((idx, Hit::Title)) => {
-                // Rightmost CLOSE_W px of the title bar = the X button.
-                let win = &self.windows[idx];
-                if self.mx - win.x - BORDER >= win.cw as isize - CLOSE_W {
-                    let win = self.windows.remove(idx);
+                let top = self.raise(idx);
+                // Title-bar buttons (from the right edge): close, max, min.
+                let rx = self.mx - self.windows[top].x - BORDER;
+                let cw = self.windows[top].cw as isize;
+                if rx >= cw - TBTN_W {
+                    let win = self.windows.remove(top);
                     kprintln!("WM: closed '{}'", win.title);
                     self.dirty = true;
                     return;
+                } else if rx >= cw - 2 * TBTN_W {
+                    self.maximize_toggle(top);
+                    return;
+                } else if rx >= cw - 3 * TBTN_W {
+                    self.minimize(top);
+                    return;
                 }
-                let top = self.raise(idx);
+                // Double-click the title bar (not on a button) -> maximize.
+                let now = timer::ticks();
+                let (lt, lx, ly) = self.last_title_click;
+                if now.wrapping_sub(lt) < 30 && (self.mx - lx).abs() < 6 && (self.my - ly).abs() < 6 {
+                    self.last_title_click = (0, 0, 0);
+                    self.maximize_toggle(top);
+                    return;
+                }
+                self.last_title_click = (now, self.mx, self.my);
                 let win = &self.windows[top];
                 self.drag = Some((top, self.mx - win.x, self.my - win.y));
             }
@@ -1138,7 +1502,21 @@ impl Wm {
         for (app, _, x, wdt) in self.taskbar_layout() {
             if px >= x as isize && px < (x + wdt) as isize {
                 kprintln!("WM: taskbar -> '{app}'");
-                self.launch(app);
+                // Existing window: restore if minimized, minimize if focused,
+                // else raise. Otherwise launch it fresh.
+                if let Some(idx) = self.windows.iter().position(|w| w.title == app) {
+                    if self.windows[idx].minimized {
+                        self.windows[idx].minimized = false;
+                        self.raise(idx);
+                        kprintln!("WM: restored '{app}' from taskbar");
+                    } else if idx == self.windows.len() - 1 {
+                        self.minimize(idx);
+                    } else {
+                        self.raise(idx);
+                    }
+                } else {
+                    self.launch(app);
+                }
                 return;
             }
         }
@@ -1183,6 +1561,13 @@ impl Wm {
     }
 
     fn on_left_up(&mut self) {
+        // Finish an active resize.
+        if let Some((idx, _)) = self.resize.take() {
+            let win = &self.windows[idx];
+            kprintln!("WM: resized '{}' to {}x{}", win.title, win.cw, win.ch);
+            self.update_cursor();
+            return;
+        }
         // Complete an icon drag: reorder, persist, DRAG_OK.
         if let Some(from) = self.icon_drag.take() {
             self.icon_press = None;
@@ -1207,6 +1592,7 @@ impl Wm {
             return;
         }
         if let Some((idx, _, _)) = self.drag.take() {
+            self.try_snap(idx); // drag-to-edge snapping
             let win = &self.windows[idx];
             kprintln!("WM: '{}' moved to ({}, {})", win.title, win.x, win.y);
         } else if let Some(win) = self.windows.last_mut() {
@@ -1312,6 +1698,9 @@ impl Wm {
 
         let top = self.windows.len().saturating_sub(1);
         for (idx, win) in self.windows.iter().enumerate() {
+            if win.minimized {
+                continue; // minimized windows stay alive but unpainted
+            }
             let focused = idx == top;
             // Soft drop shadow (offset, semi-transparent) behind the window.
             {
@@ -1346,11 +1735,18 @@ impl Wm {
                 }
                 let tcol = if focused { 0xffe8e8e8 } else { 0xff666666 };
                 back.draw_text(txu + 10, tyu + 3, &win.title, FontId::Ui, 13, tcol);
-                // Close button: a 5px-radius circle near the right edge.
-                let ccx = (tx + win.cw as isize - 12) as isize;
+                // Window buttons (macOS traffic-light style): minimize (amber),
+                // maximize (green), close (red), each in a TBTN_W slot from right.
                 let ccy = ty + TITLE_H / 2;
-                let close_col = if focused { 0xffe05555 } else { 0xff555555 };
-                back.fill_circle(ccx, ccy, 5, close_col);
+                let cx = |slot: isize| tx + win.cw as isize - slot * TBTN_W + TBTN_W / 2;
+                let (close_c, max_c, min_c) = if focused {
+                    (0xffe0_5555, 0xff5fc26a, 0xffd6a844)
+                } else {
+                    (0xff55_5555, 0xff444444, 0xff444444)
+                };
+                back.fill_circle(cx(1), ccy, 6, close_c);
+                back.fill_circle(cx(2), ccy, 6, max_c);
+                back.fill_circle(cx(3), ccy, 6, min_c);
             }
             // Content.
             back.blit(win.x + BORDER, win.y + BORDER + TITLE_H, &win.canvas, win.cw, win.ch);
@@ -1375,11 +1771,11 @@ impl Wm {
             }
         }
         for (app, label, x, pw) in &layout {
-            let open = self.windows.iter().any(|win| win.title == *app);
-            let (pill, txt) = if open {
-                (blend(0xff111111, ACCENT, 70), ACCENT)
-            } else {
-                (0xff1e1e1e, 0xff8a8a8a)
+            let win = self.windows.iter().find(|win| win.title == *app);
+            let (pill, txt) = match win {
+                Some(w) if w.minimized => (blend(0xff111111, ACCENT, 30), blend(ACCENT, 0xff111111, 100)),
+                Some(_) => (blend(0xff111111, ACCENT, 70), ACCENT),
+                None => (0xff1e1e1e, 0xff8a8a8a),
             };
             back.fill_round_rect(*x, ty + 5, *pw, TASKBAR_H - 10, 7, pill);
             ui_centered(&back, x + pw / 2, ty + 8, &fit_label(&back, label, pw.saturating_sub(8), FontId::Ui, 12), FontId::Ui, 12, txt);
@@ -1400,20 +1796,8 @@ impl Wm {
             }
         }
 
-        // Cursor, always on top.
-        for (row, line) in CURSOR.iter().enumerate() {
-            for (col, &c) in line.iter().enumerate() {
-                let color = match c {
-                    b'X' => 0xff00_0000,
-                    b'O' => 0xffff_ffff,
-                    _ => continue,
-                };
-                let (px, py) = (self.mx + col as isize, self.my + row as isize);
-                if px >= 0 && py >= 0 {
-                    back.put_pixel(px as usize, py as usize, color);
-                }
-            }
-        }
+        // Cursor, always on top, shape depends on what is under it.
+        draw_cursor(&back, self.mx, self.my, self.cursor);
 
         self.screen.copy_from(&self.back);
         self.dirty = false;

@@ -10,8 +10,8 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    breakout, browser, clipboard, clock, files, font, freetype::FontId, fs, gifplayer, keymap,
-    kprintln, net, netdev, repl, scheduler, shell, snake, snd, timer, video, viewer, wasmapp,
+    breakout, browser, calc, clipboard, clock, files, font, freetype::FontId, fs, gifplayer, keymap,
+    kprintln, net, netdev, repl, scheduler, settings, shell, snake, snd, timer, video, viewer, wasmapp,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -50,7 +50,7 @@ const TASKBAR_TEXT: u32 = 0xffe8_e8e8;
 /// out when no NIC is attached.
 // Viewer is appended last so adding it doesn't shift the existing button
 // indices (the proof drivers depend on edit=0..chat=5).
-const LAUNCHERS: [(&str, &str); 13] = [
+const LAUNCHERS: [(&str, &str); 15] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
@@ -64,10 +64,12 @@ const LAUNCHERS: [(&str, &str); 13] = [
     ("lisp", "Lisp"),
     ("snake", "Snake"),
     ("breakout", "Brick"),
+    ("calc", "Calc"),
+    ("settings", "Settings"),
 ];
 // Per-app icon colours (modern, muted): browser blue, shell green, files amber,
 // lisp purple, games teal/orange, etc. Indexed by LAUNCHERS order.
-const ICON_COLORS: [u32; 13] = [
+const ICON_COLORS: [u32; 15] = [
     0xff4a62a0, // edit  - slate blue
     0xff3f99b0, // clock - cyan
     0xff5b8af0, // browser - blue
@@ -81,6 +83,8 @@ const ICON_COLORS: [u32; 13] = [
     0xff9a6ad6, // lisp - purple
     0xff45a87a, // snake - emerald
     0xffe07a44, // breakout - orange
+    0xff5a8a8a, // calc - steel
+    0xff80808c, // settings - gray
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -116,6 +120,8 @@ fn icon_abbrev(app: &str) -> &'static str {
         "lisp" => "Li",
         "snake" => "Sn",
         "breakout" => "Bk",
+        "calc" => "Ca",
+        "settings" => "St",
         _ => "Ap",
     }
 }
@@ -286,6 +292,18 @@ fn set_wallpaper_next() {
     }
 }
 
+/// Public wrapper so the settings app can toggle the wallpaper.
+pub fn toggle_wallpaper() {
+    set_wallpaper_next();
+}
+
+static WINDOW_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Number of open windows (for the settings "apps running" stat).
+pub fn window_count() -> usize {
+    WINDOW_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn wallpaper() -> Option<&'static crate::png::Image> {
     unsafe {
         if *core::ptr::addr_of!(WALLPAPER_ON) {
@@ -391,6 +409,8 @@ pub enum App {
     Video(video::VideoState),
     Wasm(wasmapp::WasmState),
     Breakout(breakout::BreakoutState),
+    Calc(calc::CalcState),
+    Settings(settings::SettingsState),
 }
 
 /// One rendered chat log entry: the display text and its ink colour
@@ -458,6 +478,8 @@ pub fn render_window_content(win: &mut Window) {
         App::Gif(_) => gifplayer::render(win),
         App::Lisp(_) => repl::render(win),
         App::Browser(_) => browser::paint_view(win),
+        App::Calc(_) => calc::render(win),
+        App::Settings(_) => settings::render(win),
         App::Paint(_) => {
             let (c, b) = if let App::Paint(p) = &win.app { (p.color, p.brush) } else { (0, 1) };
             let cw = win.cw;
@@ -739,6 +761,10 @@ impl Wm {
             "breakout" => {
                 self.add_window("breakout", 360, 70, 280, 24 + 320, App::Breakout(breakout::BreakoutState::new()));
             }
+            "calc" => self.add_window("calc", 380, 120, 264, 420, App::Calc(calc::CalcState::new())),
+            "settings" => {
+                self.add_window("settings", 240, 110, 480, 360, App::Settings(settings::SettingsState::new()));
+            }
             _ => {}
         }
         self.dirty = true;
@@ -768,7 +794,8 @@ impl Wm {
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
             | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_)
-            | App::Gif(_) | App::Lisp(_) | App::Snake(_) | App::Video(_) | App::Wasm(_) | App::Breakout(_) => {}
+            | App::Gif(_) | App::Lisp(_) | App::Snake(_) | App::Video(_) | App::Wasm(_)
+            | App::Breakout(_) | App::Calc(_) | App::Settings(_) => {}
         }
         if matches!(win.app, App::Snake(_)) {
             snake::render(&mut win);
@@ -781,6 +808,12 @@ impl Wm {
         }
         if matches!(win.app, App::Breakout(_)) {
             breakout::render(&mut win);
+        }
+        if matches!(win.app, App::Calc(_)) {
+            calc::render(&mut win);
+        }
+        if matches!(win.app, App::Settings(_)) {
+            settings::render(&mut win);
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -1016,6 +1049,10 @@ impl Wm {
                     if browser::char_input(win, ch) {
                         self.dirty = true;
                     }
+                }
+                App::Calc(_) => {
+                    calc::key(win, ch);
+                    self.dirty = true;
                 }
                 _ => {}
             }
@@ -1627,6 +1664,16 @@ impl Wm {
                         gifplayer::click(win);
                         self.dirty = true;
                     }
+                    App::Calc(_) => {
+                        calc::click(win, rx, ry);
+                        self.dirty = true;
+                    }
+                    App::Settings(_) => {
+                        if settings::click(win, rx, ry) {
+                            scheduler::spawn_kernel("audio", snd::audio_task);
+                        }
+                        self.dirty = true;
+                    }
                     _ => {}
                 }
             }
@@ -1838,6 +1885,7 @@ impl Wm {
         let (w, h) = (self.screen.width, self.screen.height);
         let back =
             unsafe { Framebuffer::new(self.back.as_mut_ptr(), w, h, w * 4) };
+        WINDOW_COUNT.store(self.windows.len(), core::sync::atomic::Ordering::Relaxed);
         back.clear(DESKTOP_BG);
         if let Some(wp) = wallpaper() {
             // Scale the decoded wallpaper to fill the desktop (nearest-neighbour).

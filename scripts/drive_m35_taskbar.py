@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M35.5 taskbar overflow fix: with a NIC there are 13 launchers. Confirm every
+"""M35.5 taskbar overflow fix: with a NIC there are 15 launchers. Confirm every
 pill fits on screen (with room for the clock) and that the LAST pill — which
 used to be pushed off the 1024px edge — is clickable (hit-test matches render)."""
 import re
@@ -20,7 +20,7 @@ def main():
         if m:
             pills.append((m.group(1), int(m.group(2)), int(m.group(3))))
     check("taskbar pills logged", len(pills) >= 12, f"{len(pills)} pills")
-    check("13 launchers present (NIC -> includes chat)", len(pills) == 13, f"{len(pills)} pills")
+    check("15 launchers present (NIC -> includes chat)", len(pills) == 15, f"{len(pills)} pills")
 
     # Every pill must fit on screen with room reserved for the clock.
     rightmost = max(x + w for _, x, w in pills)

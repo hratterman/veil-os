@@ -10,8 +10,8 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    browser, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl, scheduler, snd,
-    timer, viewer,
+    browser, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl, scheduler, shell,
+    snd, timer, viewer,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -178,7 +178,7 @@ pub enum App {
     Echo { text: String },
     Static,
     Paint(PaintState),
-    Shell { input: String, lines: Vec<String> },
+    Shell { input: String, lines: Vec<String>, history: Vec<String>, hist: usize },
     Browser(browser::BrowserState),
     Editor(EditorState),
     Clock(clock::ClockState),
@@ -313,7 +313,7 @@ impl Wm {
                 430,
                 420,
                 280,
-                App::Shell { input: String::new(), lines: Vec::new() },
+                App::Shell { input: String::new(), lines: Vec::new(), history: Vec::new(), hist: 0 },
             ),
             "edit" => {
                 self.add_window("edit", 40, 40, 420, 300, App::Editor(EditorState::open("NOTE.TXT")));
@@ -560,6 +560,11 @@ impl Wm {
                 self.dirty = true;
                 return;
             }
+            // M35 shell: Up/Down history, Tab completion (non-character keys).
+            if matches!(win.app, App::Shell { .. }) && shell_raw_key(win, code) {
+                self.dirty = true;
+                return;
+            }
             // M29: file-manager up/down/Enter (Enter dispatches via open_file).
             if matches!(win.app, App::Files(_)) {
                 match files::key(win, code) {
@@ -625,35 +630,52 @@ impl Wm {
         if cmd.is_empty() {
             return;
         }
-        let (name, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
-        match name {
-            "help" => self.shell_append(
-                "built-ins: help, paint\nfrom disk: ls, cat <f>, echo <s>, spin <n>, hello\n",
-            ),
-            "paint" => {
-                let count = self
-                    .windows
-                    .iter()
-                    .filter(|w| matches!(w.app, App::Paint(_)))
-                    .count();
-                let (x, y) = (520 + 24 * count as isize, 40 + 20 * count as isize);
-                let title = format!("paint-{count}");
-                self.add_window(&title, x, y, 480, 380, App::Paint(PaintState::new()));
-                kprintln!("SHELL: launched '{title}' as a new window");
-                self.shell_append(&format!("launched {title}\n"));
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        // `run <app>` or a bare launcher name opens a GUI app.
+        let target = if first == "run" {
+            cmd.split_whitespace().nth(1).map(String::from)
+        } else if launcher_name(first).is_some() {
+            Some(String::from(first))
+        } else {
+            None
+        };
+        if let Some(app) = target {
+            self.launch(&app);
+            self.shell_append(&format!("launched {app}\n"));
+            return;
+        }
+        // The real shell engine (ls/cat/cp/mv/rm/echo/pipes/...) is authoritative
+        // for its built-ins; only an *unknown* command falls back to a user
+        // binary on disk (e.g. `spin 5`, `hello`).
+        let outcome = shell::run(cmd);
+        if outcome.out.ends_with(": command not found\n") {
+            let bin = format!("{}.BIN", first.to_ascii_uppercase());
+            if let Some(image) = fs::read_file(&bin) {
+                let args = cmd.split_once(' ').map(|x| x.1.trim()).unwrap_or("");
+                match scheduler::spawn(&image, first, args) {
+                    Some(pid) => self.shell_append(&format!("[{pid}] {first} started\n")),
+                    None => self.shell_append("spawn failed (out of memory?)\n"),
+                }
+                return;
             }
-            _ => {
-                let mut file = String::from(name);
-                file.make_ascii_uppercase();
-                file.push_str(".BIN");
-                match fs::read_file(&file) {
-                    Some(bin) => match scheduler::spawn(&bin, name, args.trim()) {
-                        Some(pid) => self.shell_append(&format!("[{pid}] {name} started\n")),
-                        None => self.shell_append("spawn failed (out of memory?)\n"),
-                    },
-                    None => self.shell_append(&format!("{name}: not found on disk\n")),
+        }
+        if outcome.clear {
+            if let Some(win) = self.windows.iter_mut().find(|w| matches!(w.app, App::Shell { .. })) {
+                if let App::Shell { lines, .. } = &mut win.app {
+                    lines.clear();
                 }
             }
+            self.dirty = true;
+            return;
+        }
+        if !outcome.out.is_empty() {
+            for line in outcome.out.lines() {
+                kprintln!("SHELL_OUT: {line}");
+            }
+            self.shell_append(&outcome.out);
+        }
+        if let Some(app) = outcome.launch {
+            self.launch(&app);
         }
     }
 
@@ -1105,7 +1127,7 @@ const SHELL_PROMPT: u32 = 0xff80_c080;
 
 /// Returns the completed command line on Enter.
 fn shell_key(win: &mut Window, ch: char) -> Option<String> {
-    let App::Shell { input, lines } = &mut win.app else {
+    let App::Shell { input, lines, history, hist } = &mut win.app else {
         return None;
     };
     let mut command = None;
@@ -1116,6 +1138,10 @@ fn shell_key(win: &mut Window, ch: char) -> Option<String> {
         '\n' => {
             let cmd = core::mem::take(input);
             lines.push(format!("> {cmd}\n"));
+            if !cmd.trim().is_empty() && history.last() != Some(&cmd) {
+                history.push(cmd.clone());
+            }
+            *hist = history.len();
             command = Some(cmd);
         }
         c => input.push(c),
@@ -1124,9 +1150,51 @@ fn shell_key(win: &mut Window, ch: char) -> Option<String> {
     command
 }
 
+/// Up/Down recall command history; Tab completes a filename. Returns true if
+/// the key was consumed.
+fn shell_raw_key(win: &mut Window, code: u16) -> bool {
+    const KEY_TAB: u16 = 15;
+    const KEY_UP: u16 = 103;
+    const KEY_DOWN: u16 = 108;
+    let App::Shell { input, history, hist, .. } = &mut win.app else {
+        return false;
+    };
+    match code {
+        KEY_UP => {
+            if *hist > 0 {
+                *hist -= 1;
+                *input = history[*hist].clone();
+            }
+        }
+        KEY_DOWN => {
+            if *hist + 1 < history.len() {
+                *hist += 1;
+                *input = history[*hist].clone();
+            } else {
+                *hist = history.len();
+                input.clear();
+            }
+        }
+        KEY_TAB => {
+            // Complete the last whitespace-separated token against disk names.
+            let (head, frag) = match input.rsplit_once(char::is_whitespace) {
+                Some((h, f)) => (alloc::format!("{h} "), f.to_string()),
+                None => (String::new(), input.clone()),
+            };
+            let matches = shell::complete(&frag);
+            if matches.len() == 1 {
+                *input = format!("{head}{}", matches[0]);
+            }
+        }
+        _ => return false,
+    }
+    render_shell(win);
+    true
+}
+
 fn render_shell(win: &mut Window) {
     let (input, visible) = {
-        let App::Shell { input, lines } = &win.app else { return };
+        let App::Shell { input, lines, .. } = &win.app else { return };
         let rows = (win.ch - 28) / 16;
         let skip = lines.len().saturating_sub(rows);
         (input.clone(), lines[skip..].to_vec())

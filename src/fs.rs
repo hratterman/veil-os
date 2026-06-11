@@ -265,6 +265,27 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), ()> {
     })
 }
 
+/// Delete `name` from the root directory: free its cluster chain and mark the
+/// directory slot as deleted (0xE5).
+pub fn delete(name: &str) -> Result<(), ()> {
+    critical(|| {
+        let l = layout().ok_or(())?;
+        let want = from_83(&to_83(name).ok_or(())?);
+        let (_, _, mut cluster, slot) =
+            scan_root(&l).into_iter().find(|(n, _, _, _)| *n == want).ok_or(())?;
+        while cluster >= 2 && cluster < 0xfff8 {
+            let next = read_fat(&l, cluster);
+            write_fat(&l, cluster, 0);
+            cluster = next;
+        }
+        let mut sec = [0u8; SEC];
+        let lba = (l.root_start + slot / (SEC / 32)) as u64;
+        blk::read_sectors(lba, 1, &mut sec).map_err(|_| ())?;
+        sec[(slot % (SEC / 32)) * 32] = 0xe5;
+        blk::write_sectors(lba, 1, &sec).map_err(|_| ())
+    })
+}
+
 fn find_free_slot(l: &Layout) -> Option<usize> {
     let mut sec = [0u8; SEC];
     for s in 0..l.root_sectors {

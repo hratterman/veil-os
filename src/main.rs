@@ -48,6 +48,7 @@ mod repl;
 mod scheduler;
 mod semihosting;
 mod setup;
+mod shell;
 mod snd;
 mod syscall;
 mod timer;

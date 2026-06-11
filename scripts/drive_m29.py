@@ -16,8 +16,9 @@ FILES_BTN = (652, 768 - 20)
 WIN_X, WIN_Y = 120, 60
 CONTENT_X = WIN_X + 2
 CONTENT_Y = WIN_Y + 2 + 22       # 84
-NAME_X = CONTENT_X + 52          # 174
+NAME_X = CONTENT_X + 56          # render draws the name at canvas x+4+48+4
 ROW_H = 14
+COL_W = 4 + 48 + 4 + 12 * 8 + 8   # 160; the list is laid out in columns
 
 SEL_BG = (0x2A, 0x5A, 0x8A)
 SEL_TX = (0xFF, 0xFF, 0xFF)
@@ -73,10 +74,11 @@ def main():
     listing = files_listing(d)
     check("file list has entries", len(listing) > 0, f"{len(listing)} files")
 
-    # Row 0 is selected -> a blue highlight fills the row past the filename.
+    # Row 0 is selected -> a blue highlight fills its column (COL_W wide)
+    # past the filename. Sample inside column 0's highlight, clear of glyphs.
     d.move(1000, 740)
     img = d.dump("m29_list")
-    far = (CONTENT_X + 300, CONTENT_Y + 7)
+    far = (CONTENT_X + COL_W - 12, CONTENT_Y + 7)
     check("row 0 highlighted (list rendered)", img.at(*far) == SEL_BG,
           f"px {img.at(*far)} want {SEL_BG}")
 

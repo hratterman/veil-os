@@ -17,7 +17,8 @@ const STEP: u64 = 2; // ticks per frame (~25 fps at the 50 Hz timer)
 pub struct VideoState {
     name: String,
     data: Vec<u8>,
-    frames: Vec<(usize, usize)>, // byte ranges of each JPEG frame
+    frames: Vec<(usize, usize)>, // byte ranges of each JPEG frame (MJPEG)
+    predecoded: Vec<Image>,      // pre-decoded frames (H.264 .mp4)
     cur: usize,
     playing: bool,
     next_tick: u64,
@@ -48,12 +49,28 @@ fn split_frames(data: &[u8]) -> Vec<(usize, usize)> {
 impl VideoState {
     pub fn with_file(name: &str) -> VideoState {
         let data = fs::read_file(name).unwrap_or_default();
-        let frames = split_frames(&data);
-        kprintln!("VIDEO: {name} -> {} frames ({} bytes)", frames.len(), data.len());
+        // .mp4 → H.264 (decode all frames up front, capped to bound memory).
+        let is_mp4 = name.ends_with(".MP4") || name.ends_with(".mp4");
+        let mut predecoded = Vec::new();
+        let frames;
+        if is_mp4 {
+            let fr = crate::h264::decode_all(&data, 120);
+            predecoded = fr
+                .into_iter()
+                .map(|f| Image { w: f.w, h: f.h, full_w: f.w, full_h: f.h, pixels: f.pixels })
+                .collect::<Vec<_>>();
+            // Dummy byte ranges so the play loop's `cur % frames.len()` works.
+            frames = (0..predecoded.len()).map(|i| (i, i)).collect::<Vec<_>>();
+            kprintln!("VIDEO: {name} -> H.264, {} frames ({} bytes)", predecoded.len(), data.len());
+        } else {
+            frames = split_frames(&data);
+            kprintln!("VIDEO: {name} -> {} frames ({} bytes)", frames.len(), data.len());
+        }
         let mut st = VideoState {
             name: String::from(name),
             data,
             frames,
+            predecoded,
             cur: 0,
             playing: true,
             next_tick: 0,
@@ -66,6 +83,16 @@ impl VideoState {
 
     fn decode_current(&mut self) {
         if self.decoded_frame == self.cur {
+            return;
+        }
+        if !self.predecoded.is_empty() {
+            self.img = self.predecoded.get(self.cur).cloned();
+            self.decoded_frame = self.cur;
+            if self.cur == 0 {
+                if let Some(im) = &self.img {
+                    kprintln!("VIDEO: frame 0 {}x{}", im.w, im.h);
+                }
+            }
             return;
         }
         if let Some(&(s, e)) = self.frames.get(self.cur) {

@@ -866,7 +866,7 @@ impl Wm {
         if name.ends_with(".PNG") || name.ends_with(".JPG") || name.ends_with(".JPEG") {
             self.add_window(name, 220, 80, 560, 460, App::Viewer(viewer::ViewerState::with_file(name)));
             kprintln!("FILES: open {name} in Viewer");
-        } else if name.ends_with(".WAV") {
+        } else if name.ends_with(".WAV") || name.ends_with(".MP3") {
             let st = AudioState {
                 file: String::from(name),
                 start_tick: 0,
@@ -884,7 +884,7 @@ impl Wm {
         } else if name.ends_with(".GIF") {
             self.add_window(name, 200, 90, 280, 240, App::Gif(gifplayer::GifPlayerState::with_file(name)));
             kprintln!("FILES: open {name} in GIF player");
-        } else if name.ends_with(".MJP") || name.ends_with(".AVI") {
+        } else if name.ends_with(".MJP") || name.ends_with(".AVI") || name.ends_with(".MP4") {
             self.add_window(name, 200, 80, 360, 300, App::Video(video::VideoState::with_file(name)));
             kprintln!("FILES: open {name} in Video player");
         } else if name.ends_with(".WSM") {

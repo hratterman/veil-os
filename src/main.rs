@@ -33,6 +33,7 @@ mod fwcfg;
 mod gic;
 mod gif;
 mod gifplayer;
+mod h264;
 mod glyph_cache;
 mod heap;
 mod html;
@@ -43,6 +44,7 @@ mod keymap;
 mod lisp;
 #[cfg(feature = "pi4")]
 mod mbox;
+mod mp3;
 mod net;
 mod netdev;
 mod paging;
@@ -113,6 +115,8 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     milestone35_jpeg(); // M35: prove the baseline JPEG decoder
     milestone35_6_freetype(); // M35.6: FreeType2 vector text from source
     milestone35_wasm(); // M35: prove the WASM interpreter (+ JIT)
+    milestone_mp3(); // M37: prove the from-scratch MP3 Layer III decoder
+    milestone_h264(); // M37: prove the from-scratch H.264 baseline decoder
     milestone9();
     milestone10(&fdt);
     if milestone12(&fdt) {
@@ -382,8 +386,11 @@ fn milestone24(fdt: &dtb::Fdt) {
         return;
     }
     kprintln!("SND_OK: virtio-sound output ready (44100 Hz, 16-bit stereo)");
-    if read_mode(fdt).as_deref() == Some(b"audio") {
-        snd::play_file("TONE.WAV");
+    match read_mode(fdt).as_deref() {
+        Some(b"audio") => snd::play_file("TONE.WAV"),
+        // M37: decode an on-disk MP3 from scratch and stream it to virtio-sound.
+        Some(b"mp3") => snd::play_file("TONE.MP3"),
+        _ => {}
     }
 }
 
@@ -679,6 +686,109 @@ fn milestone35_wasm() {
         kprintln!("WASM_JIT_FAST: JIT is {speed}x faster than the interpreter");
     }
     kprintln!("WASM_OK: parser + interpreter + AArch64 JIT (hello/compute/fib)");
+}
+
+/// M37: decode an embedded 440 Hz MP3 (MPEG-1 Layer III, simple stereo,
+/// 44.1 kHz) from scratch and prove the output is a clean tone: right sample
+/// rate, ~440 Hz fundamental (counted via zero crossings), and sane amplitude.
+/// Any bug in Huffman/requant/IMDCT/filterbank yields noise, not a 440 Hz tone.
+fn milestone_mp3() {
+    let bytes = include_bytes!("../assets/codec/tone.mp3");
+    let Some(pcm) = mp3::decode(bytes) else {
+        kprintln!("MP3_FAIL: decode returned None");
+        return;
+    };
+    let n = pcm.samples.len();
+    kprintln!("MP3: {} Hz {}ch, {} samples", pcm.rate, pcm.channels, n);
+    if pcm.rate != 44100 || n < 44100 {
+        kprintln!("MP3_FAIL: rate/length wrong ({} Hz, {} samples)", pcm.rate, n);
+        return;
+    }
+    // Analyse the left channel (interleaved L,R). Count full zero crossings and
+    // peak amplitude over the steady portion (skip the encoder-delay lead-in).
+    let left: alloc::vec::Vec<i16> = pcm.samples.iter().step_by(2).copied().collect();
+    let start = (left.len() / 4).min(left.len());
+    let end = left.len();
+    let mut crossings = 0usize;
+    let mut peak = 0i32;
+    let mut nz = 0usize;
+    for w in left[start..end].windows(2) {
+        if (w[0] < 0) != (w[1] < 0) {
+            crossings += 1;
+        }
+        let a = (w[1] as i32).abs();
+        if a > peak {
+            peak = a;
+        }
+        if a > 64 {
+            nz += 1;
+        }
+    }
+    let secs = (end - start) as f64 / 44100.0;
+    let freq = (crossings as f64) / 2.0 / secs;
+    kprintln!("MP3: fundamental ~{} Hz, peak {}, {} loud samples", freq as i32, peak, nz);
+    // 440 Hz tone: expect ~880 crossings/s -> ~440 Hz; peak well above noise.
+    if (freq - 440.0).abs() < 40.0 && peak > 1500 && nz > left.len() / 8 {
+        kprintln!("MP3_OK: Layer III decode (Huffman/requant/IMDCT/filterbank) -> clean 440 Hz");
+    } else {
+        kprintln!("MP3_FAIL: not a clean 440 Hz tone (freq {} peak {})", freq as i32, peak);
+    }
+}
+
+/// M37: decode an embedded 320×240 baseline H.264 clip (Annex-B, CAVLC) from
+/// scratch and prove reconstruction is right: 8 frames, the IDR frame's four
+/// quadrant centres reconstruct to the encoded colours (lossy → tolerant), and
+/// a later P frame differs (motion compensation moved the box). Exercises NAL
+/// parse, SPS/PPS, CAVLC, intra 4×4/16×16, P-slice MC and the inverse transform.
+fn milestone_h264() {
+    let bytes = include_bytes!("../assets/codec/quad.264");
+    let frames = h264::decode_all(bytes, 8);
+    kprintln!("H264: decoded {} frames", frames.len());
+    let Some(f0) = frames.first() else {
+        kprintln!("H264_FAIL: no frames decoded");
+        return;
+    };
+    kprintln!("H264: frame0 {}x{}", f0.w, f0.h);
+    if f0.w != 320 || f0.h != 240 {
+        kprintln!("H264_FAIL: wrong dimensions {}x{}", f0.w, f0.h);
+        return;
+    }
+    let at = |f: &h264::Frame, x: usize, y: usize| {
+        let p = f.pixels[y * f.w + x];
+        (((p >> 16) & 0xff) as i32, ((p >> 8) & 0xff) as i32, (p & 0xff) as i32)
+    };
+    let near = |a: (i32, i32, i32), b: (i32, i32, i32), tol: i32| {
+        (a.0 - b.0).abs() < tol && (a.1 - b.1).abs() < tol && (a.2 - b.2).abs() < tol
+    };
+    // Quadrant centres (avoid the moving box at rows 100..140).
+    let quads_ok = |f: &h264::Frame| {
+        near(at(f, 80, 40), (220, 30, 30), 55)
+            && near(at(f, 240, 40), (30, 200, 40), 55)
+            && near(at(f, 80, 200), (40, 60, 210), 55)
+            && near(at(f, 235, 200), (235, 235, 235), 55)
+    };
+    let tl = at(f0, 80, 40);
+    let bl = at(f0, 80, 200);
+    kprintln!("H264: frame0 quad tl={tl:?} bl={bl:?}");
+    let colors_ok = quads_ok(f0);
+    // P-frame correctness: the LAST frame's flat quadrants must still be right
+    // (no drift), and the moving yellow box must have travelled to the right
+    // (frame 0: cols 20..50; frame N: ~160..190 → yellow at x=170, blue in f0).
+    let fl = frames.last().unwrap();
+    let last_quads_ok = quads_ok(fl);
+    let f0_box = at(f0, 170, 120);
+    let fl_box = at(fl, 170, 120);
+    let is_yellow = |c: (i32, i32, i32)| c.0 > 180 && c.1 > 150 && c.2 < 90;
+    let motion_ok = !is_yellow(f0_box) && is_yellow(fl_box);
+    kprintln!(
+        "H264: f0_box(170,120)={f0_box:?} last_box={fl_box:?} last_quads_ok={last_quads_ok}"
+    );
+    kprintln!("H264: colors_ok={colors_ok} motion_ok={motion_ok} frames={}", frames.len());
+    if colors_ok && last_quads_ok && motion_ok && frames.len() >= 6 {
+        kprintln!("H264_OK: baseline decode (NAL/SPS/PPS/CAVLC/intra/inter MC/IDCT) -> correct image");
+    } else {
+        kprintln!("H264_FAIL: reconstruction wrong (colors={colors_ok} motion={motion_ok})");
+    }
 }
 
 /// M35.6: initialise FreeType (compiled from C source, heap-backed) and render

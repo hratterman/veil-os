@@ -57,6 +57,9 @@ cp assets/hello.wasm "$MNT/HELLO.WSM" 2>/dev/null || true
 cp assets/compute.wasm "$MNT/COMPUTE.WSM" 2>/dev/null || true
 # M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
 python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
+# M37 codecs: a from-scratch-decoded MP3 (Layer III) and H.264 baseline MP4.
+cp assets/codec/tone.mp3 "$MNT/TONE.MP3" 2>/dev/null || true
+cp assets/codec/quad.mp4 "$MNT/QUAD.MP4" 2>/dev/null || true
 # M25/M27: USER.TXT labels Chat and gates the first-boot setup screen.
 #   --no-user  -> omit it, so the OS shows the setup screen on boot (hosted
 #                 demo, m27 test); --username NAME bakes a specific name;

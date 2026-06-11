@@ -143,13 +143,18 @@ pub fn audio_task() {
     }
 }
 
-/// Read a WAV off the disk, validate it's 16-bit stereo 44.1 kHz, play it,
-/// and emit the AUDIO_OK sentinel on a clean run.
+/// Read an audio file off the disk and play it. `.MP3` is decoded by the
+/// from-scratch Layer III decoder; everything else is treated as a PCM WAV.
+/// Emits AUDIO_OK on a clean run.
 pub fn play_file(name: &str) {
     let Some(data) = fs::read_file(name) else {
         kprintln!("AUDIO: {name} not found");
         return;
     };
+    if name.ends_with(".MP3") || name.ends_with(".mp3") {
+        play_mp3(name, &data);
+        return;
+    }
     let Some((rate, channels, bits, pcm)) = parse_wav(&data) else {
         kprintln!("AUDIO: {name} is not a PCM WAV");
         return;
@@ -161,6 +166,37 @@ pub fn play_file(name: &str) {
     }
     let played = play(pcm);
     kprintln!("AUDIO_OK: played {played} bytes of {name} ({} ms)", played as u64 * 1000 / (rate as u64 * channels as u64 * (bits as u64 / 8)));
+}
+
+/// Decode an MP3 to PCM and stream it. The device is fixed at 44.1 kHz stereo,
+/// so other sample rates are nearest-neighbour resampled. Emits AUDIO_OK.
+fn play_mp3(name: &str, data: &[u8]) {
+    let Some(pcm) = crate::mp3::decode(data) else {
+        kprintln!("AUDIO: {name} is not a decodable MP3");
+        return;
+    };
+    kprintln!("MP3: {name} -> {} Hz {}ch, {} samples", pcm.rate, pcm.channels, pcm.samples.len());
+    // pcm.samples is interleaved 16-bit stereo. Resample to 44100 if needed.
+    let mut frames: alloc::vec::Vec<i16> = pcm.samples;
+    if pcm.rate != 44100 && pcm.rate != 0 {
+        let in_frames = frames.len() / 2;
+        let out_frames = (in_frames as u64 * 44100 / pcm.rate as u64) as usize;
+        let mut rs = alloc::vec::Vec::with_capacity(out_frames * 2);
+        for o in 0..out_frames {
+            let s = (o as u64 * pcm.rate as u64 / 44100) as usize;
+            rs.push(frames[(s * 2).min(frames.len().saturating_sub(2))]);
+            rs.push(frames[(s * 2 + 1).min(frames.len().saturating_sub(1))]);
+        }
+        frames = rs;
+    }
+    // i16 -> little-endian bytes.
+    let mut bytes = alloc::vec::Vec::with_capacity(frames.len() * 2);
+    for s in &frames {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let played = play(&bytes);
+    kprintln!("AUDIO_OK: played {played} bytes of {name} (MP3, {} ms)",
+        (frames.len() / 2) as u64 * 1000 / 44100);
 }
 
 /// Parse a RIFF/WAVE file, returning (sample_rate, channels, bits_per_sample,

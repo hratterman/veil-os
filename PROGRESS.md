@@ -465,6 +465,60 @@ its content is injected by JavaScript, which the browser doesn't run).
 **Serial tokens fired this milestone:** HTTP_READ_OK, EXT_IMG_OK, CSS_VAR_OK,
 FLEX_OK, FONTS_OK.
 
+## M37 — from-scratch H.264 + MP3 decoders (2026-06-11)
+
+Two more from-scratch codecs, no crates, wired into the apps + file manager.
+Proof: `scripts/m37_test.sh` (boot self-tests + GUI drivers + headless sound).
+
+- **H.264 baseline decoder** (`src/h264/`): constrained-baseline (I + P slices,
+  CAVLC, single reference, 4:2:0). `bits.rs` (RBSP unescape + Exp-Golomb),
+  `mod.rs` (Annex-B start codes **and** MP4/ISO-BMFF demux: moov/trak/stbl,
+  stsz/stco/stsc sample table, avcC parameter sets, SPS/PPS Exp-Golomb),
+  `cavlc.rs` + `cavlc_tables.rs` (coeff_token/level/total_zeros/run_before VLC,
+  ITU Table 9-5/9-7/9-10), `transform.rs` (4×4 integer inverse transform,
+  dequant, luma/chroma Hadamard DC), `slice.rs` (slice header, macroblock layer,
+  intra 4×4 9-mode / 16×16 4-mode / chroma prediction, P-slice motion
+  compensation with 6-tap quarter-pel luma + bilinear eighth-pel chroma, median
+  mv prediction, in-loop **deblocking filter** §8.7, limited-range YCbCr→RGB).
+  Validated against ffmpeg's decode of the same clip: quadrant colours within
+  ±2, P-frame box position pixel-exact, deblocked boundary within ±1.
+  **H264_OK.** Wired into the video player (`video.rs` pre-decodes `.mp4`) +
+  file manager (`.MP4` → Video). `scripts/drive_m37_video.py`.
+
+  *Three bugs found + fixed during bring-up:* (1) intra-4×4 **mode** prediction
+  used the reconstruction grid (`decoded4`) for neighbour availability, but
+  intra-MB neighbours aren't reconstructed yet during the mode-reading pass —
+  added a separate `i4set` "mode known" grid (this was a +52 luma offset
+  smeared across whole regions via horizontal/vertical intra propagation).
+  (2) The `mb_skip_run` state machine read a *new* skip run after exhausting one,
+  swallowing the coded MB that follows — so every P frame decoded as all-skip
+  (motion never applied, the box never moved). (3) dequant overflowed i32 on a
+  stray coefficient → switched to i64 with a clamp (defensive).
+
+- **MP3 Layer III decoder** (`src/mp3/`): full pipeline ported from the
+  public-domain pdmp3.c (Unlicense) to Rust over a whole in-memory buffer (no
+  streaming ring): frame header/sync, side info, scalefactors, Huffman decode,
+  requantization, reorder, M/S + intensity stereo, alias reduction, IMDCT +
+  windowing (hybrid synthesis), frequency inversion, polyphase synthesis
+  filterbank → 16-bit PCM. The kernel has **no libm**, so all fixed cos/sin
+  windows and the `is^(4/3)` table are precomputed by `scripts/gen_mp3_tables.py`
+  and requant exponents (always multiples of ¼) use f64 exponent-bit math.
+  Decodes the embedded 440 Hz tone to a clean 440 Hz fundamental, peak 3953 vs
+  ffmpeg's 4023. **MP3_OK.** Wired into `snd::play_file` (`.MP3` → decode →
+  resample-to-44100 → virtio-sound) + the audio app + file manager.
+  `scripts/drive_m37_mp3.py`; headless `opt/veil.mode=mp3` streams it through
+  virtio-sound (**AUDIO_OK**).
+
+**Table provenance:** all bulky/error-prone tables are *generated* from vendored
+reference sources (committed under `vendor/`) so they're verifiable, not
+hand-transcribed: MP3 Huffman/window from `pdmp3.c`; H.264 CAVLC VLCs from
+FFmpeg `h264_cavlc.c`; deblock α/β/tc0 from FFmpeg `h264_loopfilter.c`. The
+table *values* are the ITU-T H.264 / ISO 11172-3 spec tables.
+
+**Serial tokens fired this milestone:** H264_OK, MP3_OK (+ AUDIO_OK via the MP3
+sound path). Regressions green: gui_test, m29 (file manager), m35 MJPEG video,
+and the JPEG/WASM/FreeType/crypto boot self-tests.
+
 ## Bugfix — large-PNG OOM crash (2026-06-11)
 
 **Symptom:** opening a real-world-sized PNG (e.g. 1920x1080) in the image

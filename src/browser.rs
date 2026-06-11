@@ -366,6 +366,17 @@ fn parse_response(resp: &[u8], path: &str) -> Option<(u32, String, Vec<u8>)> {
     let chunked = head
         .lines()
         .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
+    // Follow redirects: for a 3xx, hand back the Location as the "body" with a
+    // sentinel content-type so navigate() can re-fetch it.
+    if (300..400).contains(&status) {
+        if let Some(loc) = head.lines().find_map(|l| {
+            let (name, val) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("location").then(|| val.trim())
+        }) {
+            kprintln!("BROWSER: GET {path} -> {status} redirect to {loc}");
+            return Some((status, String::from("text/redirect"), loc.as_bytes().to_vec()));
+        }
+    }
     let raw = &resp[split + 4..];
     let body = if chunked { dechunk(raw) } else { raw.to_vec() };
     kprintln!("BROWSER: GET {path} -> {status} {ctype} ({} bytes)", body.len());
@@ -1680,9 +1691,31 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
             }
         }
     }
-    let Some((status, ctype, body)) = http_get(&path) else {
-        render_message(win, &path, "fetch failed: no response from server");
-        return;
+    // Fetch, following up to a few 3xx redirects (Location may be relative).
+    let mut path = path;
+    let (status, ctype, body) = {
+        let mut result = None;
+        for _ in 0..6 {
+            let Some((s, c, b)) = http_get(&path) else { break };
+            if c == "text/redirect" {
+                let loc = String::from_utf8_lossy(&b);
+                let loc = loc.trim();
+                let next = if is_external(loc) { String::from(loc) } else { url_join(&path, loc) };
+                kprintln!("BROWSER: following redirect -> {next}");
+                set_page_base(if is_external(&next) { Some(next.clone()) } else { None });
+                path = next;
+                continue;
+            }
+            result = Some((s, c, b));
+            break;
+        }
+        match result {
+            Some(r) => r,
+            None => {
+                render_message(win, &path, "fetch failed: no response from server");
+                return;
+            }
+        }
     };
     if !ctype.to_ascii_lowercase().contains("text/html") {
         render_message(win, &path, &format!("not html: {ctype} ({status})"));

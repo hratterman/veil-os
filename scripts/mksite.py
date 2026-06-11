@@ -278,7 +278,8 @@ WEB = page("""<h1>The Real Web</h1>
 <p><a href="imgtest.htm">External images test</a> -
 <a href="cssvar.htm">CSS variables test</a> -
 <a href="flextest.htm">Flexbox test</a> - <a href="fonttest.htm">Fonts test</a> -
-<a href="navtest.htm">Nav/selector test</a></p>
+<a href="navtest.htm">Nav/selector test</a> -
+<a href="formtest.htm">Form input test</a></p>
 <p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
@@ -342,6 +343,15 @@ CSSVAR = page("""<style>
 <div class="vbar">brand colored bar (background = var(--brand))</div>
 <h1 class="vtext">accent heading (color = var(--accent))</h1>
 <p class="vfb">fallback works (var(--nope, #1188dd))</p>
+<p><a href="web.htm">Back</a></p>""")
+
+FORMTEST = page("""<h1>Search Veil</h1>
+<p>Type a query into the box (M35 text input):</p>
+<form action="/news.htm">
+<p><input type="text" name="q" size="24" value=""></p>
+<p>Notes:</p>
+<textarea>scratch pad</textarea>
+</form>
 <p><a href="web.htm">Back</a></p>""")
 
 NAVTEST = page("""<style>
@@ -625,7 +635,7 @@ def main():
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
         "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST, "fonttest.htm": FONTTEST,
-        "navtest.htm": NAVTEST,
+        "navtest.htm": NAVTEST, "formtest.htm": FORMTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

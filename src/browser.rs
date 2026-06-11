@@ -54,6 +54,22 @@ pub struct BrowserState {
     page_bg: u32,
     history: Vec<String>, // previously-visited paths (newest last), max 20
     img_cache: Vec<(String, png::Image)>, // decoded images by URL, LRU, cap 10
+    // M35 text input: an editable address bar and on-page form fields.
+    editing: bool,           // address bar focused for editing
+    edit_buf: String,        // address-bar contents while editing
+    fields: Vec<InputField>, // <input>/<textarea> on the current page
+    focus: Option<usize>,    // index into `fields` of the focused field
+}
+
+#[derive(Clone)]
+struct InputField {
+    x: isize, // document coordinates of the field box
+    y: isize,
+    w: isize,
+    h: isize,
+    value: String,
+    multiline: bool,
+    action: String, // enclosing form's action (for Enter-to-submit)
 }
 
 struct LinkBox {
@@ -76,7 +92,76 @@ impl BrowserState {
             page_bg: 0xffff_ffff,
             history: Vec::new(),
             img_cache: Vec::new(),
+            editing: false,
+            edit_buf: String::new(),
+            fields: Vec::new(),
+            focus: None,
         }
+    }
+}
+
+/// Redraw the on-page input fields into the page buffer (value + focus ring),
+/// then repaint the view. Cheaper than a full re-layout for each keystroke.
+fn paint_fields(win: &mut Window) {
+    let (fields, focus, pw, dh) = {
+        let crate::wm::App::Browser(st) = &win.app else { return };
+        (st.fields.clone(), st.focus, st.page_w, st.doc_h)
+    };
+    if pw != 0 && dh != 0 {
+        if let crate::wm::App::Browser(st) = &mut win.app {
+            let pfb = unsafe { Framebuffer::new(st.page.as_mut_ptr(), pw, dh, pw * 4) };
+            for (i, f) in fields.iter().enumerate() {
+                if f.x < 0 || f.y < 0 {
+                    continue;
+                }
+                let (x, y, w, h) = (f.x as usize, f.y as usize, f.w as usize, f.h as usize);
+                pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
+                let border = if focus == Some(i) { 0xff5b_8af0 } else { 0xff4a_5060 };
+                pfb.fill_rect(x, y, w, 1, border);
+                pfb.fill_rect(x, y + h - 1, w, 1, border);
+                pfb.fill_rect(x, y, 1, h, border);
+                pfb.fill_rect(x + w - 1, y, 1, h, border);
+                let txt = if focus == Some(i) { format!("{}_", f.value) } else { f.value.clone() };
+                pfb.draw_string(x + 4, y + 3, &txt, 0xffe8_e8e8, None);
+            }
+        }
+    }
+    paint_view(win);
+}
+
+/// Click in the chrome (topbar): focus the address bar for editing if the
+/// click landed on the URL field (right of the back button). Returns true if
+/// the click was consumed by the chrome.
+pub fn chrome_click(win: &mut Window, rx: isize, ry: isize) -> bool {
+    let crate::wm::App::Browser(st) = &mut win.app else { return false };
+    if ry < TOPBAR as isize && rx >= 18 {
+        st.editing = true;
+        st.focus = None;
+        st.edit_buf = String::new(); // focus clears, like select-all + type
+        paint_view(win);
+        return true;
+    }
+    false
+}
+
+/// A printable character arrived while a text field (address bar or a page
+/// input) is focused. Returns true if consumed.
+pub fn char_input(win: &mut Window, ch: char) -> bool {
+    let crate::wm::App::Browser(st) = &mut win.app else { return false };
+    if st.editing {
+        st.edit_buf.push(ch);
+        paint_view(win);
+        true
+    } else if let Some(i) = st.focus {
+        if let Some(f) = st.fields.get_mut(i) {
+            f.value.push(ch);
+            // Repaint the page so the typed text shows in the field.
+            paint_fields(win);
+            return true;
+        }
+        false
+    } else {
+        false
     }
 }
 
@@ -888,6 +973,7 @@ enum Frag {
     Word { s: String, color: u32, scale: usize, link: Option<String>, underline: bool, font: Font },
     Space { scale: usize, font: Font },
     Img { idx: usize, w: isize, h: isize },
+    Input { value: String, w: isize, h: isize, multiline: bool },
     Br,
 }
 
@@ -910,7 +996,7 @@ fn frag_w(f: &Frag) -> isize {
     match f {
         Frag::Word { s, scale, font, .. } => text_w(s, *scale, *font),
         Frag::Space { scale, font } => text_w(" ", *scale, *font),
-        Frag::Img { w, .. } => *w,
+        Frag::Img { w, .. } | Frag::Input { w, .. } => *w,
         Frag::Br => 0,
     }
 }
@@ -918,7 +1004,7 @@ fn frag_w(f: &Frag) -> isize {
 fn frag_h(f: &Frag) -> isize {
     match f {
         Frag::Word { scale, font, .. } | Frag::Space { scale, font } => text_h(*scale, *font),
-        Frag::Img { h, .. } => *h,
+        Frag::Img { h, .. } | Frag::Input { h, .. } => *h,
         Frag::Br => 16,
     }
 }
@@ -929,6 +1015,7 @@ struct Ctx<'a> {
     items: Vec<Item>,
     links: Vec<LinkBox>,
     img_spots: Vec<(usize, isize, isize)>, // (imgs idx, x, y) for the proof log
+    fields: Vec<InputField>,               // on-page form fields, with positions
 }
 
 /// Whitespace-collapsing text -> word/space frags.
@@ -976,6 +1063,20 @@ fn collect_inline(
             };
             match tag.as_str() {
                 "br" => buf.push(Frag::Br),
+                "input" => {
+                    // Render text-like inputs as editable boxes; skip the rest.
+                    let ty = node.attr("type").unwrap_or("text").to_ascii_lowercase();
+                    if matches!(ty.as_str(), "text" | "search" | "email" | "url" | "password" | "tel" | "number" | "") {
+                        let value = node.attr("value").unwrap_or("").into();
+                        let chars = node.attr("size").and_then(|s| s.parse::<isize>().ok()).unwrap_or(20);
+                        buf.push(Frag::Input { value, w: (chars * 8 + 8).clamp(80, 360), h: 20, multiline: false });
+                    }
+                }
+                "textarea" => {
+                    let mut value = String::new();
+                    node.text(&mut value);
+                    buf.push(Frag::Input { value: value.trim().into(), w: 280, h: 64, multiline: true });
+                }
                 "img" => {
                     let src = node.attr("src").map(resolve_href).unwrap_or_default();
                     match ctx.imgs.iter().position(|(s, _)| *s == src) {
@@ -1034,6 +1135,25 @@ fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> is
             Frag::Img { idx, .. } => {
                 ctx.img_spots.push((idx, x + dx, fy));
                 ctx.items.push(Item::Image { x: x + dx, y: fy, idx });
+            }
+            Frag::Input { value, w: fw, h: fh, multiline } => {
+                let (bx, by) = (x + dx, fy);
+                // Field surface + a 1px muted border (focus ring drawn later).
+                ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff1f1f1f });
+                for (rx, ry, rw, rh) in
+                    [(bx, by, fw, 1), (bx, by + fh - 1, fw, 1), (bx, by, 1, fh), (bx + fw - 1, by, 1, fh)]
+                {
+                    ctx.items.push(Item::Rect { x: rx, y: ry, w: rw, h: rh, color: 0xff4a5060 });
+                }
+                ctx.items.push(Item::Text {
+                    x: bx + 4,
+                    y: by + 3,
+                    s: value.clone(),
+                    color: 0xffe8e8e8,
+                    scale: 1,
+                    font: None,
+                });
+                ctx.fields.push(InputField { x: bx, y: by, w: fw, h: fh, value, multiline, action: String::new() });
             }
             Frag::Space { .. } | Frag::Br => {}
         }
@@ -1271,6 +1391,7 @@ fn measure_item(
         items: Vec::new(),
         links: Vec::new(),
         img_spots: Vec::new(),
+        fields: Vec::new(),
     };
     let cstyle = resolve(ctx.sheet, node, parent);
     let bottom = if cstyle.display == Display::Inline {
@@ -1590,6 +1711,7 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         items: Vec::new(),
         links: Vec::new(),
         img_spots: Vec::new(),
+        fields: Vec::new(),
     };
     let end_y = layout_block(&mut ctx, body_node, &root, 0, view_w as isize, 0, None);
     let doc_h = (end_y.max(1) as usize).min(MAX_DOC_H);
@@ -1654,9 +1776,18 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     st.page_w = view_w;
     st.doc_h = doc_h;
     st.links = ctx.links;
+    st.fields = ctx.fields;
+    st.focus = None;
     st.scroll = 0;
     st.page_bg = page_bg;
+    let nfields = st.fields.len();
+    for f in &st.fields {
+        kprintln!("BROWSER: field 'input' at ({}, {}) {}x{}", f.x, f.y, f.w, f.h);
+    }
     paint_view(win);
+    if nfields > 0 {
+        kprintln!("BROWSER: {nfields} form field(s) on page");
+    }
 
     if by_click && !M16_DONE.swap(true, Ordering::Relaxed) {
         kprintln!(
@@ -1717,8 +1848,11 @@ pub fn paint_view(win: &mut Window) {
         } else {
             100
         };
-        // External pages already carry a full URL; local paths get our IP.
-        if st.path.starts_with("http://") || st.path.starts_with("https://") {
+        // While editing, show the edit buffer with a block cursor.
+        if st.editing {
+            format!("{}_", st.edit_buf)
+        } else if st.path.starts_with("http://") || st.path.starts_with("https://") {
+            // External pages already carry a full URL; local paths get our IP.
             format!("{}  [{pct}%]", st.path)
         } else {
             format!("http://{}{}  [{pct}%]", net::fmt_ip(&ip), st.path)
@@ -1743,6 +1877,27 @@ pub fn paint_view(win: &mut Window) {
     fb.fill_rect(0, 0, 18, TOPBAR, if has_history { 0xff90_a8c0 } else { 0xffb0_b4bc });
     fb.draw_string(5, 2, "<", BAR_TEXT, None);
     fb.draw_string(22, 2, &bar, BAR_TEXT, None);
+}
+
+/// Canvas-relative click: focus an on-page input field if one was hit.
+/// Returns true if a field took focus.
+pub fn focus_field(win: &mut Window, rx: isize, ry: isize) -> bool {
+    let crate::wm::App::Browser(st) = &mut win.app else { return false };
+    if ry < TOPBAR as isize {
+        return false;
+    }
+    let (dx, dy) = (rx, ry - TOPBAR as isize + st.scroll as isize);
+    if let Some(i) = st
+        .fields
+        .iter()
+        .position(|f| dx >= f.x && dx < f.x + f.w && dy >= f.y && dy < f.y + f.h)
+    {
+        st.focus = Some(i);
+        st.editing = false;
+        paint_fields(win);
+        return true;
+    }
+    false
 }
 
 /// Canvas-relative click -> link href, if one was hit.
@@ -1796,6 +1951,83 @@ pub fn key(win: &mut Window, code: u16) -> bool {
     const KEY_DOWN: u16 = 108;
     const KEY_PGDN: u16 = 109;
     const KEY_BACKSPACE: u16 = 14;
+    const KEY_ENTER: u16 = 28;
+    const KEY_ESC: u16 = 1;
+
+    // Address-bar editing intercepts the keyboard.
+    let editing = matches!(&win.app, crate::wm::App::Browser(st) if st.editing);
+    if editing {
+        match code {
+            KEY_ENTER => {
+                let url = if let crate::wm::App::Browser(st) = &mut win.app {
+                    st.editing = false;
+                    core::mem::take(&mut st.edit_buf)
+                } else {
+                    return true;
+                };
+                kprintln!("BROWSER: address bar -> {url}");
+                navigate(win, url.trim(), true);
+                return true;
+            }
+            KEY_ESC => {
+                if let crate::wm::App::Browser(st) = &mut win.app {
+                    st.editing = false;
+                }
+                paint_view(win);
+                return true;
+            }
+            KEY_BACKSPACE => {
+                if let crate::wm::App::Browser(st) = &mut win.app {
+                    st.edit_buf.pop();
+                }
+                paint_view(win);
+                return true;
+            }
+            // Let character-producing keys fall through to char_input(); other
+            // non-char keys (arrows etc.) are simply ignored while editing.
+            _ => return false,
+        }
+    }
+
+    // A focused on-page input field takes Enter (submit) and Backspace (delete).
+    let focused = matches!(&win.app, crate::wm::App::Browser(st) if st.focus.is_some());
+    if focused {
+        match code {
+            KEY_BACKSPACE => {
+                if let crate::wm::App::Browser(st) = &mut win.app {
+                    if let Some(f) = st.focus.and_then(|i| st.fields.get_mut(i)) {
+                        f.value.pop();
+                    }
+                }
+                paint_fields(win);
+                return true;
+            }
+            KEY_ENTER => {
+                let action = if let crate::wm::App::Browser(st) = &mut win.app {
+                    let a = st.focus.and_then(|i| st.fields.get(i)).map(|f| f.action.clone());
+                    st.focus = None;
+                    a
+                } else {
+                    None
+                };
+                if let Some(a) = action.filter(|a| !a.is_empty()) {
+                    kprintln!("BROWSER: form submit -> {a}");
+                    navigate(win, &a, true);
+                }
+                paint_fields(win);
+                return true;
+            }
+            KEY_ESC => {
+                if let crate::wm::App::Browser(st) = &mut win.app {
+                    st.focus = None;
+                }
+                paint_fields(win);
+                return true;
+            }
+            _ => {}
+        }
+    }
+
     if code == KEY_BACKSPACE {
         return back(win); // address bar isn't a text field -> Backspace = back
     }

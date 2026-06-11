@@ -603,6 +603,12 @@ impl Wm {
                     repl::render(win);
                     self.dirty = true;
                 }
+                App::Browser(_) => {
+                    // Address bar / focused form field text entry.
+                    if browser::char_input(win, ch) {
+                        self.dirty = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -767,6 +773,10 @@ impl Wm {
                     App::Browser(_) => {
                         if ry < browser::TOPBAR as isize && rx < 18 {
                             browser::back(win); // the `<` back button
+                        } else if browser::chrome_click(win, rx, ry) {
+                            // address bar focused for editing
+                        } else if browser::focus_field(win, rx, ry) {
+                            // an on-page input field took focus
                         } else if let Some(href) = browser::link_at(win, rx, ry) {
                             kprintln!("BROWSER: clicked link -> {href}");
                             browser::navigate(win, &href, true);

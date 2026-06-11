@@ -44,6 +44,14 @@ def fetch(url):
 
 def strip_html(html, base):
     html = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    # Surface the page <title> as a heading. The Veil browser shows the URL in
+    # its title bar and we strip the whole <head>, so otherwise the page's name
+    # never appears on screen. Only inject when the body has no <h1> of its own,
+    # so pages that already lead with a heading (example.com, Wikipedia) aren't
+    # doubled up.
+    tm = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.S | re.I)
+    title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", tm.group(1))).strip() if tm else ""
+    has_h1 = re.search(r"<h1[\s>]", html, flags=re.I) is not None
     for tag in DROP_TREES:
         html = re.sub(rf"<{tag}\b.*?</{tag}>", " ", html, flags=re.S | re.I)
         html = re.sub(rf"<{tag}\b[^>]*/?>", " ", html, flags=re.I)
@@ -64,6 +72,13 @@ def strip_html(html, base):
     # Drop inline event handlers and style attributes the browser ignores anyway.
     html = re.sub(r'\son\w+\s*=\s*"[^"]*"', "", html, flags=re.I)
     html = re.sub(r"\sstyle\s*=\s*\"[^\"]*\"", "", html, flags=re.I)
+    if title and not has_h1:
+        heading = "<h1>%s</h1>" % title
+        if re.search(r"<body[^>]*>", html, flags=re.I):
+            html = re.sub(r"(<body[^>]*>)", lambda m: m.group(1) + heading, html,
+                          count=1, flags=re.I)
+        else:
+            html = heading + html
     return html
 
 

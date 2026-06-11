@@ -111,18 +111,26 @@ pub fn render(win: &mut Window) {
     if im.w == 0 || im.h == 0 {
         return;
     }
-    // Fit to the content box, preserving aspect (scale in 1/1024 units).
+    // Fit to the content box, preserving aspect (scale in 1/1024 units). The
+    // destination is always shrunk to the window, so even a 2048px image only
+    // ever blits `cw`x`ch` pixels — large images are scaled down, never drawn
+    // 1:1 past the canvas edge.
     let scale = ((cw * 1024 / im.w).min(ch * 1024 / im.h)).max(1);
     let dw = (im.w * scale / 1024).clamp(1, cw);
     let dh = (im.h * scale / 1024).clamp(1, ch);
     let ox = (cw - dw) / 2;
     let oy = (ch - dh) / 2;
     for dy in 0..dh {
-        let sy = dy * im.h / dh;
+        let sy = (dy * im.h / dh).min(im.h - 1);
         let srow = sy * im.w;
         for dx in 0..dw {
-            let sx = dx * im.w / dw;
-            fb.put_pixel(ox + dx, oy + dy, im.pixels[srow + sx]);
+            let sx = (dx * im.w / dw).min(im.w - 1);
+            let si = srow + sx;
+            // Guard both ends of the blit: the source index into the decoded
+            // buffer and the destination pixel inside the canvas.
+            if si < im.pixels.len() && ox + dx < cw && oy + dy < ch {
+                fb.put_pixel(ox + dx, oy + dy, im.pixels[si]);
+            }
         }
     }
 }

@@ -464,3 +464,31 @@ its content is injected by JavaScript, which the browser doesn't run).
 
 **Serial tokens fired this milestone:** HTTP_READ_OK, EXT_IMG_OK, CSS_VAR_OK,
 FLEX_OK, FONTS_OK.
+
+## Bugfix — large-PNG OOM crash (2026-06-11)
+
+**Symptom:** opening a real-world-sized PNG (e.g. 1920x1080) in the image
+viewer (or via the file manager) took the whole OS down — noVNC dropped, the
+QEMU instance vanished.
+
+**Root cause:** `png::decode()` allocated a full-resolution XRGB pixel buffer
+(~8 MiB at 1920x1080) *plus* the inflated scanlines (~6 MiB, transiently ~2x
+during the inflate buffer's doubling growth) on the fixed 16 MiB kernel heap.
+The allocation failed, `alloc` returned null, the default handler panicked,
+and the panic handler calls `semihosting::exit(1)` — QEMU exits, "OS gone".
+
+**Fix (`src/png.rs`):** (1) lowered the decoded-dimension cap to 2048x2048;
+(2) added a heap-budget guard before `inflate()` that estimates the peak
+(pixels + 2x raw + 1 MiB headroom) against `heap::free_bytes()` and refuses
+the image gracefully (`decode` -> None, viewer shows "cannot decode") instead
+of OOM-panicking; (3) drop the compressed `idat` copy before the pixel buffer
+goes live. Plus defensive bounds checks before the blits in `viewer.rs`
+(source index + destination clamp; large images are already scaled to fit) and
+`files.rs` (skip slots past the canvas edge). Emits **PNG_CRASH_FIXED** on
+serial the first time a multi-megapixel image is handled without crashing.
+
+**Test:** `scripts/pngfix_test.sh` (gen 1920x1080 PNG via `mkbigpng.py`, stage
+it so the viewer opens onto it, drive via `drive_pngfix.py`): the image is
+refused gracefully, PNG_CRASH_FIXED fires, the OS stays alive (QMP screendump
++ navigation to a normal PNG still work), no KERNEL PANIC. M23 (viewer), M29
+(file manager) and M34-img (browser `<img>`) regressions all still green.

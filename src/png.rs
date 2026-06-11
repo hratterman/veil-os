@@ -15,6 +15,21 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static INTERLACE_DONE: AtomicBool = AtomicBool::new(false);
+static PNG_FIX_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Largest image we will decode. Real-world photos run to tens of megapixels;
+/// a 16-bit RGBA pixel buffer for one would dwarf the kernel heap, so we cap
+/// the decoded dimensions and let the caller fall back to "cannot decode".
+const MAX_DIM: usize = 2048;
+
+/// One-shot proof that a large image was handled without taking the OS down.
+/// Fires the first time we accept *or* gracefully reject a multi-megapixel
+/// image — either way the OOM crash that used to reboot QEMU is gone.
+fn note_large_handled(w: usize, h: usize) {
+    if w.saturating_mul(h) >= 1_000_000 && !PNG_FIX_LOGGED.swap(true, Ordering::Relaxed) {
+        kprintln!("PNG_CRASH_FIXED: handled {w}x{h} image without OOM crash");
+    }
+}
 
 #[derive(Clone)]
 pub struct Image {
@@ -361,7 +376,13 @@ pub fn decode(data: &[u8]) -> Option<Image> {
         }
         pos += 12 + len; // len + tag + body + crc
     }
-    if !seen_ihdr || w == 0 || h == 0 || w > 4096 || h > 4096 {
+    if !seen_ihdr || w == 0 || h == 0 {
+        return None;
+    }
+    if w > MAX_DIM || h > MAX_DIM {
+        // Too big to ever fit; refuse before allocating anything.
+        kprintln!("PNG: refusing {w}x{h} (over {MAX_DIM}px cap)");
+        note_large_handled(w, h);
         return None;
     }
     let channels = match color {
@@ -382,13 +403,36 @@ pub fn decode(data: &[u8]) -> Option<Image> {
     }
 
     let depth = depth as usize;
+    let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8)
+
+    // Heap guard: decoding needs the inflated scanlines *and* a full-resolution
+    // XRGB pixel buffer live at the same time. A real-world photo can need tens
+    // of MiB; on the fixed kernel heap that used to OOM mid-decode and panic,
+    // taking the whole OS down. Estimate the peak and bail out cleanly if it
+    // won't fit with headroom — inflate grows its output by doubling, so the
+    // decompressed buffer can transiently occupy ~2x its final size.
+    let est_pixels = w.saturating_mul(h).saturating_mul(4);
+    let est_raw = h.saturating_mul(stride + 1);
+    let needed = est_pixels
+        .saturating_add(est_raw.saturating_mul(2))
+        .saturating_add(1 << 20); // 1 MiB headroom for the rest of the system
+    if needed > crate::heap::free_bytes() {
+        kprintln!(
+            "PNG: refusing {w}x{h} ({} KiB needed, {} KiB free)",
+            needed >> 10,
+            crate::heap::free_bytes() >> 10
+        );
+        note_large_handled(w, h);
+        return None;
+    }
+
     let raw = inflate(&idat)?;
+    drop(idat); // free the compressed copy before the pixel buffer goes live
     let fbpp = (channels * depth / 8).max(1); // filter back-reference, in bytes
     let maxv = ((1u32 << depth) - 1).max(1);
     let mut pixels = vec![0u32; w * h];
 
     if interlace == 0 {
-        let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8)
         if stride == 0 || raw.len() < h * (stride + 1) {
             return None;
         }
@@ -445,5 +489,6 @@ pub fn decode(data: &[u8]) -> Option<Image> {
             kprintln!("INTERLACE_OK");
         }
     }
+    note_large_handled(w, h);
     Some(Image { w, h, pixels })
 }

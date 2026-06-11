@@ -104,6 +104,11 @@ pub fn render(win: &mut Window) {
         let row = slot % rows;
         let x = col * col_w;
         let y = row * ROW_H;
+        // Skip any slot whose row/column origin lands outside the canvas, so a
+        // wide listing never starts a blit past the window edge.
+        if x >= cw || y >= ch {
+            continue;
+        }
         let selected = i == sel;
         if selected {
             fb.fill_rect(x, y, col_w, ROW_H, SEL_BG);

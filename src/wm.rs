@@ -582,7 +582,7 @@ struct FileDrag {
 
 /// A right-click context menu: items + screen anchor + the target it acts on.
 pub struct ContextMenu {
-    items: Vec<&'static str>,
+    items: Vec<String>,
     x: isize,
     y: isize,
     target: MenuTarget,
@@ -592,6 +592,7 @@ pub struct ContextMenu {
 enum MenuTarget {
     Desktop,
     Window(usize),
+    Clipboard,
 }
 
 impl Wm {
@@ -987,7 +988,11 @@ impl Wm {
                     return;
                 }
                 keymap::KEY_V => {
-                    self.clipboard_paste();
+                    if self.shift {
+                        self.open_clipboard_menu(); // Ctrl+Shift+V history picker
+                    } else {
+                        self.clipboard_paste();
+                    }
                     return;
                 }
                 _ => {}
@@ -1555,6 +1560,27 @@ impl Wm {
         CursorShape::Arrow
     }
 
+    /// Ctrl+Shift+V: a popup of the last clipboard entries; click one to paste.
+    fn open_clipboard_menu(&mut self) {
+        let hist = crate::clipboard::history();
+        if hist.is_empty() {
+            self.notify("Clipboard history empty");
+            return;
+        }
+        let items: Vec<String> = hist
+            .iter()
+            .map(|s| s.chars().take(22).collect::<String>().replace('\n', " "))
+            .collect();
+        let mh = items.len() as isize * 26 + 8;
+        self.menu = Some(ContextMenu {
+            items,
+            x: self.mx.min(self.screen.width as isize - 180).max(0),
+            y: (self.my - mh).max(0),
+            target: MenuTarget::Clipboard,
+        });
+        self.dirty = true;
+    }
+
     fn on_right_down(&mut self) {
         if self.menu.take().is_some() {
             self.dirty = true;
@@ -1563,17 +1589,21 @@ impl Wm {
         if self.my >= self.screen.height as isize - TASKBAR_H as isize {
             return;
         }
-        let (items, target): (Vec<&'static str>, MenuTarget) = match self.hit_test(self.mx, self.my) {
+        let win_items = || ["Minimize", "Maximize", "Close"].iter().map(|s| s.to_string()).collect();
+        let (items, target): (Vec<String>, MenuTarget) = match self.hit_test(self.mx, self.my) {
             Some((idx, Hit::Title)) => {
                 let top = self.raise(idx);
-                (vec!["Minimize", "Maximize", "Close"], MenuTarget::Window(top))
+                (win_items(), MenuTarget::Window(top))
             }
             Some((idx, Hit::Content(..))) => {
                 let top = self.raise(idx);
-                (vec!["Minimize", "Maximize", "Close"], MenuTarget::Window(top))
+                (win_items(), MenuTarget::Window(top))
             }
             None => (
-                vec!["New File", "New Folder", "Screenshot", "Change Wallpaper", "Settings"],
+                ["New File", "New Folder", "Screenshot", "Change Wallpaper", "Settings"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 MenuTarget::Desktop,
             ),
         };
@@ -1594,7 +1624,12 @@ impl Wm {
         if !inside || row >= menu.items.len() {
             return true; // click outside an item just closes the menu
         }
-        let item = menu.items[row];
+        let item = menu.items[row].as_str();
+        if let MenuTarget::Clipboard = menu.target {
+            crate::clipboard::pick(row);
+            self.clipboard_paste();
+            return true;
+        }
         match (&menu.target, item) {
             (MenuTarget::Window(idx), "Minimize") => self.minimize(*idx),
             (MenuTarget::Window(idx), "Maximize") => self.maximize_toggle(*idx),

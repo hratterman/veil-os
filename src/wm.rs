@@ -10,8 +10,8 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    browser, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, scheduler, snd, timer,
-    viewer,
+    browser, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl, scheduler, snd,
+    timer, viewer,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -35,7 +35,7 @@ const TASKBAR_TEXT: u32 = 0xffe8_eef4;
 /// out when no NIC is attached.
 // Viewer is appended last so adding it doesn't shift the existing button
 // indices (the proof drivers depend on edit=0..chat=5).
-const LAUNCHERS: [(&str, &str); 10] = [
+const LAUNCHERS: [(&str, &str); 11] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
@@ -46,10 +46,11 @@ const LAUNCHERS: [(&str, &str); 10] = [
     ("audio", "Audio"),
     ("files", "Files"),
     ("gif", "GIF"),
+    ("lisp", "Lisp"),
 ];
-const ICON_COLORS: [u32; 10] = [
+const ICON_COLORS: [u32; 11] = [
     0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff40_9088,
-    0xffc0_6090, 0xff58_78b0, 0xffd0_7048,
+    0xffc0_6090, 0xff58_78b0, 0xffd0_7048, 0xff60_30a0,
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -111,6 +112,7 @@ pub enum App {
     Audio(AudioState),
     Files(files::FilesState),
     Gif(gifplayer::GifPlayerState),
+    Lisp(repl::LispState),
 }
 
 /// One rendered chat log entry: the display text and its ink colour
@@ -305,6 +307,10 @@ impl Wm {
                 self.add_window("files", 120, 60, 320, 378, App::Files(files::FilesState::new()));
                 kprintln!("FILES: window open");
             }
+            "lisp" => {
+                self.add_window("lisp", 150, 70, 480, 320, App::Lisp(repl::LispState::new()));
+                kprintln!("LISP: window open");
+            }
             _ => {}
         }
         self.dirty = true;
@@ -332,7 +338,7 @@ impl Wm {
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
             | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_)
-            | App::Gif(_) => {}
+            | App::Gif(_) | App::Lisp(_) => {}
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -357,6 +363,9 @@ impl Wm {
         }
         if matches!(win.app, App::Gif(_)) {
             gifplayer::render(&mut win);
+        }
+        if matches!(win.app, App::Lisp(_)) {
+            repl::render(&mut win);
         }
         self.windows.push(win);
         self.dirty = true;
@@ -464,6 +473,12 @@ impl Wm {
                     gifplayer::Action::None => {}
                 }
             }
+            // M32: Lisp REPL — Up/Down recall history, Page keys scroll output.
+            if matches!(win.app, App::Lisp(_)) && repl::key(win, code) {
+                repl::render(win);
+                self.dirty = true;
+                return;
+            }
             // M29: file-manager up/down/Enter (Enter dispatches via open_file).
             if matches!(win.app, App::Files(_)) {
                 match files::key(win, code) {
@@ -500,6 +515,11 @@ impl Wm {
                 }
                 App::Chat(_) => {
                     chat_key(win, ch);
+                    self.dirty = true;
+                }
+                App::Lisp(_) => {
+                    repl::char_input(win, ch);
+                    repl::render(win);
                     self.dirty = true;
                 }
                 _ => {}

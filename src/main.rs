@@ -32,6 +32,7 @@ mod html;
 mod http;
 mod input;
 mod keymap;
+mod lisp;
 #[cfg(feature = "pi4")]
 mod mbox;
 mod net;
@@ -40,6 +41,7 @@ mod paging;
 #[cfg(feature = "pi4")]
 mod pi4;
 mod png;
+mod repl;
 mod scheduler;
 mod semihosting;
 mod setup;

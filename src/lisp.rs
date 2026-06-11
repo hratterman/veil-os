@@ -263,6 +263,74 @@ impl Interp {
         }
         Ok(print_value(&last))
     }
+
+    /// Serialize the user-defined top-level bindings (everything that isn't a
+    /// builtin — those are re-installed by `new()`) as one `(define ...)` per
+    /// line. Values are written in a source form that re-evaluates to an equal
+    /// value; lambdas as their `(lambda (args) body)` source.
+    pub fn serialize_env(&self) -> String {
+        let g = self.global.borrow();
+        let mut out = String::new();
+        for (name, val) in g.vars.iter() {
+            match serialize_value(val) {
+                Some(src) => out.push_str(&format!("(define {name} {src})\n")),
+                None => out.push_str(&format!("; {name} not serialized\n")),
+            }
+        }
+        out
+    }
+
+    /// Write the top-level env to `file` on FAT16 (no-op without a disk).
+    pub fn save_to(&self, file: &str) {
+        if !crate::fs::mounted() {
+            return;
+        }
+        let _ = crate::fs::write_file(file, self.serialize_env().as_bytes());
+    }
+
+    /// Restore bindings from `file` if present. Each line is evaluated through
+    /// the normal reader/evaluator; a corrupt or unparseable line is skipped
+    /// (tolerant restore — never crashes). Returns the count restored.
+    pub fn load_from(&mut self, file: &str) -> usize {
+        if !crate::fs::mounted() {
+            return 0;
+        }
+        let Some(bytes) = crate::fs::read_file(file) else {
+            return 0;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut n = 0;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with(';') {
+                continue;
+            }
+            if self.eval_str(t).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+/// Source form for a value such that re-evaluating it yields an equal value.
+/// Returns `None` for builtins (re-installed by `new()`, so never persisted).
+fn serialize_value(v: &Value) -> Option<String> {
+    match v {
+        Value::Int(_) | Value::Bool(_) | Value::Str(_) => Some(print_value(v)),
+        // Quote so the reader produces the datum, not a variable/call.
+        Value::Sym(_) | Value::Pair(..) | Value::Nil => Some(format!("'{}", print_value(v))),
+        Value::Lambda { params, body, .. } => {
+            let mut s = format!("(lambda ({})", params.join(" "));
+            for e in body.iter() {
+                s.push(' ');
+                s.push_str(&print_value(e));
+            }
+            s.push(')');
+            Some(s)
+        }
+        Value::Builtin(_) => None,
+    }
 }
 
 // Native `eval` recursion depth guard. Task 0 (where the REPL runs) is on the

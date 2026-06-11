@@ -50,7 +50,11 @@ const BAD_INPUT: &[&str] = &[
     "(+ 1 'a)", "(((", "(define () 1)",
 ];
 
-fn run_self_test(interp: &mut Interp) {
+// Self-tests run on a throwaway interp so their `define`s don't leak into the
+// user's REPL env (which would then get serialized to LISP.TXT).
+fn run_self_test() {
+    let mut throwaway = Interp::new();
+    let interp = &mut throwaway;
     let mut all = true;
     for (src, want) in SELF_TEST {
         match interp.eval_str(src) {
@@ -90,12 +94,44 @@ fn run_self_test(interp: &mut Interp) {
     if all {
         kprintln!("LISP_OK");
     }
+    run_persist_test();
+}
+
+// Prove the env serialize -> restore round-trip in memory (no disk side
+// effects): atoms, quoted lists and lambdas must survive. The real on-disk
+// persistence (LISP.TXT) is the same machinery, exercised by the GUI driver's
+// define -> close -> reopen cycle.
+fn run_persist_test() {
+    let mut a = Interp::new();
+    let _ = a.eval_str("(define pvar 42) (define plist '(1 2 3)) (define psq (lambda (n) (* n n)))");
+    let dump = a.serialize_env();
+    let mut b = Interp::new();
+    for line in dump.lines() {
+        let t = line.trim();
+        if !t.is_empty() && !t.starts_with(';') {
+            let _ = b.eval_str(t);
+        }
+    }
+    let v = b.eval_str("pvar");
+    let l = b.eval_str("plist");
+    let q = b.eval_str("(psq 9)");
+    let _ = lisp::take_output();
+    if v.as_deref() == Ok("42") && l.as_deref() == Ok("(1 2 3)") && q.as_deref() == Ok("81") {
+        kprintln!("LISP_PERSIST_OK");
+    } else {
+        kprintln!("LISP PERSIST FAIL: pvar={v:?} plist={l:?} psq={q:?}");
+    }
 }
 
 impl LispState {
     pub fn new() -> LispState {
+        run_self_test();
+        // Real REPL interp: builtins, then restore the user's saved env.
         let mut interp = Interp::new();
-        run_self_test(&mut interp);
+        let restored = interp.load_from("LISP.TXT");
+        if restored > 0 {
+            kprintln!("LISP: restored {restored} defs from LISP.TXT");
+        }
         let output = [
             "Veil Lisp 1.0",
             "A Lisp interpreter in a from-scratch OS.",
@@ -137,10 +173,19 @@ impl LispState {
                     if !printed.is_empty() {
                         self.push_lines(printed.trim_end_matches('\n'));
                     }
+                    // Serial echo so a GUI driver can observe REPL results
+                    // (e.g. to confirm a restored value after reopen).
+                    kprintln!("LISP_EVAL: {line} => {result}");
                     self.output.push(result);
+                    // Persist the top-level env after anything that may have
+                    // (re)bound a name. LISP.TXT is small; the write is cheap.
+                    if line.contains("define") {
+                        self.interp.save_to("LISP.TXT");
+                    }
                 }
                 Err(e) => {
                     let _ = lisp::take_output();
+                    kprintln!("LISP_EVAL: {line} => error: {e}");
                     self.output.push(format!("error: {e}"));
                 }
             }

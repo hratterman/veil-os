@@ -39,6 +39,17 @@ const SELF_TEST: &[(&str, &str)] = &[
     ("(map (lambda (x) (* x x)) (list 1 2 3 4 5))", "(1 4 9 16 25)"),
 ];
 
+// Malformed input a user could type at the prompt. Each MUST surface as an
+// Err (caught + shown by the REPL), never an out-of-bounds panic — a panic
+// would exit the whole kernel. If any of these slips through to a panic the
+// self-test never reaches LISP_OK, so this doubles as a robustness gate.
+const BAD_INPUT: &[&str] = &[
+    "(car)", "(cdr)", "(cons 1)", "(mod 5)", "(mod 5 0)", "(if)", "(if 1)",
+    "(define)", "(define x)", "(lambda)", "(let)", "(let ((x)))", "(cond ())",
+    "(car 5)", "(/ 1 0)", "(nope 1 2)", "(eq? 1)", "(map car)",
+    "(+ 1 'a)", "(((", "(define () 1)",
+];
+
 fn run_self_test(interp: &mut Interp) {
     let mut all = true;
     for (src, want) in SELF_TEST {
@@ -57,6 +68,18 @@ fn run_self_test(interp: &mut Interp) {
             }
         }
     }
+    // Robustness: malformed input must error gracefully, not panic.
+    let mut bad_ok = 0;
+    for src in BAD_INPUT {
+        let _ = lisp::take_output();
+        if interp.eval_str(src).is_err() {
+            bad_ok += 1;
+        } else {
+            kprintln!("LISP ROBUST FAIL: {src} did not error");
+        }
+    }
+    let _ = lisp::take_output();
+    kprintln!("LISP: {bad_ok}/{} malformed inputs errored cleanly", BAD_INPUT.len());
     if all {
         kprintln!("LISP_OK");
     }

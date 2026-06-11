@@ -284,6 +284,7 @@ fn eval(mut expr: Value, mut env: Env) -> Result<Value, String> {
                     match op.as_str() {
                         "quote" => return Ok(args.into_iter().next().unwrap_or(Value::Nil)),
                         "if" => {
+                            need(&args, 2, "if")?;
                             let c = eval(args[0].clone(), env.clone())?;
                             expr = if truthy(&c) {
                                 args[1].clone()
@@ -305,9 +306,13 @@ fn eval(mut expr: Value, mut env: Env) -> Result<Value, String> {
                             continue;
                         }
                         "let" => {
+                            need(&args, 1, "let")?;
                             let scope = new_env(Some(env.clone()));
                             for binding in list_to_vec(&args[0])? {
                                 let b = list_to_vec(&binding)?;
+                                if b.len() < 2 {
+                                    return Err("let: binding needs (name value)".to_string());
+                                }
                                 let name = sym_name(&b[0])?;
                                 let v = eval(b[1].clone(), env.clone())?;
                                 scope.borrow_mut().vars.insert(name, v);
@@ -323,6 +328,9 @@ fn eval(mut expr: Value, mut env: Env) -> Result<Value, String> {
                             let mut chosen = None;
                             for clause in &args {
                                 let c = list_to_vec(clause)?;
+                                if c.is_empty() {
+                                    return Err("cond: empty clause".to_string());
+                                }
                                 let take = matches!(&c[0], Value::Sym(s) if s == "else")
                                     || truthy(&eval(c[0].clone(), env.clone())?);
                                 if take {
@@ -406,6 +414,7 @@ fn bind_params(scope: &Env, params: &[String], argv: Vec<Value>) -> Result<(), S
 }
 
 fn make_lambda(args: &[Value], env: &Env) -> Result<Value, String> {
+    need(args, 1, "lambda")?;
     let params = list_to_vec(&args[0])?
         .iter()
         .map(sym_name)
@@ -418,9 +427,11 @@ fn make_lambda(args: &[Value], env: &Env) -> Result<Value, String> {
 }
 
 fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
+    need(args, 1, "define")?;
     match &args[0] {
         // (define name expr)
         Value::Sym(name) => {
+            need(args, 2, "define")?;
             let v = eval(args[1].clone(), env.clone())?;
             env.borrow_mut().vars.insert(name.clone(), v);
             Ok(Value::Sym(name.clone()))
@@ -428,6 +439,9 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
         // (define (name params...) body...)  -> lambda shorthand
         Value::Pair(..) => {
             let sig = list_to_vec(&args[0])?;
+            if sig.is_empty() {
+                return Err("define: empty signature".to_string());
+            }
             let name = sym_name(&sig[0])?;
             let lam = Value::Lambda {
                 params: sig[1..].iter().map(sym_name).collect::<Result<_, _>>()?,
@@ -482,6 +496,14 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 
 const HELP: &str = "examples:\n  (+ 1 2 3)\n  (define (sq x) (* x x))  (sq 7)\n  (map (lambda (x) (* x x)) (list 1 2 3 4 5))\n  (if (< 3 5) 'yes 'no)\n  (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))  (fact 10)";
 
+fn need(a: &[Value], n: usize, name: &str) -> Result<(), String> {
+    if a.len() < n {
+        Err(format!("{name}: expected {n} arg(s), got {}", a.len()))
+    } else {
+        Ok(())
+    }
+}
+
 fn apply_builtin(name: &str, a: Vec<Value>) -> Result<Value, String> {
     let ints = || a.iter().map(as_int).collect::<Result<Vec<_>, _>>();
     match name {
@@ -508,6 +530,7 @@ fn apply_builtin(name: &str, a: Vec<Value>) -> Result<Value, String> {
             Ok(Value::Int(acc))
         }
         "mod" => {
+            need(&a, 2, "mod")?;
             let n = ints()?;
             if n[1] == 0 {
                 return Err("mod by zero".to_string());
@@ -525,19 +548,28 @@ fn apply_builtin(name: &str, a: Vec<Value>) -> Result<Value, String> {
             });
             Ok(Value::Bool(ok))
         }
-        "cons" => Ok(Value::Pair(Rc::new(a[0].clone()), Rc::new(a[1].clone()))),
-        "car" => match &a[0] {
-            Value::Pair(x, _) => Ok((**x).clone()),
-            _ => Err("car: not a pair".to_string()),
-        },
-        "cdr" => match &a[0] {
-            Value::Pair(_, x) => Ok((**x).clone()),
-            _ => Err("cdr: not a pair".to_string()),
-        },
+        "cons" => {
+            need(&a, 2, "cons")?;
+            Ok(Value::Pair(Rc::new(a[0].clone()), Rc::new(a[1].clone())))
+        }
+        "car" => {
+            need(&a, 1, "car")?;
+            match &a[0] {
+                Value::Pair(x, _) => Ok((**x).clone()),
+                _ => Err("car: not a pair".to_string()),
+            }
+        }
+        "cdr" => {
+            need(&a, 1, "cdr")?;
+            match &a[0] {
+                Value::Pair(_, x) => Ok((**x).clone()),
+                _ => Err("cdr: not a pair".to_string()),
+            }
+        }
         "list" => Ok(list_from(a)),
-        "null?" => Ok(Value::Bool(matches!(a[0], Value::Nil))),
-        "pair?" => Ok(Value::Bool(matches!(a[0], Value::Pair(..)))),
-        "length" => Ok(Value::Int(list_to_vec(&a[0])?.len() as i64)),
+        "null?" => { need(&a, 1, "null?")?; Ok(Value::Bool(matches!(a[0], Value::Nil))) }
+        "pair?" => { need(&a, 1, "pair?")?; Ok(Value::Bool(matches!(a[0], Value::Pair(..)))) }
+        "length" => { need(&a, 1, "length")?; Ok(Value::Int(list_to_vec(&a[0])?.len() as i64)) }
         "append" => {
             let mut items = Vec::new();
             for l in &a {
@@ -545,13 +577,14 @@ fn apply_builtin(name: &str, a: Vec<Value>) -> Result<Value, String> {
             }
             Ok(list_from(items))
         }
-        "number?" => Ok(Value::Bool(matches!(a[0], Value::Int(_)))),
-        "string?" => Ok(Value::Bool(matches!(a[0], Value::Str(_)))),
-        "symbol?" => Ok(Value::Bool(matches!(a[0], Value::Sym(_)))),
-        "boolean?" => Ok(Value::Bool(matches!(a[0], Value::Bool(_)))),
-        "not" => Ok(Value::Bool(!truthy(&a[0]))),
-        "eq?" | "equal?" => Ok(Value::Bool(values_equal(&a[0], &a[1]))),
+        "number?" => { need(&a, 1, "number?")?; Ok(Value::Bool(matches!(a[0], Value::Int(_)))) }
+        "string?" => { need(&a, 1, "string?")?; Ok(Value::Bool(matches!(a[0], Value::Str(_)))) }
+        "symbol?" => { need(&a, 1, "symbol?")?; Ok(Value::Bool(matches!(a[0], Value::Sym(_)))) }
+        "boolean?" => { need(&a, 1, "boolean?")?; Ok(Value::Bool(matches!(a[0], Value::Bool(_)))) }
+        "not" => { need(&a, 1, "not")?; Ok(Value::Bool(!truthy(&a[0]))) }
+        "eq?" | "equal?" => { need(&a, 2, name)?; Ok(Value::Bool(values_equal(&a[0], &a[1]))) }
         "display" => {
+            need(&a, 1, "display")?;
             out_push(&display_str(&a[0]));
             Ok(Value::Nil)
         }
@@ -560,6 +593,7 @@ fn apply_builtin(name: &str, a: Vec<Value>) -> Result<Value, String> {
             Ok(Value::Nil)
         }
         "map" => {
+            need(&a, 2, "map")?;
             let f = a[0].clone();
             let items = list_to_vec(&a[1])?;
             let mut out = Vec::with_capacity(items.len());

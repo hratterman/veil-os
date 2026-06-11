@@ -574,8 +574,8 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             fname = os.path.basename(m.group(1))
             ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-            if ext not in ("png", "wav", "gif"):
-                errors.append(f"{fname}: only .png/.wav/.gif")
+            if ext not in ("png", "wav", "gif", "jpg", "jpeg"):
+                errors.append(f"{fname}: only .png/.jpg/.wav/.gif")
             elif len(content) > 4 * 1024 * 1024:
                 errors.append(f"{fname}: over 4MB")
             elif s.upload_count() + len(saved) >= 5:

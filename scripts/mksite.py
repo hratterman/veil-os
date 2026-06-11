@@ -372,6 +372,8 @@ NAVTEST = page("""<style>
 <p><a href="web.htm">Back</a></p>""")
 
 IMGTEST = page("""<h1>External images</h1>
+<p>A JPEG decoded by our own from-scratch decoder (M35):</p>
+<img src="photo.jpg">
 <p>A PNG fetched over direct TLS 1.3 (no proxy):</p>
 <img src="https://www.python.org/static/img/python-logo.png">
 <p>A PNG fetched over plain HTTP through the proxy:</p>
@@ -650,6 +652,11 @@ def main():
     with open(os.path.join(OUT, "plasma.png"), "wb") as f:
         f.write(png(128, 128, plasma_pixel))
     write_demo_gif(os.path.join(OUT, "demo.gif"))
+    # M35: a real JPEG, served so the browser's from-scratch decoder renders it.
+    jpg = os.path.join(os.path.dirname(__file__), "..", "assets", "dog_baseline.jpg")
+    if os.path.exists(jpg):
+        import shutil
+        shutil.copyfile(jpg, os.path.join(OUT, "photo.jpg"))
     print("site/ ready:", ", ".join(sorted(os.listdir(OUT))))
 
 

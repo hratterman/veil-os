@@ -93,6 +93,8 @@ fn content_type(name: &str) -> &'static str {
         Some("HTM") | Some("HTML") => "text/html",
         Some("CSS") => "text/css",
         Some("PNG") => "image/png",
+        Some("JPG") | Some("JPEG") => "image/jpeg",
+        Some("GIF") => "image/gif",
         Some("BMP") => "image/bmp",
         Some("TXT") => "text/plain",
         _ => "application/octet-stream",

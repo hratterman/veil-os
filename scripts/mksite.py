@@ -294,7 +294,19 @@ written from scratch.</p>
 <p class="muted">Slow to load is normal - the proxy is fetching a real site
 across the internet, then this browser lays out every line by hand.</p>
 <p><a href="imgtest.htm">External images test</a></p>
+<p><a href="cssvar.htm">CSS variables test</a></p>
 <p><a href="index.htm">Home</a></p>""")
+
+CSSVAR = page("""<style>
+:root { --brand: #2a7e3b; --accent: #cc4422; --pad: 14px; }
+.vbar { background-color: var(--brand); color: #ffffff; padding: var(--pad); }
+.vtext { color: var(--accent); font-size: 32px; }
+.vfb { color: var(--nope, #1188dd); }
+</style>
+<div class="vbar">brand colored bar (background = var(--brand))</div>
+<h1 class="vtext">accent heading (color = var(--accent))</h1>
+<p class="vfb">fallback works (var(--nope, #1188dd))</p>
+<p><a href="web.htm">Back</a></p>""")
 
 IMGTEST = page("""<h1>External images</h1>
 <p>A PNG fetched over direct TLS 1.3 (no proxy):</p>
@@ -559,7 +571,7 @@ def main():
         "index.htm": INDEX, "page2.htm": PAGE2, "news.htm": NEWS,
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
-        "web.htm": WEB, "imgtest.htm": IMGTEST,
+        "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR,
         "style.css": STYLE,
     }
     for name, text in pages.items():

@@ -1,0 +1,16 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a> | <a href="web.htm">Web</a></div>
+<style>
+:root { --brand: #2a7e3b; --accent: #cc4422; --pad: 14px; }
+.vbar { background-color: var(--brand); color: #ffffff; padding: var(--pad); }
+.vtext { color: var(--accent); font-size: 32px; }
+.vfb { color: var(--nope, #1188dd); }
+</style>
+<div class="vbar">brand colored bar (background = var(--brand))</div>
+<h1 class="vtext">accent heading (color = var(--accent))</h1>
+<p class="vfb">fallback works (var(--nope, #1188dd))</p>
+<p><a href="web.htm">Back</a></p>
+</body>
+</html>

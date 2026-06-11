@@ -418,7 +418,77 @@ fn parse_px(v: &str) -> Option<isize> {
     v.trim().trim_end_matches("px").trim().parse().ok()
 }
 
+// CSS custom properties for the current document. Rendering is single-threaded
+// on the desktop task, so a global set-before-layout map is enough — no need to
+// thread it through every resolve()/apply_decl() call.
+static mut CSS_VARS: Option<Vec<(String, String)>> = None;
+static CSS_VAR_DONE: AtomicBool = AtomicBool::new(false);
+
+fn set_css_vars(v: Vec<(String, String)>) {
+    unsafe { *core::ptr::addr_of_mut!(CSS_VARS) = Some(v) };
+}
+
+fn lookup_var(name: &str) -> Option<String> {
+    unsafe {
+        (*core::ptr::addr_of!(CSS_VARS))
+            .as_ref()?
+            .iter()
+            .rev() // later declarations win
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+}
+
+/// Resolve `var(--name)` / `var(--name, fallback)` references in a value,
+/// iterating a few times so variables that reference other variables resolve.
+fn substitute_vars(val: &str) -> String {
+    let mut cur = String::from(val);
+    for _ in 0..4 {
+        if !cur.contains("var(") {
+            break;
+        }
+        let mut out = String::new();
+        let mut rest = cur.as_str();
+        while let Some(i) = rest.find("var(") {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + 4..];
+            let Some(close) = after.find(')') else {
+                out.push_str(&rest[i..]);
+                rest = "";
+                break;
+            };
+            let inner = &after[..close];
+            let (name, fallback) = match inner.split_once(',') {
+                Some((n, f)) => (n.trim(), Some(f.trim())),
+                None => (inner.trim(), None),
+            };
+            let resolved = lookup_var(name)
+                .or_else(|| fallback.map(String::from))
+                .unwrap_or_default();
+            if !CSS_VAR_DONE.swap(true, Ordering::Relaxed) {
+                kprintln!("CSS_VAR_OK");
+            }
+            out.push_str(&resolved);
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        cur = out;
+    }
+    cur
+}
+
 fn apply_decl(s: &mut Style, prop: &str, val: &str) {
+    // Custom properties are stored globally, not applied to the element style.
+    if prop.starts_with("--") {
+        return;
+    }
+    let substituted;
+    let val = if val.contains("var(") {
+        substituted = substitute_vars(val);
+        substituted.as_str()
+    } else {
+        val
+    };
     match prop {
         "color" => {
             if let Some(c) = parse_color(val) {
@@ -942,8 +1012,12 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     }
     let doc = html::parse(&String::from_utf8_lossy(&body));
 
-    // Stylesheets: <link rel="stylesheet" href=...> anywhere in the doc.
+    // Stylesheets: linked (<link rel="stylesheet">) and inline (<style>). Both
+    // contribute rules and CSS custom properties. `all_css` accumulates the raw
+    // text so :root variables (which css::parse skips as a selector) are still
+    // collected.
     let mut sheet: Vec<css::Rule> = Vec::new();
+    let mut all_css = String::new();
     let mut link_nodes = Vec::new();
     doc.find_all("link", &mut link_nodes);
     for l in link_nodes {
@@ -953,9 +1027,22 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         }
         let Some(href) = l.attr("href") else { continue };
         if let Some((200, _, css_body)) = http_get(&resolve_href(href)) {
-            sheet.extend(css::parse(&String::from_utf8_lossy(&css_body)));
+            let css = String::from_utf8_lossy(&css_body).into_owned();
+            sheet.extend(css::parse(&css));
+            all_css.push_str(&css);
+            all_css.push('\n');
         }
     }
+    let mut style_nodes = Vec::new();
+    doc.find_all("style", &mut style_nodes);
+    for st in style_nodes {
+        let mut css = String::new();
+        st.text(&mut css);
+        sheet.extend(css::parse(&css));
+        all_css.push_str(&css);
+        all_css.push('\n');
+    }
+    set_css_vars(css::collect_vars(&all_css));
 
     // Images: fetch + decode each unique PNG src, served by the persistent LRU
     // cache so navigating back doesn't re-fetch. https -> TLS, http -> proxy,

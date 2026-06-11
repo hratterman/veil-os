@@ -49,6 +49,31 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
+/// Collect all CSS custom-property declarations (`--name: value`) from every
+/// rule block, regardless of selector (so `:root { --x: ... }`, which `parse`
+/// skips as an unsupported selector, still contributes its variables). Later
+/// declarations win, so callers should resolve a name to its LAST entry.
+pub fn collect_vars(src: &str) -> Vec<(String, String)> {
+    let src = strip_comments(src);
+    let mut vars = Vec::new();
+    let mut rest = src.as_str();
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}').map(|c| open + c) else {
+            break;
+        };
+        for d in rest[open + 1..close].split(';') {
+            if let Some((p, v)) = d.split_once(':') {
+                let (p, v) = (p.trim(), v.trim());
+                if p.starts_with("--") && !v.is_empty() {
+                    vars.push((String::from(p), String::from(v)));
+                }
+            }
+        }
+        rest = &rest[close + 1..];
+    }
+    vars
+}
+
 pub fn parse(src: &str) -> Vec<Rule> {
     let src = strip_comments(src);
     let mut rules = Vec::new();

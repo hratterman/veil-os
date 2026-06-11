@@ -76,7 +76,7 @@ fn tag(name: &str) -> &'static str {
         "[TXT]"
     } else if name.ends_with(".MJP") || name.ends_with(".AVI") {
         "[VID]"
-    } else if name.ends_with(".WASM") {
+    } else if name.ends_with(".WSM") {
         "[WSM]"
     } else {
         "[???]"
@@ -92,7 +92,7 @@ fn openable(name: &str) -> bool {
         || name.ends_with(".MJP")
         || name.ends_with(".MJP")
         || name.ends_with(".AVI")
-        || name.ends_with(".WASM")
+        || name.ends_with(".WSM")
 }
 
 pub fn render(win: &mut Window) {

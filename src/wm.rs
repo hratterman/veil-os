@@ -11,7 +11,7 @@
 use crate::fb::Framebuffer;
 use crate::{
     browser, clipboard, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl,
-    scheduler, shell, snake, snd, timer, video, viewer,
+    scheduler, shell, snake, snd, timer, video, viewer, wasmapp,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -197,6 +197,7 @@ pub enum App {
     Lisp(repl::LispState),
     Snake(snake::SnakeState),
     Video(video::VideoState),
+    Wasm(wasmapp::WasmState),
 }
 
 /// One rendered chat log entry: the display text and its ink colour
@@ -435,13 +436,16 @@ impl Wm {
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
             | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_)
-            | App::Gif(_) | App::Lisp(_) | App::Snake(_) | App::Video(_) => {}
+            | App::Gif(_) | App::Lisp(_) | App::Snake(_) | App::Video(_) | App::Wasm(_) => {}
         }
         if matches!(win.app, App::Snake(_)) {
             snake::render(&mut win);
         }
         if matches!(win.app, App::Video(_)) {
             video::render(&mut win);
+        }
+        if matches!(win.app, App::Wasm(_)) {
+            wasmapp::render(&mut win);
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -502,6 +506,9 @@ impl Wm {
         } else if name.ends_with(".MJP") || name.ends_with(".AVI") {
             self.add_window(name, 200, 80, 360, 300, App::Video(video::VideoState::with_file(name)));
             kprintln!("FILES: open {name} in Video player");
+        } else if name.ends_with(".WSM") {
+            self.add_window(name, 180, 80, 460, 240, App::Wasm(wasmapp::WasmState::with_file(name)));
+            kprintln!("FILES: open {name} in WASM runtime");
         } else {
             kprintln!("FILES: no app registered for {name}");
         }

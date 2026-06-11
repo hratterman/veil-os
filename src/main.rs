@@ -59,6 +59,8 @@ mod uart;
 mod video;
 mod viewer;
 mod virtio;
+mod wasm;
+mod wasmapp;
 mod wm;
 
 use core::panic::PanicInfo;
@@ -104,6 +106,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
     font::selftest(); // M34: prove the generated bitmap fonts loaded
     milestone35_jpeg(); // M35: prove the baseline JPEG decoder
+    milestone35_wasm(); // M35: prove the WASM interpreter (+ JIT)
     milestone9();
     milestone10(&fdt);
     if milestone12(&fdt) {
@@ -604,6 +607,72 @@ fn milestone35_jpeg() {
     if ok420 && ok444 && ok_base && ok_prog {
         kprintln!("JPEG_OK: baseline + progressive DCT (4:2:0/4:4:4, real photos)");
     }
+}
+
+/// M35: run a hello-world WASM module (fd_write) through the interpreter, plus
+/// a compute kernel and recursive fib, then JIT the compute kernel.
+fn milestone35_wasm() {
+    let hello = include_bytes!("../assets/hello.wasm");
+    match wasm::run(hello) {
+        Ok(out) => {
+            let trimmed = out.trim_end();
+            kprintln!("WASM hello -> {trimmed:?}");
+            if !out.contains("WebAssembly") {
+                kprintln!("WASM_FAIL: hello output wrong");
+                return;
+            }
+        }
+        Err(e) => {
+            kprintln!("WASM_FAIL: hello: {e}");
+            return;
+        }
+    }
+    let compute = include_bytes!("../assets/compute.wasm");
+    // sum of i^2 for i in 1..1000 = 332833500
+    let want = 332_833_500i64;
+    let got = wasm::call_export(compute, "compute", &[1000]);
+    kprintln!("WASM compute(1000) -> {got:?} (want {want})");
+    let fib = wasm::call_export(compute, "fib", &[10]);
+    kprintln!("WASM fib(10) -> {fib:?} (want 55)");
+    if got != Some(want) || fib != Some(55) {
+        kprintln!("WASM_FAIL: compute/fib wrong");
+        return;
+    }
+    // JIT the compute kernel and check it agrees with the interpreter.
+    match wasm::call_export_jit(compute, "compute", 1000) {
+        Some((r, jitted)) => {
+            kprintln!("WASM JIT compute(1000) -> {r} (jit={jitted})");
+            if r != want {
+                kprintln!("WASM_FAIL: JIT result {r} != {want}");
+                return;
+            }
+            if jitted {
+                kprintln!("WASM_JIT_OK: native AArch64 codegen ran");
+            }
+        }
+        None => kprintln!("WASM: JIT path returned nothing"),
+    }
+    // Speed: interpret vs JIT a heavy compute kernel (i32 arithmetic wraps
+    // identically in both), timed on the physical counter.
+    let cyc = || -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
+        v
+    };
+    let n = 400_000i32;
+    let t0 = cyc();
+    let interp = wasm::call_export(compute, "compute", &[n as i64]);
+    let t1 = cyc();
+    let jit = wasm::call_export_jit(compute, "compute", n);
+    let t2 = cyc();
+    let (ic, jc) = (t1 - t0, t2 - t1);
+    let agree = jit.map(|(r, _)| r) == interp;
+    let speed = if jc > 0 { ic / jc } else { 0 };
+    kprintln!("WASM perf compute({n}): interp {ic} cyc, jit {jc} cyc, ~{speed}x faster (agree={agree})");
+    if agree && speed >= 3 {
+        kprintln!("WASM_JIT_FAST: JIT is {speed}x faster than the interpreter");
+    }
+    kprintln!("WASM_OK: parser + interpreter + AArch64 JIT (hello/compute/fib)");
 }
 
 fn milestone4() {

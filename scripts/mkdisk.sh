@@ -49,6 +49,10 @@ done
 cp assets/dog_baseline.jpg "$MNT/DOGBASE.JPG" 2>/dev/null || true
 # M35: a demo MJPEG video (a sequence of baseline JPEG frames).
 cp assets/demo.mjpeg "$MNT/DEMO.MJP" 2>/dev/null || true
+# M35: WASM demo modules (hello prints via fd_write; compute is a JIT kernel).
+python3 scripts/mkwasm.py assets >/dev/null 2>&1 || true
+cp assets/hello.wasm "$MNT/HELLO.WSM" 2>/dev/null || true
+cp assets/compute.wasm "$MNT/COMPUTE.WSM" 2>/dev/null || true
 # M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
 python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
 # M25/M27: USER.TXT labels Chat and gates the first-boot setup screen.

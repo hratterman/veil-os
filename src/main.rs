@@ -50,6 +50,7 @@ mod scheduler;
 mod semihosting;
 mod setup;
 mod shell;
+mod snake;
 mod snd;
 mod syscall;
 mod timer;

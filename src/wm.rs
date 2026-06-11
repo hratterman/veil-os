@@ -11,7 +11,7 @@
 use crate::fb::Framebuffer;
 use crate::{
     browser, clipboard, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl,
-    scheduler, shell, snd, timer, viewer,
+    scheduler, shell, snake, snd, timer, viewer,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -44,7 +44,7 @@ const TASKBAR_TEXT: u32 = 0xffe8_eef4;
 /// out when no NIC is attached.
 // Viewer is appended last so adding it doesn't shift the existing button
 // indices (the proof drivers depend on edit=0..chat=5).
-const LAUNCHERS: [(&str, &str); 11] = [
+const LAUNCHERS: [(&str, &str); 12] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
@@ -56,10 +56,11 @@ const LAUNCHERS: [(&str, &str); 11] = [
     ("files", "Files"),
     ("gif", "GIF"),
     ("lisp", "Lisp"),
+    ("snake", "Snake"),
 ];
-const ICON_COLORS: [u32; 11] = [
+const ICON_COLORS: [u32; 12] = [
     0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff40_9088,
-    0xffc0_6090, 0xff58_78b0, 0xffd0_7048, 0xff60_30a0,
+    0xffc0_6090, 0xff58_78b0, 0xffd0_7048, 0xff60_30a0, 0xff4a_a06a,
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -188,6 +189,7 @@ pub enum App {
     Files(files::FilesState),
     Gif(gifplayer::GifPlayerState),
     Lisp(repl::LispState),
+    Snake(snake::SnakeState),
 }
 
 /// One rendered chat log entry: the display text and its ink colour
@@ -396,6 +398,9 @@ impl Wm {
                 self.add_window("lisp", 150, 70, 480, 320, App::Lisp(repl::LispState::new()));
                 kprintln!("LISP: window open");
             }
+            "snake" => {
+                self.add_window("snake", 320, 90, 18 * 14, 24 + 18 * 14, App::Snake(snake::SnakeState::new()));
+            }
             _ => {}
         }
         self.dirty = true;
@@ -423,7 +428,10 @@ impl Wm {
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
             | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_)
-            | App::Gif(_) | App::Lisp(_) => {}
+            | App::Gif(_) | App::Lisp(_) | App::Snake(_) => {}
+        }
+        if matches!(win.app, App::Snake(_)) {
+            snake::render(&mut win);
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -582,6 +590,11 @@ impl Wm {
             // M32: Lisp REPL — Up/Down recall history, Page keys scroll output.
             if matches!(win.app, App::Lisp(_)) && repl::key(win, code) {
                 repl::render(win);
+                self.dirty = true;
+                return;
+            }
+            // M35 Snake: arrow / WASD direction keys.
+            if matches!(win.app, App::Snake(_)) && snake::key(win, code) {
                 self.dirty = true;
                 return;
             }
@@ -1106,6 +1119,9 @@ impl Wm {
                 self.dirty = true;
             }
             if matches!(win.app, App::Gif(_)) && gifplayer::tick(win, now) {
+                self.dirty = true;
+            }
+            if matches!(win.app, App::Snake(_)) && snake::tick(win, now) {
                 self.dirty = true;
             }
         }

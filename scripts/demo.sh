@@ -9,7 +9,7 @@ set -u
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
 
-scripts/mkdisk.sh >/dev/null
+scripts/mkdisk.sh --no-user >/dev/null
 KERNEL=target/aarch64-unknown-none/debug/veil
 
 echo "Veil OS is running — close the window to quit."

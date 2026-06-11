@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.veil.audio</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/henry/projects/veil-os/scripts/audio_server.js</string>
+    <string>6092</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/henry/projects/veil-os</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/henry/Library/Logs/veil/audio.log</string>
+  <key>StandardErrorPath</key><string>/Users/henry/Library/Logs/veil/audio.log</string>
+</dict></plist>

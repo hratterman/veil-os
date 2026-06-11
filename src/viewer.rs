@@ -32,6 +32,17 @@ impl ViewerState {
         st
     }
 
+    /// M29: open the viewer positioned on a specific file (chosen in the
+    /// file manager). Falls back to the first image if the name isn't found.
+    pub fn with_file(name: &str) -> ViewerState {
+        let mut st = ViewerState::new();
+        if let Some(i) = st.files.iter().position(|f| f == name) {
+            st.idx = i;
+            st.load();
+        }
+        st
+    }
+
     /// Decode the current file and log it (the proof greps these lines).
     fn load(&mut self) {
         self.img = None;

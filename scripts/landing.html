@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veil OS</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #0b1018; color: #cdd6f4;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    display: flex; min-height: 100vh; align-items: center; justify-content: center;
+  }
+  .card { width: 520px; max-width: 92vw; padding: 32px; }
+  h1 { color: #89b4fa; margin: 0 0 4px; font-size: 34px; letter-spacing: 1px; }
+  .tag { color: #7a849c; margin: 0 0 28px; }
+  #drop {
+    border: 2px dashed #2a3850; border-radius: 10px; padding: 36px 16px;
+    text-align: center; color: #8a94a4; transition: .15s; cursor: pointer;
+  }
+  #drop.over { border-color: #40a0e0; background: #11192a; color: #cdd6f4; }
+  ul { list-style: none; padding: 0; margin: 16px 0 0; }
+  li {
+    display: flex; justify-content: space-between; align-items: center;
+    background: #141c2a; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px;
+  }
+  li button { background: none; border: 0; color: #c04848; cursor: pointer; font-size: 16px; }
+  .err { color: #e0a040; font-size: 13px; }
+  #boot {
+    margin-top: 22px; width: 100%; padding: 14px; border: 0; border-radius: 8px;
+    background: #2a7d4f; color: #fff; font-size: 16px; cursor: pointer;
+  }
+  #boot:hover { background: #34935d; }
+  a { color: #89b4fa; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Veil OS</h1>
+  <p class="tag">A toy operating system. Runs in your browser.</p>
+
+  <div id="drop">Drop .png or .wav files here (up to 5, 4MB each)<br>or click to browse</div>
+  <input id="file" type="file" accept=".png,.wav" multiple hidden>
+  <ul id="list"></ul>
+  <div class="err" id="err"></div>
+
+  <form id="bootform" method="POST" action="/boot?session=__SESSION__">
+    <button id="boot" type="submit">Boot Veil OS &raquo;</button>
+  </form>
+</div>
+
+<script>
+const SESSION = "__SESSION__";
+const drop = document.getElementById("drop");
+const input = document.getElementById("file");
+const list = document.getElementById("list");
+const err = document.getElementById("err");
+let files = [];
+
+drop.onclick = () => input.click();
+input.onchange = () => add(input.files);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); add(e.dataTransfer.files); };
+
+function add(fl) {
+  err.textContent = "";
+  for (const f of fl) {
+    if (files.length >= 5) { err.textContent = "Max 5 files."; break; }
+    if (!/\.(png|wav)$/i.test(f.name)) { err.textContent = f.name + ": only .png/.wav"; continue; }
+    if (f.size > 4 * 1024 * 1024) { err.textContent = f.name + ": over 4MB"; continue; }
+    files.push(f);
+  }
+  render();
+}
+function render() {
+  list.innerHTML = "";
+  files.forEach((f, i) => {
+    const li = document.createElement("li");
+    li.innerHTML = "<span>" + f.name + "</span>";
+    const b = document.createElement("button");
+    b.textContent = "✕";
+    b.onclick = () => { files.splice(i, 1); render(); };
+    li.appendChild(b);
+    list.appendChild(li);
+  });
+}
+
+document.getElementById("bootform").onsubmit = async (e) => {
+  e.preventDefault();
+  if (files.length) {
+    const fd = new FormData();
+    files.forEach(f => fd.append("file", f, f.name));
+    await fetch("/upload?session=" + SESSION, { method: "POST", body: fd });
+  }
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = "/boot?session=" + SESSION;
+  document.body.appendChild(form);
+  form.submit();
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.veil.sessions</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/henry/projects/veil-os/scripts/session_manager.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/henry/projects/veil-os</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/Users/henry/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/henry/Library/Logs/veil/sessions.log</string>
+  <key>StandardErrorPath</key><string>/Users/henry/Library/Logs/veil/sessions.log</string>
+</dict></plist>

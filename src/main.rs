@@ -19,6 +19,7 @@ mod desktop;
 mod dtb;
 mod exceptions;
 mod fb;
+mod files;
 mod font;
 mod frames;
 mod fs;
@@ -39,6 +40,7 @@ mod pi4;
 mod png;
 mod scheduler;
 mod semihosting;
+mod setup;
 mod snd;
 mod syscall;
 mod timer;
@@ -221,6 +223,24 @@ fn milestone12(fdt: &dtb::Fdt) -> bool {
     }
     net::init(mac, cfg.0, cfg.1, cfg.2);
 
+    // M26: optional chat relay address (fw_cfg opt/veil.relay = "ip:port").
+    // Present -> the Chat app uses the TCP relay (DMs + user list); absent
+    // -> it stays in the M20 UDP-broadcast mode. The self-hosted demo sets
+    // it to the slirp host gateway (10.0.2.2:7778) where relay.py runs.
+    if let Some(fw) = fwcfg::FwCfg::from_dtb(fdt) {
+        if let Some(f) = fw.find_file("opt/veil.relay") {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = fw.read_file(f, &mut buf) {
+                if let Some(addr) =
+                    core::str::from_utf8(&buf[..n]).ok().and_then(net::parse_relay)
+                {
+                    net::set_relay(Some(addr));
+                    kprintln!("RELAY: chat relay at {}:{}", net::fmt_ip(&addr.0), addr.1);
+                }
+            }
+        }
+    }
+
     // TX proof: a hand-crafted broadcast frame with an experimental
     // ethertype and a greppable payload.
     let mut frame = [0u8; 60];
@@ -259,12 +279,13 @@ fn milestone12(fdt: &dtb::Fdt) -> bool {
 /// failure (no DNS, unreachable) it falls back to time-since-boot. Only
 /// reached when a NIC is present (milestone12 returned true).
 fn milestone19b() {
-    // Timezone offset from TZ.TXT (e.g. "-5" => EST). Default UTC.
-    let tz_hours = fs::read_file("TZ.TXT")
-        .and_then(|d| core::str::from_utf8(&d).ok()?.trim().parse::<i64>().ok())
+    // Timezone offset from TZ.TXT (e.g. "-5" => EST, "5.5" => IST). The
+    // first-boot setup screen (M27) writes this; default UTC if absent.
+    let tz_secs = fs::read_file("TZ.TXT")
+        .and_then(|d| parse_tz_offset(core::str::from_utf8(&d).ok()?.trim()))
         .unwrap_or(0);
-    timer::set_tz(tz_hours * 3600);
-    kprintln!("TZ: UTC offset {tz_hours}h (from TZ.TXT)");
+    timer::set_tz(tz_secs);
+    kprintln!("TZ: UTC offset {tz_secs}s (from TZ.TXT)");
 
     match net::ntp_sync("pool.ntp.org") {
         Some(unix) => {
@@ -274,6 +295,18 @@ fn milestone19b() {
         }
         None => kprintln!("NTP: no sync (network unreachable); clock uses time-since-boot"),
     }
+}
+
+/// Parse a TZ.TXT offset string ("[+-]hours[.5]") into seconds.
+fn parse_tz_offset(s: &str) -> Option<i64> {
+    let neg = s.starts_with('-');
+    let body = s.trim_start_matches(['+', '-']);
+    let (hours, half) = match body.split_once('.') {
+        Some((h, frac)) => (h.parse::<i64>().ok()?, if frac.starts_with('5') { 1 } else { 0 }),
+        None => (body.parse::<i64>().ok()?, 0),
+    };
+    let secs = hours * 3600 + half * 1800;
+    Some(if neg { -secs } else { secs })
 }
 
 /// M24: virtio-sound bring-up. Initializes the device if present (the

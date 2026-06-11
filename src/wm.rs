@@ -9,9 +9,11 @@
 //! Geometry constants are mirrored in scripts/drive_gui.py — keep in sync.
 
 use crate::fb::Framebuffer;
-use crate::{browser, clock, fs, keymap, kprintln, net, netdev, scheduler, snd, timer, viewer};
+use crate::{
+    browser, clock, files, fs, keymap, kprintln, net, netdev, scheduler, snd, timer, viewer,
+};
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -32,7 +34,7 @@ const TASKBAR_TEXT: u32 = 0xffe8_eef4;
 /// out when no NIC is attached.
 // Viewer is appended last so adding it doesn't shift the existing button
 // indices (the proof drivers depend on edit=0..chat=5).
-const LAUNCHERS: [(&str, &str); 8] = [
+const LAUNCHERS: [(&str, &str); 9] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
@@ -41,10 +43,11 @@ const LAUNCHERS: [(&str, &str); 8] = [
     ("chat", "Chat"),
     ("viewer", "Viewer"),
     ("audio", "Audio"),
+    ("files", "Files"),
 ];
-const ICON_COLORS: [u32; 8] = [
+const ICON_COLORS: [u32; 9] = [
     0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff40_9088,
-    0xffc0_6090,
+    0xffc0_6090, 0xff58_78b0,
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -101,9 +104,35 @@ pub enum App {
     Browser(browser::BrowserState),
     Editor(EditorState),
     Clock(clock::ClockState),
-    Chat { name: String, input: String, lines: Vec<String> },
+    Chat(ChatState),
     Viewer(viewer::ViewerState),
     Audio(AudioState),
+    Files(files::FilesState),
+}
+
+/// One rendered chat log entry: the display text and its ink colour
+/// (public-mine / public-other / DM / system).
+pub struct ChatLine {
+    text: String,
+    color: u32,
+}
+
+/// How the Chat app reaches the network. Relay mode (M26) speaks the
+/// TCP HELLO/JOIN/PART/MSG protocol and supports DMs + an online roster;
+/// Udp mode is the M20 limited-broadcast fallback used when no relay is
+/// configured (the two-instance LAN proof).
+pub enum ChatMode {
+    Udp,
+    Relay { handle: net::Handle, rx: Vec<u8> },
+}
+
+pub struct ChatState {
+    name: String,
+    input: String,
+    lines: Vec<ChatLine>,
+    users: Vec<String>,          // online roster (relay mode)
+    dm_target: Option<String>,   // Some -> DM compose to this user
+    mode: ChatMode,
 }
 
 pub struct AudioState {
@@ -212,10 +241,24 @@ impl Wm {
                 browser::navigate(win, "/", false);
             }
             "chat" => {
-                let name = match net::local_ip() {
-                    Some([_, _, _, 1]) => "A",
-                    Some([_, _, _, 2]) => "B",
-                    _ => "me",
+                let name = chat_username();
+                let (mode, users) = match net::relay_addr() {
+                    Some((ip, port)) => match net::tcp_connect(ip, port) {
+                        Some(handle) => {
+                            let hello = format!("HELLO {name}\n");
+                            net::tcp_write(handle, hello.as_bytes());
+                            kprintln!("CHAT: window open as '{name}' (relay {}:{port})", net::fmt_ip(&ip));
+                            (ChatMode::Relay { handle, rx: Vec::new() }, vec![name.clone()])
+                        }
+                        None => {
+                            kprintln!("CHAT: window open as '{name}' (relay connect failed, udp)");
+                            (ChatMode::Udp, Vec::new())
+                        }
+                    },
+                    None => {
+                        kprintln!("CHAT: window open as '{name}' (udp broadcast :7777)");
+                        (ChatMode::Udp, Vec::new())
+                    }
                 };
                 self.add_window(
                     "chat",
@@ -223,13 +266,15 @@ impl Wm {
                     380,
                     440,
                     300,
-                    App::Chat {
-                        name: String::from(name),
+                    App::Chat(ChatState {
+                        name,
                         input: String::new(),
                         lines: Vec::new(),
-                    },
+                        users,
+                        dm_target: None,
+                        mode,
+                    }),
                 );
-                kprintln!("CHAT: window open as '{name}' (udp broadcast :7777)");
             }
             "viewer" => {
                 let st = viewer::ViewerState::new();
@@ -246,6 +291,10 @@ impl Wm {
                 };
                 self.add_window("audio", 360, 300, 300, 130, App::Audio(st));
                 kprintln!("AUDIO: window open (TONE.WAV)");
+            }
+            "files" => {
+                self.add_window("files", 120, 60, 320, 378, App::Files(files::FilesState::new()));
+                kprintln!("FILES: window open");
             }
             _ => {}
         }
@@ -273,7 +322,7 @@ impl Wm {
             }
             App::Paint(_) => render_paint_toolbar(&fb, cw, 0, 1),
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
-            | App::Clock(_) | App::Chat { .. } | App::Viewer(_) | App::Audio(_) => {}
+            | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_) => {}
         }
         if matches!(win.app, App::Shell { .. }) {
             render_shell(&mut win);
@@ -284,7 +333,7 @@ impl Wm {
         if matches!(win.app, App::Clock(_)) {
             clock::render(&mut win, timer::ticks());
         }
-        if matches!(win.app, App::Chat { .. }) {
+        if matches!(win.app, App::Chat(_)) {
             render_chat(&mut win);
         }
         if matches!(win.app, App::Viewer(_)) {
@@ -293,7 +342,38 @@ impl Wm {
         if matches!(win.app, App::Audio(_)) {
             render_audio(&mut win);
         }
+        if matches!(win.app, App::Files(_)) {
+            files::render(&mut win);
+        }
         self.windows.push(win);
+        self.dirty = true;
+    }
+
+    /// M29: open a FAT16 file in the app that handles its type (file
+    /// manager dispatch). Raises the window if that file is already open.
+    pub fn open_file(&mut self, name: &str) {
+        if let Some(i) = self.windows.iter().position(|w| w.title == name) {
+            self.raise(i);
+            return;
+        }
+        if name.ends_with(".PNG") {
+            self.add_window(name, 220, 80, 560, 460, App::Viewer(viewer::ViewerState::with_file(name)));
+            kprintln!("FILES: open {name} in Viewer");
+        } else if name.ends_with(".WAV") {
+            let st = AudioState {
+                file: String::from(name),
+                start_tick: 0,
+                last_secs: u64::MAX,
+                was_playing: false,
+            };
+            self.add_window(name, 360, 300, 300, 130, App::Audio(st));
+            kprintln!("FILES: open {name} in Audio");
+        } else if name.ends_with(".TXT") {
+            self.add_window(name, 60, 60, 420, 300, App::Editor(EditorState::open(name)));
+            kprintln!("FILES: open {name} in Editor");
+        } else {
+            kprintln!("FILES: no app registered for {name}");
+        }
         self.dirty = true;
     }
 
@@ -343,6 +423,20 @@ impl Wm {
                 self.dirty = true;
                 return;
             }
+            // M29: file-manager up/down/Enter (Enter dispatches via open_file).
+            if matches!(win.app, App::Files(_)) {
+                match files::key(win, code) {
+                    files::Action::Redraw => {
+                        self.dirty = true;
+                        return;
+                    }
+                    files::Action::Open(name) => {
+                        self.open_file(&name);
+                        return;
+                    }
+                    files::Action::None => {}
+                }
+            }
         }
         let Some(ch) = keymap::translate(code, self.shift) else {
             return;
@@ -363,7 +457,7 @@ impl Wm {
                     editor_key(win, ch);
                     self.dirty = true;
                 }
-                App::Chat { .. } => {
+                App::Chat(_) => {
                     chat_key(win, ch);
                     self.dirty = true;
                 }
@@ -546,6 +640,15 @@ impl Wm {
                         }
                         self.dirty = true;
                     }
+                    App::Chat(_) => {
+                        chat_click(win, rx, ry);
+                        self.dirty = true;
+                    }
+                    App::Files(_) => match files::click(win, rx, ry) {
+                        files::Action::Open(name) => self.open_file(&name),
+                        files::Action::Redraw => self.dirty = true,
+                        files::Action::None => {}
+                    },
                     _ => {}
                 }
             }
@@ -962,8 +1065,16 @@ impl PaintState {
 const CHAT_BG: u32 = 0xfff8_f6f0;
 const CHAT_TEXT: u32 = 0xff20_2830;
 const CHAT_MINE: u32 = 0xff20_60a0;
+const CHAT_DM: u32 = 0xffb0_5838; // terracotta — direct messages
 const CHAT_PROMPT: u32 = 0xff60_3080;
+// Right-side online-user panel (M26): fixed width, green dot per user.
+const PANEL_W: usize = 80;
+const PANEL_BG: u32 = 0xffe8_e6e0;
+const PANEL_TEXT: u32 = 0xff30_3840;
+const PANEL_SEL: u32 = 0xffc0_7850; // highlighted DM target
+const PANEL_DOT: u32 = 0xff40_b060; // online indicator
 static CHAT_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DM_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn chat_ok() {
     use core::sync::atomic::Ordering;
@@ -972,22 +1083,108 @@ fn chat_ok() {
     }
 }
 
+fn dm_ok() {
+    use core::sync::atomic::Ordering;
+    if !DM_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("DM_OK");
+    }
+}
+
+/// The chat sender label (M25). Priority: USER.TXT on the FAT16 disk (the
+/// session manager / first-boot setup writes the visitor's name there),
+/// then the legacy local-IP A/B convention (the diskless M20 two-instance
+/// proof has no USER.TXT), then a random 6-hex-char id derived from the
+/// boot-time hardware timer.
+fn chat_username() -> String {
+    if let Some(data) = fs::read_file("USER.TXT") {
+        if let Ok(s) = core::str::from_utf8(&data) {
+            let name: String = s.trim().chars().take(20).collect();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    match net::local_ip() {
+        Some([_, _, _, 1]) => return String::from("A"),
+        Some([_, _, _, 2]) => return String::from("B"),
+        _ => {}
+    }
+    let now: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack)) };
+    format!("{:06x}", now & 0xff_ffff)
+}
+
 fn render_chat(win: &mut Window) {
-    let (name, input, visible) = {
-        let App::Chat { name, input, lines } = &win.app else { return };
-        let rows = (win.ch - 28) / 16;
-        let skip = lines.len().saturating_sub(rows);
-        (name.clone(), input.clone(), lines[skip..].to_vec())
+    let App::Chat(st) = &win.app else { return };
+    let (cw, ch) = (win.cw, win.ch);
+    // Relay mode reserves a right-hand user panel; UDP mode uses full width.
+    let relay = matches!(st.mode, ChatMode::Relay { .. });
+    let log_w = if relay { cw - PANEL_W } else { cw };
+    let rows = (ch - 28) / 16;
+    let skip = st.lines.len().saturating_sub(rows);
+    let prompt = match &st.dm_target {
+        Some(t) => format!("@{t}> {}_", st.input),
+        None => format!("{}> {}_", st.name, st.input),
     };
-    let mine = format!("{name}:");
+    let visible: Vec<(String, u32)> =
+        st.lines[skip..].iter().map(|l| (l.text.clone(), l.color)).collect();
+    let users = st.users.clone();
+    let target = st.dm_target.clone();
+
     let fb = win.canvas_fb();
     fb.clear(CHAT_BG);
-    for (i, line) in visible.iter().enumerate() {
-        let color = if line.starts_with(&mine) { CHAT_MINE } else { CHAT_TEXT };
-        fb.draw_string(6, 4 + 16 * i, line.trim_end_matches('\n'), color, None);
+    for (i, (text, color)) in visible.iter().enumerate() {
+        // Clip a long line to the log width (8px per glyph).
+        let max_cols = log_w.saturating_sub(8) / 8;
+        let shown: String = text.chars().take(max_cols).collect();
+        fb.draw_string(6, 4 + 16 * i, &shown, *color, None);
     }
-    let prompt = format!("{name}> {input}_");
-    fb.draw_string(6, win.ch - 20, &prompt, CHAT_PROMPT, None);
+    fb.draw_string(6, ch - 20, &prompt, CHAT_PROMPT, None);
+
+    if relay {
+        let px = log_w;
+        fb.fill_rect(px, 0, PANEL_W, ch, PANEL_BG);
+        fb.draw_string(px + 6, 4, "online", PANEL_TEXT, None);
+        for (i, u) in users.iter().enumerate() {
+            let y = 24 + i * 16;
+            if y + 14 > ch {
+                break;
+            }
+            if target.as_deref() == Some(u.as_str()) {
+                fb.fill_rect(px + 2, y - 1, PANEL_W - 4, 15, PANEL_SEL);
+            }
+            fb.fill_rect(px + 6, y + 4, 6, 6, PANEL_DOT);
+            let label: String = u.chars().take((PANEL_W - 18) / 8).collect();
+            fb.draw_string(px + 16, y, &label, PANEL_TEXT, None);
+        }
+    }
+}
+
+/// Content-area click inside a chat window (relay mode): a click on the
+/// right user panel selects/deselects that user as the DM target.
+fn chat_click(win: &mut Window, rx: isize, ry: isize) {
+    let App::Chat(st) = &mut win.app else { return };
+    if !matches!(st.mode, ChatMode::Relay { .. }) {
+        return;
+    }
+    let panel_x = (win.cw - PANEL_W) as isize;
+    if rx < panel_x {
+        return; // log area, not the panel
+    }
+    let i = (ry - 24) / 16;
+    if i < 0 {
+        return;
+    }
+    let Some(u) = st.users.get(i as usize).cloned() else { return };
+    // Toggle: click the current target (or your own name) to go back to the
+    // public room.
+    st.dm_target = if st.dm_target.as_deref() == Some(u.as_str()) || u == st.name {
+        None
+    } else {
+        kprintln!("CHAT: dm target -> {u}");
+        Some(u)
+    };
+    render_chat(win);
 }
 
 // --- audio player (M24) ----------------------------------------------------
@@ -1067,30 +1264,32 @@ fn audio_tick(win: &mut Window, now: u64) -> bool {
     true
 }
 
+/// Push a log line, capping scrollback.
+fn chat_push(st: &mut ChatState, text: String, color: u32) {
+    st.lines.push(ChatLine { text, color });
+    let excess = st.lines.len().saturating_sub(200);
+    if excess > 0 {
+        st.lines.drain(..excess);
+    }
+}
+
 fn chat_key(win: &mut Window, ch: char) {
     {
-        let App::Chat { name, input, lines } = &mut win.app else { return };
+        let App::Chat(st) = &mut win.app else { return };
         match ch {
             '\u{8}' => {
-                input.pop();
+                st.input.pop();
             }
             '\n' => {
-                let text = core::mem::take(input);
-                if !text.trim().is_empty() {
-                    let mut msg = format!("{name}: {}\n", text.trim());
-                    msg.truncate(128);
-                    if net::chat_send(msg.as_bytes()) {
-                        kprintln!("CHAT: sent {} bytes: {}", msg.len(), msg.trim_end());
-                        chat_ok();
-                    } else {
-                        kprintln!("CHAT: send failed (no netstack?)");
-                    }
-                    lines.push(msg);
+                let text = st.input.trim().to_string();
+                st.input.clear();
+                if !text.is_empty() {
+                    chat_send_line(st, &text);
                 }
             }
             c => {
-                if input.len() < 120 {
-                    input.push(c);
+                if st.input.len() < 120 {
+                    st.input.push(c);
                 }
             }
         }
@@ -1098,30 +1297,166 @@ fn chat_key(win: &mut Window, ch: char) {
     render_chat(win);
 }
 
+/// Send the typed line, either as a relay MSG frame (public or DM to the
+/// current target) or as an M20 UDP broadcast.
+fn chat_send_line(st: &mut ChatState, text: &str) {
+    match &mut st.mode {
+        ChatMode::Relay { handle, .. } => {
+            let to = st.dm_target.clone().unwrap_or_else(|| String::from("*"));
+            let body = &text.as_bytes()[..text.len().min(400)];
+            let header = format!("MSG {} {} {}\n", st.name, to, body.len());
+            let mut frame = header.into_bytes();
+            frame.extend_from_slice(body);
+            net::tcp_write(*handle, &frame);
+            kprintln!("CHAT: sent MSG to '{to}' ({} bytes)", body.len());
+            chat_ok();
+            // The relay echoes our own message back, so we render on receipt
+            // (keeps DM/public colouring identical in both directions).
+        }
+        ChatMode::Udp => {
+            let mut msg = format!("{}: {}\n", st.name, text);
+            msg.truncate(128);
+            if net::chat_send(msg.as_bytes()) {
+                kprintln!("CHAT: sent {} bytes: {}", msg.len(), msg.trim_end());
+                chat_ok();
+            } else {
+                kprintln!("CHAT: send failed (no netstack?)");
+            }
+            chat_push(st, msg.trim_end().to_string(), CHAT_MINE);
+        }
+    }
+}
+
+/// One relay protocol event parsed off the wire.
+enum RelayEvent {
+    Join(String),
+    Part(String),
+    Msg { from: String, to: String, body: String },
+}
+
+/// Drain complete frames out of the relay receive buffer. Lines are
+/// newline-terminated; an `MSG <from> <to> <len>\n` header is followed by
+/// exactly `<len>` raw payload bytes (which we leave intact until present).
+fn parse_relay(rx: &mut Vec<u8>) -> Vec<RelayEvent> {
+    let mut out = Vec::new();
+    loop {
+        let Some(nl) = rx.iter().position(|&b| b == b'\n') else { break };
+        let line = String::from_utf8_lossy(&rx[..nl]).into_owned();
+        let mut it = line.split(' ');
+        match it.next() {
+            Some("MSG") => {
+                let from = it.next().unwrap_or("").to_string();
+                let to = it.next().unwrap_or("").to_string();
+                let len: usize = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                if rx.len() < nl + 1 + len {
+                    break; // payload not fully arrived yet
+                }
+                let body = String::from_utf8_lossy(&rx[nl + 1..nl + 1 + len]).into_owned();
+                rx.drain(..nl + 1 + len);
+                out.push(RelayEvent::Msg { from, to, body });
+            }
+            Some("JOIN") => {
+                if let Some(u) = it.next() {
+                    out.push(RelayEvent::Join(u.to_string()));
+                }
+                rx.drain(..nl + 1);
+            }
+            Some("PART") => {
+                if let Some(u) = it.next() {
+                    out.push(RelayEvent::Part(u.to_string()));
+                }
+                rx.drain(..nl + 1);
+            }
+            _ => {
+                rx.drain(..nl + 1); // unknown line: skip
+            }
+        }
+    }
+    out
+}
+
 impl Wm {
-    /// Append a received chat datagram to the chat window's log.
+    /// Append a received chat datagram (M20 UDP mode) to the chat log.
     pub fn chat_append(&mut self, msg: &str) {
-        let Some(win) = self
-            .windows
-            .iter_mut()
-            .find(|w| matches!(w.app, App::Chat { .. }))
-        else {
+        let Some(win) = self.windows.iter_mut().find(|w| matches!(w.app, App::Chat(_))) else {
             return;
         };
         {
-            let App::Chat { lines, .. } = &mut win.app else { unreachable!() };
+            let App::Chat(st) = &mut win.app else { unreachable!() };
             for piece in msg.split_inclusive('\n') {
                 if !piece.trim().is_empty() {
-                    lines.push(String::from(piece.trim_end_matches('\n')));
+                    chat_push(st, piece.trim_end_matches('\n').to_string(), CHAT_TEXT);
                 }
-            }
-            let excess = lines.len().saturating_sub(200);
-            if excess > 0 {
-                lines.drain(..excess);
             }
         }
         kprintln!("CHAT: rx {:?}", msg.trim_end());
         chat_ok();
+        render_chat(win);
+        self.dirty = true;
+    }
+
+    /// M26: pump the relay TCP connection — read available bytes, parse
+    /// HELLO/JOIN/PART/MSG frames, and update the log + online roster.
+    /// Called every desktop-loop iteration.
+    pub fn chat_poll(&mut self) {
+        let Some(win) = self.windows.iter_mut().find(|w| matches!(w.app, App::Chat(_))) else {
+            return;
+        };
+        let App::Chat(st) = &mut win.app else { return };
+        let ChatMode::Relay { handle, rx } = &mut st.mode else { return };
+        let handle = *handle;
+        // Drain the socket into the per-window buffer.
+        let mut tmp = [0u8; 1024];
+        let mut got = false;
+        loop {
+            match net::tcp_read(handle, &mut tmp) {
+                net::TcpRead::Data(n) => {
+                    rx.extend_from_slice(&tmp[..n]);
+                    got = true;
+                }
+                _ => break,
+            }
+        }
+        if !got {
+            return;
+        }
+        let events = parse_relay(rx);
+        if events.is_empty() {
+            return;
+        }
+        let name = st.name.clone();
+        for ev in events {
+            match ev {
+                RelayEvent::Join(u) => {
+                    if !st.users.contains(&u) {
+                        st.users.push(u.clone());
+                        st.users.sort();
+                        kprintln!("CHAT: join {u} (users {})", st.users.len());
+                    }
+                }
+                RelayEvent::Part(u) => {
+                    st.users.retain(|x| *x != u);
+                    kprintln!("CHAT: part {u} (users {})", st.users.len());
+                }
+                RelayEvent::Msg { from, to, body } => {
+                    let (text, color) = if to == "*" {
+                        let c = if from == name { CHAT_MINE } else { CHAT_TEXT };
+                        (format!("{from}: {body}"), c)
+                    } else {
+                        let t = if from == name {
+                            format!("{from} -> {to}: {body}")
+                        } else {
+                            format!("{from} -> you: {body}")
+                        };
+                        dm_ok();
+                        (t, CHAT_DM)
+                    };
+                    kprintln!("CHAT: rx {text:?}");
+                    chat_push(st, text, color);
+                    chat_ok();
+                }
+            }
+        }
         render_chat(win);
         self.dirty = true;
     }

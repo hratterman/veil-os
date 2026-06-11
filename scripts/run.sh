@@ -50,8 +50,13 @@ cd "$DIR"
 echo "Building (this takes ~30s the first time)..."
 bash scripts/build.sh 2>&1 | tail -5
 
-# 7. Disk image
-scripts/mkdisk.sh >/dev/null
+# 7. Disk image (drop your own .png/.wav into user-files/ to add them — they
+#    show up in the Files app inside the OS).
+if [ ! -d "$DIR/user-files" ]; then
+  mkdir -p "$DIR/user-files"
+  echo "Tip: drop .png or .wav files into $DIR/user-files/ and re-run to add them to the OS."
+fi
+scripts/mkdisk.sh --no-user >/dev/null
 
 # 8. Boot
 echo ""

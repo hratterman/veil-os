@@ -1,7 +1,8 @@
 # Veil OS — progress
 
-Contract: `os-build-spec.md` (M1–M17) + `os-build-spec-v2.md` (M18–M24).
-Gated milestones; each passes only on observed proof.
+Contract: `os-build-spec.md` (M1–M17) + `os-build-spec-v2.md` (M18–M24) +
+`os-build-spec-v3.md` (M25–M30). Gated milestones; each passes only on
+observed proof.
 
 ## Milestones
 
@@ -32,6 +33,12 @@ Gated milestones; each passes only on observed proof.
 | M22 | Paint-save verify + polish | PASSED 2026-06-10 | paint reboot pixel-verified; site updated through M21 (browser-rendered); full regression suite green |
 | M23 | Image viewer | PASSED 2026-06-10 | `scripts/m23_test.sh` (CHECK.PNG checker pixels; Right→DOG.PNG photo, image changes; Left returns) |
 | M24 | Audio (WAV) | PASSED 2026-06-10 | `scripts/m24_test.sh` (virtio-sound streams 3s tone clean, AUDIO_OK); GUI `drive_m24.py`; audible via demo.sh (coreaudio) — human check |
+| M25 | Per-visitor sessions + USER.TXT usernames | PASSED 2026-06-10 | `scripts/m25_test.sh` (two isolated disks alpha_fox/beta_owl; A's msg renders in B prefixed `alpha_fox:`, exact font pixels; both CHAT_OK). `session_manager.py --selftest` green. Cloudflare cutover staged (install_sessions.sh) — not live-verified here |
+| M26 | TCP relay + DMs + online user list | PASSED 2026-06-10 | `scripts/m26_test.sh` (3 instances ann/bob/cid on `relay.py`; public broadcast reaches all, DM reaches bob not cid, panel lists all 3, DM_OK — all exact font pixels, 25 checks). M20/M25 UDP path regress green |
+| M27 | First-boot setup screen | PASSED 2026-06-10 | `scripts/m27_test.sh` (boot1 no USER.TXT → drive setup: name+UTC-5, SETUP_OK, desktop replaces card pixel-verified; on-disk USER.TXT=testuser/TZ.TXT=-5; boot2 skips setup, persists, TZ -18000s). M18/M23 default-disk regress green |
+| M28 | Browser audio (PCM over WebSocket) | PASSED 2026-06-10 | `scripts/m28_test.sh` (QEMU `wav` FIFO audiodev → `audio_server.js` taps FIFO → WS → `ws_probe.js` read 8148 bytes, 7966 non-zero, AUDIO_STREAM_OK; driver clicked Play, AUDIO_OK). Browser client `novnc_audio.js` + `com.veil.audio` staged (no browser in-sandbox) |
+| M29 | In-OS file manager (App::Files) | PASSED 2026-06-10 | `scripts/m29_test.sh` (Files lists 20 disk files; row-0 highlight + first filename exact font pixels; click CHECK.PNG → Viewer opens 128x128 image, FILES_OK). `user-files/` PNG copy verified; mkdisk `--extra-dir` shared with M30 |
+| M30 | Pre-boot file upload (hosted demo) | PASSED 2026-06-10 | `scripts/m30_test.sh` (session_manager: POST /upload veiltest.png → POST /boot 302 → spawned QEMU; drive setup → Files lists VEILTEST.PNG (exact font pixels) → opens 320x240 in Viewer, UPLOAD_OK). `landing.html` upload page + selftest green |
 
 ## M19b notes (2026-06-10)
 
@@ -123,6 +130,120 @@ stereo 44100). App::Audio window (filename/Play-Stop/elapsed) runs playback on
 a kernel task so the 3s stream doesn't block the desktop. mkdisk generates
 TONE.WAV (`scripts/mkwav.py`, 440Hz 3s). demo.sh uses `-audiodev coreaudio`,
 m24_test/serve_vnc use `none`.
+
+## M25 notes (2026-06-10)
+
+Chat sender label now reads `USER.TXT` off the FAT16 disk
+(`wm::chat_username`): priority USER.TXT → legacy local-IP A/B (keeps the
+diskless M20 proof green) → random 6-hex from `cntpct`. `mkdisk.sh` grew
+`--username`/`--out`/`--extra-dir` flags. `m25_test.sh` boots two instances
+off separate disks (each its own USER.TXT) over the same hub bridge as M20.
+Host: `session_manager.py` (stdlib HTTP on :6091) spawns a per-visitor
+QEMU+websockify on VNC :11.., websockify 6100.., random adjective_animal
+usernames, 20-session cap, 30-min idle reap; `--selftest` covers username
+uniqueness, port allocation, real disk build. `install_sessions.sh` +
+`launchd/com.veil.sessions.plist` stage the cutover (replaces
+com.veil.qemu/websockify/reset) — live Cloudflare swap is a manual op, not
+verified in-sandbox.
+
+## M26 notes (2026-06-10)
+
+Chat gained a TCP relay mode alongside the M20 UDP broadcast. `relay.py`
+(stdlib TCP :7778) speaks `HELLO/JOIN/PART/MSG` with a length-prefixed MSG
+body; public (`to=*`) fans out to all incl. sender, DMs go to the named
+recipient + echo to sender. The kernel `App::Chat` is now a `ChatState`
+(lines as `ChatLine{text,color}`, `users` roster, `dm_target`, `ChatMode`).
+Mode is chosen at launch from `net::relay_addr()` (fw_cfg `opt/veil.relay`,
+parsed in main): present → TCP relay (DMs + right-side 80px user panel,
+click a name to DM, terracotta DM colour); absent → UDP fallback (keeps the
+diskless M20 + M25 proofs green). Relay frames parsed in `wm::parse_relay`,
+pumped each desktop loop via `Wm::chat_poll`. **Key reachability fact: a
+slirp `user` guest reaches host services at the gateway 10.0.2.2 — so every
+QEMU instance (test + hosted, all on the one Mac mini) hits the host relay
+at 10.0.2.2:7778 with no Cloudflare/DNS needed.** Host: `com.veil.relay`
+LaunchAgent + relay wired into `session_manager` spawn. DM_OK sentinel on
+first DM sent/received.
+
+## M27 notes (2026-06-10)
+
+`src/setup.rs`: full-screen pre-desktop mode (dark `#0b1018`, centered card,
+3x header). `desktop::run` starts the 50 Hz tick + preemption first, then
+runs setup iff `setup::needed()` (USER.TXT absent/blank) before `Wm::new`.
+Name field (keyboard, backspace, blinking cursor), timezone field
+(left/right arrows, 30-min steps UTC-12..UTC+14). Enter writes USER.TXT +
+TZ.TXT and `timer::set_tz`. TZ.TXT now supports half-hours ("5.5");
+`main::parse_tz_offset` parses `[+-]H[.5]` → seconds (replaces the old i64
+hours parse in milestone19b). **Regression guard: the setup screen triggers
+on USER.TXT absence, which every default-disk GUI proof would hit — so
+`mkdisk.sh` now writes a default `USER.TXT=guest` unless `--no-user`. Hosted
+sessions, demo.sh/run.sh, and m27_test pass `--no-user` to get the setup
+screen; all other disks skip it.** Arrow keycodes 105/106.
+
+## M28 notes (2026-06-10)
+
+Browser audio with no GStreamer/WebRTC. **Two QEMU gotchas found: this
+Homebrew QEMU rejects `out.try-poll=off` on the `wav` backend (dropped it),
+and `virtio-sound-device` logs a non-fatal "can not open virtio-sound.in"
+(capture stream, harmless — output still streams).** Path: `-audiodev
+wav,id=snd0,path=/tmp/veil-audio-<id>.fifo` → `audio_server.js` (Node
+built-ins; scans /tmp for session FIFOs, opens read — rendezvous with
+QEMU's write-open at boot so the VM never blocks, strips the 44-byte RIFF
+header by scanning for `data`, hand-rolled WS server frames) → browser
+`novnc_audio.js` (Web Audio, gesture-unlock, back-to-back buffer queue,
+speaker icon). Proof reads PCM with `ws_probe.js` (hand-rolled WS client).
+No kernel change — same M24 virtio-snd streaming. `com.veil.audio` :6092,
+Cloudflare `audio.henryratterman.com` (manual). The wav header from QEMU is
+`RIFF....WAVEfmt ....data....` with `data` at offset 36, PCM at 44.
+
+## M29 notes (2026-06-10)
+
+`src/files.rs` (App::Files): lists every FAT16 root file (sorted), 14px
+rows with `[IMG]/[WAV]/[TXT]/[???]` font tags, row-0 selected. Click or
+Enter dispatches via new `Wm::open_file` (PNG→Viewer with
+`viewer::ViewerState::with_file`, WAV→Audio with that file, TXT→Editor).
+`files::key`/`files::click` return an `Action` (Redraw/Open) so the WM does
+the cross-window launch outside the window borrow. Added as taskbar/desktop
+launcher #9 (after audio, so existing button indices are unchanged; idx 7
+without a NIC, 8 with). On open it logs `FILES[i]: NAME` for each file (the
+proof finds the first PNG row from serial). mkdisk already copies
+`user-files/*.{png,wav}`; `.gitignore` ignores `user-files/`, run.sh seeds
+it + prints the hint.
+
+## M30 notes (2026-06-10)
+
+`session_manager.py` grew the pre-boot upload flow: `GET /` serves
+`landing.html` (drop zone + Boot, session id injected via `__SESSION__`),
+`POST /upload?session=<id>` parses multipart by hand (stdlib only —
+boundary split, `filename="..."`, .png/.wav + 4MB + 5-file limits) into
+`/tmp/veil-uploads-<id>/`, `POST /boot?session=<id>` builds the disk with
+`mkdisk --extra-dir <uploads>` and spawns QEMU (302 → noVNC). Sessions are
+lazily created via `get_or_create` so uploads/boot can precede `GET /`.
+Each spawned instance now also gets a `-qmp` socket + `-serial` file (so the
+proof can drive it) and a `mkfifo`'d audio tap. **Two test-box snags fixed:
+buffered manager stdout hid the spawn error (run with `python3 -u`), and the
+optional `websockify` launch (absent here) raised `FileNotFoundError` and
+killed the session — now guarded.** The booted instance hits the M27 setup
+screen first (fresh `--no-user` disk), then Files shows the uploaded file.
+
+## Hosted-demo deployment (2026-06-10) — LIVE
+
+The per-visitor session architecture is deployed to os.henryratterman.com.
+Cut over from the single-instance agents (com.veil.qemu/websockify/reset,
+backed up to `~/Library/LaunchAgents/veil-backup-*`) to
+**com.veil.{sessions,relay,audio}**. `session_manager.py` now: (1) listens
+on **6090** (the port the live Cloudflare route already targets) bound
+**dual-stack** — cloudflared dials `localhost` as IPv6 `[::1]`, so an
+IPv4-only bind 502'd; (2) **reverse-proxies `/session/<id>/*`** (noVNC
+static + the WebSocket via a bidirectional socket pump) to that session's
+private websockify — this was the missing piece for browser visitors
+(m30_test only drove via QMP/serial); (3) resolves a concrete `websockify`
+path (it isn't on PATH); (4) exits hard on SIGTERM (the old
+`httpd.shutdown()` from the signal handler deadlocked → orphaned process
+holding the port). Verified end-to-end through Cloudflare: landing →
+POST /boot → 302 → proxied noVNC 200; a fresh session boots the latest
+kernel to the M27 setup screen (framebuffer captured). os route is on the
+**dashboard-managed** tunnel (ingress lives in the CF dashboard, not
+config.yml), already pointing at localhost:6090.
 
 ## Post-M20 UX overhaul (no milestone — 2026-06-10)
 

@@ -11,6 +11,9 @@
 # Editor / OS cruft
 .DS_Store
 
+# M29: user-supplied media baked onto the disk (local, not tracked)
+/user-files/
+
 # Local harness / session automation (not part of Veil OS)
 .claude/
 scripts/claude_keepalive.sh

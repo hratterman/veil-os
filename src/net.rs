@@ -937,6 +937,31 @@ pub fn chat_send(payload: &[u8]) -> bool {
     })
 }
 
+/// M26 relay (TCP). The chat app connects here to exchange the
+/// HELLO/JOIN/PART/MSG protocol when an address is configured (fw_cfg
+/// opt/veil.relay); absent one, chat stays in the M20 UDP-broadcast mode.
+static mut RELAY: Option<([u8; 4], u16)> = None;
+
+pub fn set_relay(addr: Option<([u8; 4], u16)>) {
+    unsafe { *core::ptr::addr_of_mut!(RELAY) = addr };
+}
+
+pub fn relay_addr() -> Option<([u8; 4], u16)> {
+    unsafe { *core::ptr::addr_of!(RELAY) }
+}
+
+/// Parse "a.b.c.d:port" (the opt/veil.relay fw_cfg string).
+pub fn parse_relay(s: &str) -> Option<([u8; 4], u16)> {
+    let (ip, port) = s.trim().split_once(':')?;
+    let mut out = [0u8; 4];
+    let mut it = ip.split('.');
+    for b in out.iter_mut() {
+        *b = it.next()?.parse().ok()?;
+    }
+    it.next().is_none().then_some(())?;
+    Some((out, port.parse().ok()?))
+}
+
 /// M19b: client-side UDP send (DNS query, NTP request). `sport` must be
 /// in 49152..61000 — replies queue in udp_rx for `udp_poll`. Returns
 /// false on an ARP miss (a request went out; retry after a yield).

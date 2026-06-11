@@ -41,10 +41,12 @@ python3 scripts/mksite.py
 for f in site/*; do
     cp "$f" "$MNT/$(basename "$f" | tr a-z A-Z)"
 done
-# Real photos for the M23 image viewer
-for f in assets/photos/*.png; do
+# Real photos for the M23 image viewer (PNG + M35 JPEG, baseline + progressive)
+for f in assets/photos/*.png assets/photos/*.jpg; do
+    [ -e "$f" ] || continue
     cp "$f" "$MNT/$(basename "$f" | tr a-z A-Z)"
 done
+cp assets/dog_baseline.jpg "$MNT/DOGBASE.JPG" 2>/dev/null || true
 # M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
 python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
 # M25/M27: USER.TXT labels Chat and gates the first-boot setup screen.

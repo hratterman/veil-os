@@ -1559,7 +1559,7 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
             continue;
         }
         if let Some((200, _, data)) = http_get(&src) {
-            match png::decode(&data) {
+            match png::decode_any(&data) {
                 Some(img) => {
                     kprintln!("BROWSER: decoded {src} ({}x{} px)", img.w, img.h);
                     if is_external(&src) && !EXT_IMG_DONE.swap(true, Ordering::Relaxed) {

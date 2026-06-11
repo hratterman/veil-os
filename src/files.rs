@@ -61,8 +61,12 @@ fn page_size(cw: usize, ch: usize) -> usize {
     rows * cols
 }
 
+fn is_image(name: &str) -> bool {
+    name.ends_with(".PNG") || name.ends_with(".JPG") || name.ends_with(".JPEG")
+}
+
 fn tag(name: &str) -> &'static str {
-    if name.ends_with(".PNG") {
+    if is_image(name) {
         "[IMG]"
     } else if name.ends_with(".GIF") {
         "[GIF]"
@@ -70,6 +74,10 @@ fn tag(name: &str) -> &'static str {
         "[WAV]"
     } else if name.ends_with(".TXT") {
         "[TXT]"
+    } else if name.ends_with(".MJPEG") || name.ends_with(".AVI") || name.ends_with(".MJPG") {
+        "[VID]"
+    } else if name.ends_with(".WASM") {
+        "[WSM]"
     } else {
         "[???]"
     }
@@ -77,10 +85,14 @@ fn tag(name: &str) -> &'static str {
 
 /// True for names the file manager knows how to launch.
 fn openable(name: &str) -> bool {
-    name.ends_with(".PNG")
+    is_image(name)
         || name.ends_with(".GIF")
         || name.ends_with(".WAV")
         || name.ends_with(".TXT")
+        || name.ends_with(".MJPEG")
+        || name.ends_with(".MJPG")
+        || name.ends_with(".AVI")
+        || name.ends_with(".WASM")
 }
 
 pub fn render(win: &mut Window) {

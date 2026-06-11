@@ -36,7 +36,7 @@ impl ViewerState {
             .unwrap_or_default()
             .into_iter()
             .map(|(name, _)| name)
-            .filter(|n| n.ends_with(".PNG")) // FAT 8.3 names are upper-case
+            .filter(|n| n.ends_with(".PNG") || n.ends_with(".JPG") || n.ends_with(".JPEG"))
             .collect();
         files.sort();
         let mut st = ViewerState { files, idx: 0, img: None, bad: None };
@@ -71,7 +71,7 @@ impl ViewerState {
             return;
         };
         let bytes = data.len();
-        match png::decode(&data) {
+        match png::decode_any(&data) {
             Some(im) => {
                 if im.w == im.full_w && im.h == im.full_h {
                     kprintln!("VIEWER: showing {name} {}x{}", im.full_w, im.full_h);

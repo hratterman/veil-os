@@ -42,6 +42,17 @@ pub struct Image {
     pub pixels: Vec<u32>,
 }
 
+/// Decode a PNG or baseline JPEG, sniffing the magic bytes. Both decoders
+/// return the same `Image`, so every consumer (viewer, file manager, browser)
+/// stays format-agnostic.
+pub fn decode_any(data: &[u8]) -> Option<Image> {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        crate::jpeg::decode(data)
+    } else {
+        decode(data)
+    }
+}
+
 /// Parse just the IHDR to learn a PNG's real dimensions without decoding it,
 /// so a viewer can show a helpful message ("2048x2048, too large") even when
 /// `decode` declines the image.

@@ -459,7 +459,7 @@ impl Wm {
             self.raise(i);
             return;
         }
-        if name.ends_with(".PNG") {
+        if name.ends_with(".PNG") || name.ends_with(".JPG") || name.ends_with(".JPEG") {
             self.add_window(name, 220, 80, 560, 460, App::Viewer(viewer::ViewerState::with_file(name)));
             kprintln!("FILES: open {name} in Viewer");
         } else if name.ends_with(".WAV") {

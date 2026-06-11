@@ -33,6 +33,7 @@ mod heap;
 mod html;
 mod http;
 mod input;
+mod jpeg;
 mod keymap;
 mod lisp;
 #[cfg(feature = "pi4")]
@@ -98,6 +99,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     scheduler::init(kernel_mapper.root());
     crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
     font::selftest(); // M34: prove the generated bitmap fonts loaded
+    milestone35_jpeg(); // M35: prove the baseline JPEG decoder
     milestone9();
     milestone10(&fdt);
     if milestone12(&fdt) {
@@ -546,6 +548,60 @@ fn milestone3(fdt: &dtb::Fdt, dtb_pa: usize) -> paging::Mapper {
 }
 
 /// M4: global allocator under an interleaved alloc/free stress, no leaks.
+/// M35: decode a known 64x64 four-quadrant test JPEG (4:2:0 and 4:4:4) and
+/// check the quadrant centres survive the YCbCr/IDCT round-trip. Lossy, so we
+/// allow generous tolerance; the point is the colours are recognisably right.
+fn milestone35_jpeg() {
+    let check = |data: &[u8], label: &str| {
+        let Some(img) = jpeg::decode(data) else {
+            kprintln!("JPEG_FAIL: {label} did not decode");
+            return false;
+        };
+        if img.w != 64 || img.h != 64 {
+            kprintln!("JPEG_FAIL: {label} wrong size {}x{}", img.w, img.h);
+            return false;
+        }
+        let at = |x: usize, y: usize| {
+            let p = img.pixels[y * 64 + x];
+            (((p >> 16) & 0xff) as i32, ((p >> 8) & 0xff) as i32, (p & 0xff) as i32)
+        };
+        let near = |a: (i32, i32, i32), b: (i32, i32, i32)| {
+            (a.0 - b.0).abs() < 50 && (a.1 - b.1).abs() < 50 && (a.2 - b.2).abs() < 50
+        };
+        let (tl, tr, bl, br) = (at(16, 16), at(48, 16), at(16, 48), at(48, 48));
+        let ok = near(tl, (220, 30, 30))
+            && near(tr, (30, 200, 40))
+            && near(bl, (40, 60, 210))
+            && near(br, (235, 235, 235));
+        if !ok {
+            kprintln!("JPEG_FAIL: {label} colours tl={tl:?} tr={tr:?} bl={bl:?} br={br:?}");
+        }
+        ok
+    };
+    let ok420 = check(include_bytes!("../assets/jpegtest.jpg"), "4:2:0");
+    let ok444 = check(include_bytes!("../assets/jpegtest444.jpg"), "4:4:4");
+    // Real camera photos: a baseline one and a PROGRESSIVE one (most web JPEGs
+    // are progressive). Prove each decodes to the right size and isn't black.
+    let real = |bytes: &[u8], label: &str| -> bool {
+        match jpeg::decode(bytes) {
+            Some(im) => {
+                let lit = im.pixels.iter().filter(|&&p| (p & 0xffffff) > 0x101010).count();
+                kprintln!("JPEG: {label} -> {}x{} ({} lit px)", im.w, im.h, lit);
+                im.w == 320 && im.h == 240 && lit > im.pixels.len() / 10
+            }
+            None => {
+                kprintln!("JPEG_FAIL: {label} did not decode");
+                false
+            }
+        }
+    };
+    let ok_base = real(include_bytes!("../assets/dog_baseline.jpg"), "dog baseline");
+    let ok_prog = real(include_bytes!("../assets/photos/dog.jpg"), "dog progressive");
+    if ok420 && ok444 && ok_base && ok_prog {
+        kprintln!("JPEG_OK: baseline + progressive DCT (4:2:0/4:4:4, real photos)");
+    }
+}
+
 fn milestone4() {
     use alloc::{collections::BTreeMap, string::String, vec::Vec};
     use core::fmt::Write;

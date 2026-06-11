@@ -1,36 +1,44 @@
 <html>
 <head><link rel="stylesheet" href="style.css"></head>
 <body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a></div>
 <div class="hero">
 <img src="logo.png">
 <h1>Veil OS</h1>
-<p>This page is served by an operating system written from scratch:
-its own kernel, its own TCP/IP stack, its own HTTP server, off its own
-FAT16 filesystem driver.</p>
+<p class="big">A graphical operating system written from scratch, and the
+little internet it serves to itself.</p>
+<p>Everything below this line was made by hand: the kernel, the TCP/IP
+stack, the HTTP server, the FAT16 driver, the browser rendering this page,
+and the PNG and GIF decoders behind its pictures.</p>
 <p>More: <a href="page2.htm">how this was built</a></p>
 </div>
+<div class="card">
+<h2>Explore the Veilnet</h2>
+<ul>
+<li><a href="news.htm">The Daily Veil</a> - dispatches from a world where
+operating systems are current events</li>
+<li><a href="wiki.htm">Veilpedia</a> - how AArch64 memory paging actually
+works</li>
+<li><a href="gallery.htm">Gallery</a> - images decoded by our own PNG reader</li>
+<li><a href="ascii.htm">ASCII Lounge</a> - art that needs no decoder</li>
+<li><a href="tips.htm">Field Guide</a> - every keyboard shortcut in the OS</li>
+<li><a href="changes.htm">Changelog</a> - thirty-one milestones, gated</li>
+<li><a href="about.htm">About</a> - who, what, and why</li>
+<li><a href="page2.htm">The build, in order</a> - the full milestone ladder</li>
+</ul>
+</div>
+<div class="card">
 <h2>What you are touching right now</h2>
 <ul>
 <li>a virtio-net driver moving raw ethernet frames</li>
-<li>ARP, IPv4 and ICMP (it answers ping)</li>
-<li>a hand-written TCP state machine - the handshake that delivered
-this page was ours on one side</li>
+<li>ARP, IPv4 and ICMP - it answers ping</li>
+<li>a hand-written TCP state machine; the handshake that delivered this
+page was ours on one side</li>
 <li>an HTTP/1.1 server running as a preemptively scheduled kernel task</li>
-<li>the browser you may be reading this in, rendering our own HTML, CSS
-and PNG decoders</li>
+<li>a browser parsing our own HTML and CSS, with our own PNG and GIF
+decoders for the pictures</li>
 </ul>
-<h2>Apps that ship with it</h2>
-<ul>
-<li>Editor - type and save text files to the FAT16 disk</li>
-<li>Clock - analog and digital faces, chronograph and stopwatch, with
-real local time synced over NTP (it resolves pool.ntp.org through our
-own DNS query)</li>
-<li>Paint - palette, brushes, a canvas that survives reboot</li>
-<li>Browser - this site, over our own loopback TCP</li>
-<li>Chat - every running Veil instance joins one room over real UDP</li>
-<li>Image viewer and a WAV audio player (PCM to virtio-sound)</li>
-</ul>
-<p>It also boots on a real Raspberry Pi 4, not just QEMU.</p>
+</div>
 <pre>BOOT_OK: veil kernel alive</pre>
 </body>
 </html>

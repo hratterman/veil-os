@@ -25,6 +25,8 @@ mod frames;
 mod fs;
 mod fwcfg;
 mod gic;
+mod gif;
+mod gifplayer;
 mod heap;
 mod html;
 mod http;

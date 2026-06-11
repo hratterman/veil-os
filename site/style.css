@@ -1,6 +1,15 @@
-body { background-color: #14181c; color: #d0d8e0; margin: 24px; }
-h1 { color: #6090e0; }
-h2 { color: #80a8e8; }
+body { background-color: #14181c; color: #d0d8e0; margin: 20px; }
+h1 { color: #6cb0ff; }
+h2 { color: #88b0f0; }
+h3 { color: #a8c0e0; }
 a { color: #e0a040; }
-pre { background-color: #20262c; color: #80e0a0; padding: 8px; }
-div { margin: 8px; }
+pre { background-color: #1b222a; color: #78e0a0; padding: 10px; }
+li { color: #c8d2dc; }
+div { margin: 6px; }
+.nav { background-color: #1b222a; padding: 8px; }
+.card { background-color: #1a2026; padding: 12px; margin: 12px; }
+.hero { padding: 8px; }
+.tag { color: #60c8a0; }
+.muted { color: #76828e; }
+.byline { color: #9aa8b8; }
+.big { font-size: 22px; }

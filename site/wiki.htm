@@ -1,0 +1,42 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a></div>
+<h1>Veilpedia: Virtual Memory on AArch64</h1>
+<p class="muted">From Veilpedia, the encyclopedia anyone who wrote the
+kernel can edit.</p>
+<div class="card">
+<p><span class="tag">Virtual memory</span> is the trick that lets every
+program believe it owns a vast, private, flat expanse of addresses while
+the hardware quietly maps those addresses onto whatever physical RAM
+happens to be free. On 64-bit ARM (AArch64) the translation is done by the
+Memory Management Unit walking a tree of page tables.</p>
+</div>
+<h2>The translation walk</h2>
+<p>Veil uses a 39-bit virtual address space split into three levels of
+4 KiB tables. An address is sliced into three 9-bit indices plus a 12-bit
+page offset:</p>
+<pre>  bits 38..30   level 1 index   (1 GiB blocks)
+  bits 29..21   level 2 index   (2 MiB blocks)
+  bits 20..12   level 3 index   (4 KiB pages)
+  bits 11..0    offset within the page</pre>
+<p>Each level holds 512 descriptors. The walk starts at the table pointed
+to by <span class="tag">TTBR0_EL1</span>, indexes down three levels, and
+arrives at a physical frame. A descriptor can also be a "block" entry that
+stops the walk early, mapping a whole 1 GiB or 2 MiB region at once - which
+is how Veil identity-maps device memory and RAM cheaply at boot.</p>
+<h2>Permissions and faults</h2>
+<p>Every descriptor carries access bits. User pages are marked
+<span class="tag">AP_EL0</span> with execute-never on data; if code at EL0
+touches kernel memory, the walk denies it and the CPU raises a translation
+fault, which Veil turns into a clean process kill. This was proven by a
+deliberately evil test program that read kernel memory and was, correctly,
+executed - in the capital-punishment sense.</p>
+<h2>See also</h2>
+<ul>
+<li><a href="changes.htm">Milestone 3: paging and the MMU</a></li>
+<li><a href="page2.htm">The full build ladder</a></li>
+</ul>
+<p><a href="index.htm">Home</a></p>
+</body>
+</html>

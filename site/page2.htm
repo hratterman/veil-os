@@ -1,9 +1,10 @@
 <html>
 <head><link rel="stylesheet" href="style.css"></head>
 <body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a></div>
 <h1>The milestone ladder</h1>
-<p>Veil was built strictly gated: each milestone proven in QEMU before
-the next began.</p>
+<p>Veil was built strictly gated: each milestone proven in QEMU before the
+next began.</p>
 <ol>
 <li>serial boot</li>
 <li>exceptions + timer</li>
@@ -20,17 +21,18 @@ the next began.</p>
 <li>arp / ipv4 / icmp</li>
 <li>udp and tcp</li>
 <li>this http server</li>
-<li>an on-OS browser (html, css, png - all ours)</li>
+<li>an on-OS browser - html, css, png, all ours</li>
 <li>the same kernel on a real Raspberry Pi 4</li>
 <li>a text editor with persistent files</li>
 <li>a clock with NTP-synced real local time</li>
 <li>global chat between independent Veil instances over UDP</li>
-<li>a public GitHub release and this browser-playable hosted demo</li>
-<li>a PNG image viewer (arrow keys to browse the disk)</li>
-<li>a native WAV audio player streaming PCM to a virtio-sound device</li>
+<li>a public GitHub release and a browser-playable hosted demo</li>
+<li>a PNG image viewer</li>
+<li>a native WAV audio player</li>
+<li>per-visitor sessions, chat relay, setup screen, browser audio</li>
+<li>an in-OS file manager and a pre-boot upload page</li>
+<li>this expanded internet and a from-scratch animated GIF player</li>
 </ol>
-<p>Run it yourself on a Mac:</p>
-<pre>brew install qemu &amp;&amp; git clone https://github.com/hratterman/veil-os &amp;&amp; cd veil-os &amp;&amp; scripts/demo.sh</pre>
 <p><a href="index.htm">back home</a></p>
 </body>
 </html>

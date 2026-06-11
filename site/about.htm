@@ -1,0 +1,28 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a></div>
+<h1>About Veil OS</h1>
+<div class="card">
+<p>Veil is a graphical operating system for 64-bit ARM, built milestone by
+milestone with a single rule: <span class="tag">reality is the grader</span>.
+Nothing counted as done until it provably worked in QEMU - pixels on a
+screen, packets on the wire, files surviving a reboot.</p>
+</div>
+<h2>The principle</h2>
+<p>No Linux. No BSD. No borrowed kernel, network library, font engine, or
+codec. When the build needed an HTTP server, we wrote one. When it needed a
+browser, we wrote that too, and a PNG decoder, and now a GIF decoder. The
+point was never to be fast or complete; it was to be honest.</p>
+<h2>Colophon</h2>
+<ul>
+<li>language: Rust, no_std, on bare metal</li>
+<li>targets: QEMU virt (aarch64) and a real Raspberry Pi 4</li>
+<li>font: an 8x16 bitmap, doubled from a public-domain 8x8</li>
+<li>this page: served by the OS to its own browser over loopback TCP</li>
+</ul>
+<p>Source and a one-line installer live on the
+<a href="changes.htm">changelog</a> page.</p>
+<p><a href="index.htm">Home</a></p>
+</body>
+</html>

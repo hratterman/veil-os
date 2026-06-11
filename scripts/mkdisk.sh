@@ -63,7 +63,7 @@ fi
 # M30: an explicit upload directory staged by the session manager.
 for SRC in user-files "$EXTRA_DIR"; do
     [ -n "$SRC" ] && [ -d "$SRC" ] || continue
-    for f in "$SRC"/*.png "$SRC"/*.PNG "$SRC"/*.wav "$SRC"/*.WAV; do
+    for f in "$SRC"/*.png "$SRC"/*.PNG "$SRC"/*.wav "$SRC"/*.WAV "$SRC"/*.gif "$SRC"/*.GIF; do
         [ -e "$f" ] || continue
         cp "$f" "$MNT/$(basename "$f" | tr a-z A-Z)" 2>/dev/null || \
             echo "mkdisk: skipped $(basename "$f") (disk full?)" >&2

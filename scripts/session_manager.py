@@ -106,6 +106,7 @@ class Session:
         self.serial = f"/tmp/veil-session-{sid}-serial.log"
         self.qemu = None
         self.wsproc = None
+        self.fifo_rd = None   # read-end fd kept open to unblock QEMU's write-open
         self.last_active = time.time()
         self.booted = False
 
@@ -183,13 +184,20 @@ class Manager:
         if s.booted:
             return
         self.build_disk(s)
-        # FIFO audio tap for the bridge (com.veil.audio reads it; the open
-        # rendezvous unblocks QEMU's write-open at boot).
+        # FIFO audio tap.  QEMU opens the write end of the FIFO at startup,
+        # which blocks until a reader also opens it (POSIX named-pipe
+        # rendezvous).  Open the read end here in O_NONBLOCK|O_RDONLY so
+        # QEMU's open() returns immediately.  We keep the fd alive for the
+        # session lifetime (stored in s.fifo_rd) so QEMU never gets ENXIO.
         try:
             if not os.path.exists(s.fifo):
                 os.mkfifo(s.fifo)
         except OSError:
             pass
+        try:
+            s.fifo_rd = os.open(s.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            s.fifo_rd = None
         s.qemu = subprocess.Popen([
             "qemu-system-aarch64",
             "-machine", "virt", "-cpu", "cortex-a72", "-m", "512M",
@@ -242,6 +250,11 @@ class Manager:
                     p.terminate()
                 except ProcessLookupError:
                     pass
+        if s.fifo_rd is not None:
+            try:
+                os.close(s.fifo_rd)
+            except OSError:
+                pass
         for path in (s.disk, s.fifo, s.qmp, s.serial):
             try:
                 os.remove(path)

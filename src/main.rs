@@ -14,6 +14,7 @@ extern crate alloc;
 mod blk;
 mod browser;
 mod clock;
+mod crypto;
 mod css;
 mod desktop;
 mod dtb;
@@ -93,6 +94,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     let kernel_mapper = milestone3(&fdt, dtb_ptr as usize);
     milestone4();
     scheduler::init(kernel_mapper.root());
+    crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
     milestone9();
     milestone10(&fdt);
     if milestone12(&fdt) {

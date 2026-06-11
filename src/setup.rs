@@ -161,7 +161,7 @@ fn render_static(screen: &Framebuffer) {
     screen.fill_rect(cx - 1, cy - 1, cw + 2, ch + 2, CARD_EDGE);
     screen.fill_rect(cx, cy, cw, ch, CARD);
     screen.draw_string_scaled(cx + 28, cy + 28, "Welcome to Veil OS", HEAD, 3);
-    screen.draw_string(cx + 30, cy + 70, "a from-scratch AArch64 operating system", LABEL, None);
+    screen.draw_string(cx + 30, cy + 70, "a bare-metal AArch64 operating system", LABEL, None);
     let fy = cy + 110;
     screen.draw_string(cx + 30, fy, "Your name", LABEL, None);
     let ty = cy + 180;

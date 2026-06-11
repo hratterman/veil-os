@@ -674,15 +674,30 @@ impl Wm {
         }
     }
 
-    /// Desktop icon hit test (vertical grid in the top-left corner).
+    /// Desktop icon hit test (two-column grid, matching compose()).
     fn icon_at(&self, px: isize, py: isize) -> Option<&'static str> {
-        if !(16..64).contains(&px) {
-            return None;
+        const ICON_W: isize = 48;
+        const ICON_SLOT: isize = 60;
+        const COL0_X: isize = 8;
+        const COL1_X: isize = 72;
+        let items = launchers();
+        let col0_count = ((items.len() + 1) / 2) as isize;
+        // Check column 0
+        if px >= COL0_X && px < COL0_X + ICON_W {
+            let row = (py - 8) / ICON_SLOT;
+            if row >= 0 && (py - 8) % ICON_SLOT < ICON_W {
+                let i = row as usize;
+                if i < col0_count as usize {
+                    return items.get(i).map(|(app, _)| *app);
+                }
+            }
         }
-        for (i, (app, _)) in launchers().into_iter().enumerate() {
-            let top = 16 + i as isize * 84;
-            if py >= top && py < top + 64 {
-                return Some(app);
+        // Check column 1
+        if px >= COL1_X && px < COL1_X + ICON_W {
+            let row = (py - 8) / ICON_SLOT;
+            if row >= 0 && (py - 8) % ICON_SLOT < ICON_W {
+                let i = col0_count as usize + row as usize;
+                return items.get(i).map(|(app, _)| *app);
             }
         }
         None
@@ -732,12 +747,21 @@ impl Wm {
             unsafe { Framebuffer::new(self.back.as_mut_ptr(), w, h, w * 4) };
         back.clear(DESKTOP_BG);
 
-        // Desktop icons (under the windows): top-left vertical grid.
-        for (i, (_, label)) in launchers().into_iter().enumerate() {
-            let top = 16 + i * 84;
-            back.fill_rect(16, top, 48, 48, ICON_COLORS[i]);
-            back.draw_char_scaled(32, top + 8, label.as_bytes()[0], 0xffff_ffff, 2);
-            back.draw_string(40usize.saturating_sub(label.len() * 4), top + 52, label, 0xffd0_dce8, None);
+        // Desktop icons: two-column grid so all apps fit without clipping.
+        // Col 0: x=8, Col 1: x=72. Each icon slot is 60px tall (48 icon + 12 label).
+        const ICON_W: usize = 48;
+        const ICON_SLOT: usize = 60;
+        const COL0_X: usize = 8;
+        const COL1_X: usize = 72;
+        let apps = launchers();
+        let col0_count = (apps.len() + 1) / 2;
+        for (i, (_, label)) in apps.iter().enumerate() {
+            let (col_x, row) = if i < col0_count { (COL0_X, i) } else { (COL1_X, i - col0_count) };
+            let top = 8 + row * ICON_SLOT;
+            back.fill_rect(col_x, top, ICON_W, ICON_W, ICON_COLORS[i]);
+            back.draw_char_scaled(col_x + 16, top + 8, label.as_bytes()[0], 0xffff_ffff, 2);
+            let lx = col_x + ICON_W / 2 - label.len() * 4;
+            back.draw_string(lx, top + 50, label, 0xffd0_dce8, None);
         }
 
         let top = self.windows.len().saturating_sub(1);

@@ -284,10 +284,13 @@ pub fn play(pcm: &[u8]) -> usize {
                 }
             }
             None => {
-                dev.mmio.irq_ack(); // force a vCPU exit (see ctrl_cmd)
-                scheduler::yield_now(); // let the UI task run between buffer polls
+                // irq_ack forces a TCG vCPU exit so QEMU's audio timer can
+                // run and mark buffers used. yield_now hands a scheduling
+                // slice to the desktop/clock tasks so the UI stays live.
+                dev.mmio.irq_ack();
+                scheduler::yield_now();
                 spins += 1;
-                assert!(spins < 4_000_000_000, "virtio-sound tx hung");
+                assert!(spins < 200_000_000, "virtio-sound tx hung");
             }
         }
     }

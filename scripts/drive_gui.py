@@ -211,8 +211,9 @@ def main():
     d.move(*PARK)
     img = d.dump("m7_raised")
     check("editor raised, title focused", img.at(200, 52) == T_FOCUS)
+    # M36: the editor content area is now a dark code-editor theme (#1e1e1e).
     check_px(img, "editor content now occludes clock (z-order swapped)",
-             300, 195, WHITE)
+             300, 195, (30, 30, 30))
 
     print("--- M8: launch paint, strokes, persistence, clear -----------")
     launch(d, "paint")        # paint clamps to (480, 322), content (482,346)

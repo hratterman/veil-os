@@ -88,11 +88,13 @@ fn openable(name: &str) -> bool {
     is_image(name)
         || name.ends_with(".GIF")
         || name.ends_with(".WAV")
-        || name.ends_with(".TXT")
-        || name.ends_with(".MJP")
         || name.ends_with(".MJP")
         || name.ends_with(".AVI")
         || name.ends_with(".WSM")
+        || name.ends_with(".MP3")
+        || [".TXT", ".RS", ".PY", ".JS", ".CSS", ".SH", ".MD", ".LOG", ".TOML", ".JSON"]
+            .iter()
+            .any(|e| name.ends_with(e))
 }
 
 pub fn render(win: &mut Window) {

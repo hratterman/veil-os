@@ -30,6 +30,8 @@ hdiutil detach "$DEV" >/dev/null
 
 MNT=$(hdiutil attach "$IMG" | grep -o '/Volumes/.*')
 printf 'Hello from the Veil filesystem! This file was written by macOS.\n' > "$MNT/README.TXT"
+# M36: a demo source file to show the editor's syntax highlighting.
+printf '// demo.rs - Veil OS\nfn main() {\n    let msg = "hello, world";\n    for i in 0..10 {\n        print(i, msg); // loop\n    }\n}\n' > "$MNT/DEMO.RS"
 # M19b: local timezone, integer UTC offset in hours (EDT = -4 in summer).
 printf -- '-4\n' > "$MNT/TZ.TXT"
 for bin in hello ls cat echo spin; do

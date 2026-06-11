@@ -1685,6 +1685,12 @@ pub fn back(win: &mut Window) -> bool {
     true
 }
 
+/// Reload the current page (F5).
+pub fn reload(win: &mut Window) {
+    let path = if let crate::wm::App::Browser(st) = &win.app { st.path.clone() } else { return };
+    navigate(win, &path, false);
+}
+
 pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     let path = resolve_href(path);
     let was_external = is_external(&path);

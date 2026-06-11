@@ -18,8 +18,10 @@ static INTERLACE_DONE: AtomicBool = AtomicBool::new(false);
 static PNG_FIX_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Largest image we will decode. Real-world photos run to tens of megapixels;
-/// a 16-bit RGBA pixel buffer for one would dwarf the kernel heap, so we cap
-/// the decoded dimensions and let the caller fall back to "cannot decode".
+/// even streaming, a multi-thousand-pixel image is a lot of scanlines to chew
+/// through on a kernel with no GPU, so we cap the source dimensions and show a
+/// "too large" message above this. Anything at or below the cap is decoded —
+/// downscaled on the fly if the full-resolution buffer wouldn't fit the heap.
 const MAX_DIM: usize = 2048;
 
 /// One-shot proof that a large image was handled without taking the OS down.
@@ -33,9 +35,24 @@ fn note_large_handled(w: usize, h: usize) {
 
 #[derive(Clone)]
 pub struct Image {
-    pub w: usize,
-    pub h: usize,
+    pub w: usize,        // pixel-buffer width (may be downscaled from the source)
+    pub h: usize,        // pixel-buffer height
+    pub full_w: usize,   // the source PNG's real width
+    pub full_h: usize,   // the source PNG's real height
     pub pixels: Vec<u32>,
+}
+
+/// Parse just the IHDR to learn a PNG's real dimensions without decoding it,
+/// so a viewer can show a helpful message ("2048x2048, too large") even when
+/// `decode` declines the image.
+pub fn probe(data: &[u8]) -> Option<(usize, usize)> {
+    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if data.len() < 24 || data[..8] != SIG || &data[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(data[16..20].try_into().ok()?) as usize;
+    let h = u32::from_be_bytes(data[20..24].try_into().ok()?) as usize;
+    Some((w, h))
 }
 
 // --- bit reader (LSB-first, per DEFLATE) -------------------------------------
@@ -135,25 +152,54 @@ const DEXT: [u8; 30] = [
     13, 13,
 ];
 
-fn inflate_codes(b: &mut Bits, out: &mut Vec<u8>, lit: &Huff, dist: &Huff) -> Option<()> {
+/// A 64 KiB sliding window over the decompressed stream. DEFLATE back-
+/// references reach at most 32768 bytes, so a 65536-byte ring (strictly larger,
+/// so the oldest readable byte never collides with the write slot) is all the
+/// history we must retain — every emitted byte is handed to the consumer and
+/// then forgotten. This is what lets us inflate a multi-megapixel image without
+/// ever materialising its full (tens-of-MiB) scanline buffer on the heap.
+const WIN: usize = 1 << 16;
+const WMASK: usize = WIN - 1;
+
+struct Window {
+    buf: Vec<u8>, // WIN bytes; logical byte i lives at buf[i & WMASK]
+    n: usize,     // total bytes emitted so far
+}
+
+impl Window {
+    #[inline]
+    fn emit(&mut self, byte: u8, out: &mut dyn FnMut(u8)) {
+        self.buf[self.n & WMASK] = byte;
+        self.n += 1;
+        out(byte);
+    }
+}
+
+fn inflate_codes(
+    b: &mut Bits,
+    w: &mut Window,
+    out: &mut dyn FnMut(u8),
+    lit: &Huff,
+    dist: &Huff,
+) -> Option<()> {
     loop {
         let sym = lit.decode(b)? as usize;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => w.emit(sym as u8, out),
             256 => return Some(()),
             257..=285 => {
-                let len =
-                    LBASE[sym - 257] as usize + b.bits(LEXT[sym - 257] as u32)? as usize;
+                let len = LBASE[sym - 257] as usize + b.bits(LEXT[sym - 257] as u32)? as usize;
                 let d = dist.decode(b)? as usize;
                 if d >= 30 {
                     return None;
                 }
                 let back = DBASE[d] as usize + b.bits(DEXT[d] as u32)? as usize;
-                if back > out.len() {
+                if back == 0 || back > w.n {
                     return None;
                 }
                 for _ in 0..len {
-                    out.push(out[out.len() - back]);
+                    let byte = w.buf[(w.n - back) & WMASK];
+                    w.emit(byte, out);
                 }
             }
             _ => return None,
@@ -161,13 +207,15 @@ fn inflate_codes(b: &mut Bits, out: &mut Vec<u8>, lit: &Huff, dist: &Huff) -> Op
     }
 }
 
-/// zlib stream -> raw bytes (adler32 trailer unchecked).
-pub fn inflate(src: &[u8]) -> Option<Vec<u8>> {
+/// Streaming inflate: decode a zlib stream and hand every output byte to `out`
+/// in order, keeping only the 64 KiB back-reference window — never the whole
+/// decompressed buffer. (adler32 trailer unchecked.)
+fn inflate_into(src: &[u8], out: &mut dyn FnMut(u8)) -> Option<()> {
     if src.len() < 2 || src[0] & 0x0f != 8 {
         return None;
     }
     let mut b = Bits { data: &src[2..], byte: 0, bit: 0 };
-    let mut out = Vec::new();
+    let mut w = Window { buf: vec![0u8; WIN], n: 0 };
     loop {
         let last = b.bits(1)?;
         match b.bits(2)? {
@@ -179,7 +227,8 @@ pub fn inflate(src: &[u8]) -> Option<Vec<u8>> {
                     return None;
                 }
                 for _ in 0..len {
-                    out.push(b.bits(8)? as u8);
+                    let byte = b.bits(8)? as u8;
+                    w.emit(byte, out);
                 }
             }
             1 => {
@@ -188,7 +237,7 @@ pub fn inflate(src: &[u8]) -> Option<Vec<u8>> {
                 ll[144..256].fill(9);
                 ll[256..280].fill(7);
                 ll[280..288].fill(8);
-                inflate_codes(&mut b, &mut out, &build(&ll), &build(&[5u8; 30]))?;
+                inflate_codes(&mut b, &mut w, out, &build(&ll), &build(&[5u8; 30]))?;
             }
             2 => {
                 let hlit = b.bits(5)? as usize + 257;
@@ -225,19 +274,23 @@ pub fn inflate(src: &[u8]) -> Option<Vec<u8>> {
                 if i > lens.len() {
                     return None;
                 }
-                inflate_codes(
-                    &mut b,
-                    &mut out,
-                    &build(&lens[..hlit]),
-                    &build(&lens[hlit..]),
-                )?;
+                inflate_codes(&mut b, &mut w, out, &build(&lens[..hlit]), &build(&lens[hlit..]))?;
             }
             _ => return None,
         }
         if last == 1 {
-            return Some(out);
+            return Some(());
         }
     }
+}
+
+/// zlib stream -> the whole decompressed buffer. Kept for the interlaced
+/// (Adam7) path, which needs random access into the full image; the common
+/// non-interlaced path streams instead (see `decode`).
+pub fn inflate(src: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    inflate_into(src, &mut |byte| out.push(byte))?;
+    Some(out)
 }
 
 // --- PNG ----------------------------------------------------------------------
@@ -331,6 +384,68 @@ fn unfilter_row(filt: u8, cur: &mut [u8], prev: &[u8], fbpp: usize) -> Option<()
     Some(())
 }
 
+/// Consumes the inflated stream one byte at a time (fed from `inflate_into`),
+/// reconstructs each full-resolution scanline in place, and samples it straight
+/// into a (possibly downscaled) output buffer with a 1/`f` nearest-neighbour
+/// step. Only the current and previous scanline plus the output ever live at
+/// once — the full image is never held, so a huge PNG costs `output + ~2 rows`,
+/// not `width * height * 4`.
+struct RowAsm<'a> {
+    stride: usize, // bytes per full-resolution filtered scanline
+    f: usize,      // integer downscale factor (1 = full resolution)
+    ow: usize,     // output width  = w / f
+    oh: usize,     // output height = h / f
+    h: usize,      // source height
+    color: u8,
+    depth: usize,
+    maxv: u32,
+    fbpp: usize,
+    plte: &'a [u32],
+    trns: &'a [u8],
+    line: Vec<u8>, // filter byte + bytes accumulated for the current scanline
+    prev: Vec<u8>, // previous unfiltered scanline
+    cur: Vec<u8>,  // scratch for the scanline being unfiltered
+    y: usize,      // next source row index
+    sampled: usize,// output rows written so far
+    out: Vec<u32>, // ow * oh pixels
+    err: bool,
+}
+
+impl RowAsm<'_> {
+    fn feed(&mut self, byte: u8) {
+        if self.err || self.y >= self.h {
+            return; // done (or broken); ignore any trailing bytes
+        }
+        self.line.push(byte);
+        if self.line.len() < self.stride + 1 {
+            return;
+        }
+        let filt = self.line[0];
+        self.cur.copy_from_slice(&self.line[1..]);
+        self.line.clear();
+        if unfilter_row(filt, &mut self.cur, &self.prev, self.fbpp).is_none() {
+            self.err = true;
+            return;
+        }
+        // This source row maps to an output row when y is a multiple of f.
+        if self.y % self.f == 0 {
+            let oy = self.y / self.f;
+            if oy < self.oh {
+                let base = oy * self.ow;
+                for ox in 0..self.ow {
+                    self.out[base + ox] = extract_pixel(
+                        &self.cur, ox * self.f, self.color, self.depth, self.maxv,
+                        self.plte, self.trns,
+                    );
+                }
+                self.sampled += 1;
+            }
+        }
+        core::mem::swap(&mut self.prev, &mut self.cur);
+        self.y += 1;
+    }
+}
+
 pub fn decode(data: &[u8]) -> Option<Image> {
     const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     if data.len() < 8 || data[..8] != SIG {
@@ -403,51 +518,83 @@ pub fn decode(data: &[u8]) -> Option<Image> {
     }
 
     let depth = depth as usize;
-    let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8)
+    let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8), full-width
+    let fbpp = (channels * depth / 8).max(1); // filter back-reference, in bytes
+    let maxv = ((1u32 << depth) - 1).max(1);
 
-    // Heap guard: decoding needs the inflated scanlines *and* a full-resolution
-    // XRGB pixel buffer live at the same time. A real-world photo can need tens
-    // of MiB; on the fixed kernel heap that used to OOM mid-decode and panic,
-    // taking the whole OS down. Estimate the peak and bail out cleanly if it
-    // won't fit with headroom — inflate grows its output by doubling, so the
-    // decompressed buffer can transiently occupy ~2x its final size.
-    let est_pixels = w.saturating_mul(h).saturating_mul(4);
-    let est_raw = h.saturating_mul(stride + 1);
-    let needed = est_pixels
-        .saturating_add(est_raw.saturating_mul(2))
-        .saturating_add(1 << 20); // 1 MiB headroom for the rest of the system
-    if needed > crate::heap::free_bytes() {
-        kprintln!(
-            "PNG: refusing {w}x{h} ({} KiB needed, {} KiB free)",
-            needed >> 10,
-            crate::heap::free_bytes() >> 10
-        );
+    if interlace == 0 {
+        // Streaming + downscale. The decoder used to OOM mid-decode (full
+        // inflated scanlines + a full XRGB pixel buffer at once) and panic,
+        // taking the whole OS down. Now we stream the scanlines (only ~2 rows
+        // resident) and pick the smallest integer downscale factor whose output
+        // buffer fits the free heap with headroom — f == 1 keeps full
+        // resolution, larger f shows the image smaller rather than refusing it.
+        const MARGIN: usize = 1 << 20; // headroom for the rest of the system
+        let work = WIN + 3 * (stride + 1); // window + line/prev/cur scanlines
+        let budget = crate::heap::free_bytes().saturating_sub(MARGIN + work);
+        let mut f = 1usize;
+        while (w / f).max(1) * (h / f).max(1) * 4 > budget {
+            f += 1;
+            if f > w && f > h {
+                kprintln!(
+                    "PNG: {w}x{h} won't fit even downscaled ({} KiB free)",
+                    crate::heap::free_bytes() >> 10
+                );
+                note_large_handled(w, h);
+                return None;
+            }
+        }
+        let ow = (w / f).max(1);
+        let oh = (h / f).max(1);
+
+        let mut asm = RowAsm {
+            stride,
+            f,
+            ow,
+            oh,
+            h,
+            color,
+            depth,
+            maxv,
+            fbpp,
+            plte: &plte,
+            trns: &trns,
+            line: Vec::with_capacity(stride + 1),
+            prev: vec![0u8; stride],
+            cur: vec![0u8; stride],
+            y: 0,
+            sampled: 0,
+            out: vec![0u32; ow * oh],
+            err: false,
+        };
+        inflate_into(&idat, &mut |byte| asm.feed(byte))?;
+        if asm.err || asm.sampled < oh {
+            return None; // bad filter byte or truncated stream
+        }
+        if f > 1 {
+            kprintln!("PNG: downscaled {w}x{h} -> {ow}x{oh} (1/{f}) to fit heap");
+        }
+        note_large_handled(w, h);
+        return Some(Image { w: ow, h: oh, full_w: w, full_h: h, pixels: asm.out });
+    }
+
+    // Interlaced (Adam7): rare, and it needs random access into the whole
+    // canvas, so it can't stream. Decode at full resolution only when the full
+    // buffer plus inflated scanlines fit; otherwise refuse gracefully.
+    let est = w
+        .saturating_mul(h)
+        .saturating_mul(4)
+        .saturating_add(h.saturating_mul(stride + 1).saturating_mul(2))
+        .saturating_add(1 << 20);
+    if est > crate::heap::free_bytes() {
+        kprintln!("PNG: refusing interlaced {w}x{h} (too large for heap)");
         note_large_handled(w, h);
         return None;
     }
-
     let raw = inflate(&idat)?;
     drop(idat); // free the compressed copy before the pixel buffer goes live
-    let fbpp = (channels * depth / 8).max(1); // filter back-reference, in bytes
-    let maxv = ((1u32 << depth) - 1).max(1);
     let mut pixels = vec![0u32; w * h];
-
-    if interlace == 0 {
-        if stride == 0 || raw.len() < h * (stride + 1) {
-            return None;
-        }
-        let mut prev = vec![0u8; stride];
-        for y in 0..h {
-            let base = y * (stride + 1);
-            let filt = *raw.get(base)?;
-            let mut cur = raw.get(base + 1..base + 1 + stride)?.to_vec();
-            unfilter_row(filt, &mut cur, &prev, fbpp)?;
-            for x in 0..w {
-                pixels[y * w + x] = extract_pixel(&cur, x, color, depth, maxv, &plte, &trns);
-            }
-            prev = cur;
-        }
-    } else {
+    {
         // Adam7: seven passes, each its own filtered sub-image, placed back
         // into the canvas at (x_start + px*x_step, y_start + py*y_step).
         // Standard Adam7 (x_start, y_start, x_step, y_step). NB: the brief's
@@ -490,5 +637,5 @@ pub fn decode(data: &[u8]) -> Option<Image> {
         }
     }
     note_large_handled(w, h);
-    Some(Image { w, h, pixels })
+    Some(Image { w, h, full_w: w, full_h: h, pixels })
 }

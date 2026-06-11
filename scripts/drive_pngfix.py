@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Regression for the large-PNG OOM crash.
+"""Regression for the large-PNG OOM crash + downscale-on-decode.
 
-A real-world-sized PNG (AAABIG.PNG, 1920x1080) is staged on the disk so it
-sorts first and the image viewer opens straight onto it. Before the fix this
-allocated tens of MiB on the 16 MiB kernel heap, OOM-panicked, and called
-semihosting::exit — QEMU vanished, noVNC dropped, "OS gone".
+Two oversized PNGs are staged on the disk. AAA2048.PNG (2048x2048) sorts first,
+so the viewer opens straight onto it. Before the fix that allocated tens of MiB
+on the 16 MiB kernel heap, OOM-panicked, and called semihosting::exit — QEMU
+vanished, "OS gone".
 
-After the fix png::decode() guards on the heap budget and refuses the image
-gracefully (the viewer shows "cannot decode"), emitting PNG_CRASH_FIXED. The
-OS stays alive: we then navigate to a normal PNG and confirm it still renders,
-and every QMP command (screendump, input) keeps working — proof QEMU never
-exited.
+After the fix png::decode() streams the scanlines (never holding the full
+image) and downscales the output to fit the heap, so the 2048x2048 image
+actually RENDERS (smaller). A genuinely over-cap image (ZZHUGE.PNG, 3000x2000)
+is declined with a friendly on-screen message. Throughout, the OS stays alive
+and every QMP command keeps working.
 """
 import sys
 
@@ -22,54 +22,69 @@ CONTENT_X = WIN_X + 2
 CONTENT_Y = WIN_Y + 2 + 22
 
 
-def nonblank(img):
+def palette(img):
     """Distinct colors sampled across the viewer content box."""
     seen = set()
-    for y in range(CONTENT_Y, CONTENT_Y + CH, 8):
-        for x in range(CONTENT_X, CONTENT_X + CW, 8):
+    for y in range(CONTENT_Y, CONTENT_Y + CH, 6):
+        for x in range(CONTENT_X, CONTENT_X + CW, 6):
             seen.add(img.at(x, y))
     return seen
+
+
+# Decoding a 2048x2048 image streams ~12 MB through the inflate closure in the
+# debug build under TCG, which takes a few seconds — keep timeouts generous.
+DECODE_T = 25
 
 
 def arrow(d, key, mark, needle, label):
     d.send([{"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": key}}}])
     d.send([{"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": key}}}])
-    check(label, d.wait_serial(needle, 5, mark))
+    check(label, d.wait_serial(needle, DECODE_T, mark))
 
 
 def main():
     d = Driver(sys.argv[1], sys.argv[2], sys.argv[3])
     check("VIEWER_OK on serial", "VIEWER_OK" in d.serial())
 
-    # Launch the viewer — it opens on AAABIG.PNG (first alphabetically), the
-    # giant image that used to take the OS down.
+    # Launch the viewer — it opens on AAA2048.PNG (2048x2048), the exact case
+    # that used to take the OS down.
     mark = len(d.serial())
     d.click(*VIEWER_BTN)
     check("viewer launched", d.wait_serial("WM: launch 'viewer'", 5, mark))
 
-    # The decoder must REFUSE it gracefully, not crash.
-    check("large PNG refused gracefully (not crashed)",
-          d.wait_serial("VIEWER: cannot decode AAABIG.PNG", 6, mark))
-    check("PNG_CRASH_FIXED emitted", d.wait_serial("PNG_CRASH_FIXED", 6, mark))
+    # The big image must DECODE (downscaled), not crash and not be refused.
+    check("2048x2048 decoded by downscaling (not crashed/refused)",
+          d.wait_serial("PNG: downscaled 2048x2048", DECODE_T, mark))
+    check("viewer reports the downscale",
+          d.wait_serial("VIEWER: showing AAA2048.PNG 2048x2048 (downscaled", DECODE_T, mark))
+    check("PNG_CRASH_FIXED emitted", d.wait_serial("PNG_CRASH_FIXED", DECODE_T, mark))
 
-    # OS is still alive: QMP screendump works and shows the viewer window.
+    # It actually rendered: a gradient fills the window with many colors.
     d.move(1000, 700)
-    img = d.dump("pngfix_big")
-    check("viewer window still rendering (QEMU alive)", len(nonblank(img)) >= 2,
-          f"{len(nonblank(img))} distinct colors")
+    img = d.dump("pngfix_2048")
+    check("big image rendered (gradient on screen)", len(palette(img)) >= 20,
+          f"{len(palette(img))} distinct colors")
 
-    # Navigate to a normal image and confirm full decode+render still works.
+    # A normal image still decodes+renders right after — OS fully alive.
     mark = len(d.serial())
     arrow(d, "right", mark, "VIEWER: showing CHECK.PNG", "right arrow -> CHECK.PNG decodes")
     d.move(1000, 700)
-    img2 = d.dump("pngfix_recover")
-    check("normal image renders after the big one", len(nonblank(img2)) >= 2,
-          f"{len(nonblank(img2))} distinct colors")
+    img2 = d.dump("pngfix_normal")
+    check("normal image renders after the big one", len(palette(img2)) >= 2,
+          f"{len(palette(img2))} distinct colors")
 
-    # And back, exercising the decoder once more — still no crash.
+    # Wrap left from CHECK.PNG... back to the big one, exercising decode again.
     mark = len(d.serial())
-    arrow(d, "left", mark, "VIEWER: cannot decode AAABIG.PNG",
-          "left arrow -> back to big image, still graceful")
+    arrow(d, "left", mark, "PNG: downscaled 2048x2048",
+          "left arrow -> back to big image, downscales again")
+
+    # Now reach the over-cap image (sorts last): from AAA2048 (idx 0), Left
+    # wraps to ZZHUGE.PNG. It must be declined gracefully with the real dims.
+    mark = len(d.serial())
+    arrow(d, "left", mark, "VIEWER: cannot decode ZZHUGE.PNG (3000x2000",
+          "over-cap image declined gracefully with dims")
+    d.move(1000, 700)
+    d.dump("pngfix_toolarge")  # the on-screen "too large" message
 
     check("kernel never panicked", "KERNEL PANIC" not in d.serial())
     d.quit()

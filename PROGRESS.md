@@ -492,3 +492,28 @@ it so the viewer opens onto it, drive via `drive_pngfix.py`): the image is
 refused gracefully, PNG_CRASH_FIXED fires, the OS stays alive (QMP screendump
 + navigation to a normal PNG still work), no KERNEL PANIC. M23 (viewer), M29
 (file manager) and M34-img (browser `<img>`) regressions all still green.
+
+### Follow-up — downscale-on-decode (2026-06-11)
+
+The first cut capped dimensions at 2048 and *refused* anything that wouldn't
+fit the heap. But a 2048x2048 image is exactly 16 MiB of pixels (= the whole
+heap), and the real hog is the full inflated scanline buffer — so even the
+nominal "max" case was refused, and users couldn't see their photos.
+
+Reworked `png::decode` to **stream**: `inflate` is now incremental
+(`inflate_into` emits each byte through a 64 KiB sliding window — never the
+whole decompressed image), and a `RowAsm` consumer unfilters each scanline in
+place and samples it straight into a **downscaled** output buffer (integer 1/f
+nearest-neighbour). `decode` picks the smallest f whose output fits the free
+heap with headroom — f=1 keeps full resolution, larger f shows the image
+smaller instead of refusing it. Peak memory is now `output + 64 KiB + ~2
+scanlines`, not `w*h*4 + raw`. Interlaced (Adam7) still uses the full-buffer
+`inflate()` (needs random canvas access) and is refused only if it won't fit.
+
+Also the btw.md UX ask: a declined image now shows filename + real dimensions
+(via new `png::probe`) + file size + a clear amber "Image too large for Veil -
+max 2048 x 2048 px" message, instead of a black "cannot decode" box.
+
+`scripts/pngfix_test.sh` now stages a 2048x2048 (must render, downscaled — it
+does: ~1/2, 5853 distinct colors on screen) and a 3000x2000 (must show the
+graceful message). M23/M29/M34-img/Adam7 regressions all still green.

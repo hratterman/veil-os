@@ -5,17 +5,29 @@
 //! current filename. Images smaller than the window are centred on a flat
 //! background; larger ones are shrunk to fit, aspect preserved.
 
+use crate::fb::Framebuffer;
 use crate::wm::Window;
 use crate::{fs, kprintln, png};
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 const BG: u32 = 0xff14_181c; // letterbox / background fill behind the image
 
+/// Why the current file can't be shown — drives the on-screen message so the
+/// user sees the filename, real dimensions and size instead of a black box.
+struct BadImg {
+    w: usize, // real PNG dimensions, 0 if the header couldn't be parsed
+    h: usize,
+    bytes: usize,    // file size on disk
+    too_large: bool, // exceeded the decoder's max dimensions
+}
+
 pub struct ViewerState {
     files: Vec<String>,      // sorted .PNG names on the disk
     idx: usize,              // current image
     img: Option<png::Image>, // decoded current image (None = undecodable)
+    bad: Option<BadImg>,     // set when the current file failed to decode
 }
 
 impl ViewerState {
@@ -27,7 +39,7 @@ impl ViewerState {
             .filter(|n| n.ends_with(".PNG")) // FAT 8.3 names are upper-case
             .collect();
         files.sort();
-        let mut st = ViewerState { files, idx: 0, img: None };
+        let mut st = ViewerState { files, idx: 0, img: None, bad: None };
         st.load();
         st
     }
@@ -43,19 +55,40 @@ impl ViewerState {
         st
     }
 
-    /// Decode the current file and log it (the proof greps these lines).
+    /// Decode the current file and log it (the proof greps these lines). On
+    /// failure, probe the header for the real dimensions so the viewer can show
+    /// a useful message rather than a black "cannot decode" box.
     fn load(&mut self) {
         self.img = None;
-        let Some(name) = self.files.get(self.idx) else {
+        self.bad = None;
+        let Some(name) = self.files.get(self.idx).cloned() else {
             kprintln!("VIEWER: no .PNG files on disk");
             return;
         };
-        match fs::read_file(name).and_then(|d| png::decode(&d)) {
+        let Some(data) = fs::read_file(&name) else {
+            kprintln!("VIEWER: cannot read {name}");
+            self.bad = Some(BadImg { w: 0, h: 0, bytes: 0, too_large: false });
+            return;
+        };
+        let bytes = data.len();
+        match png::decode(&data) {
             Some(im) => {
-                kprintln!("VIEWER: showing {name} {}x{}", im.w, im.h);
+                if im.w == im.full_w && im.h == im.full_h {
+                    kprintln!("VIEWER: showing {name} {}x{}", im.full_w, im.full_h);
+                } else {
+                    kprintln!(
+                        "VIEWER: showing {name} {}x{} (downscaled to {}x{})",
+                        im.full_w, im.full_h, im.w, im.h
+                    );
+                }
                 self.img = Some(im);
             }
-            None => kprintln!("VIEWER: cannot decode {name}"),
+            None => {
+                let (w, h) = png::probe(&data).unwrap_or((0, 0));
+                let too_large = w > 2048 || h > 2048;
+                kprintln!("VIEWER: cannot decode {name} ({w}x{h}, {bytes} bytes)");
+                self.bad = Some(BadImg { w, h, bytes, too_large });
+            }
         }
     }
 
@@ -104,8 +137,7 @@ pub fn render(win: &mut Window) {
     fb.clear(BG);
     let crate::wm::App::Viewer(st) = &win.app else { return };
     let Some(im) = &st.img else {
-        let msg = if st.files.is_empty() { "no .PNG files on disk" } else { "cannot decode image" };
-        fb.draw_string(8, 8, msg, 0xffd0_d8e0, None);
+        render_error(&fb, st);
         return;
     };
     if im.w == 0 || im.h == 0 {
@@ -132,5 +164,54 @@ pub fn render(win: &mut Window) {
                 fb.put_pixel(ox + dx, oy + dy, im.pixels[si]);
             }
         }
+    }
+}
+
+/// Friendly multi-line message for a file that couldn't be shown: filename,
+/// real dimensions, size, and the reason — in the viewer's retro style.
+fn render_error(fb: &Framebuffer, st: &ViewerState) {
+    const NAME_COL: u32 = 0xffd0_d8e0;
+    const DIM_COL: u32 = 0xff8a_94a0;
+    const WARN_COL: u32 = 0xffe0_b070;
+
+    if st.files.is_empty() {
+        fb.draw_string(12, 24, "No .PNG files on disk", NAME_COL, None);
+        return;
+    }
+
+    let mut y = 24usize;
+    fb.draw_string(12, y, &st.current_name(), NAME_COL, None);
+    y += 26;
+    if let Some(b) = &st.bad {
+        if b.w > 0 {
+            fb.draw_string(12, y, &format!("{} x {} px", b.w, b.h), DIM_COL, None);
+            y += 18;
+        }
+        if b.bytes > 0 {
+            fb.draw_string(12, y, &human_size(b.bytes), DIM_COL, None);
+            y += 18;
+        }
+        y += 8;
+        let msg = if b.too_large {
+            "Image too large for Veil - max 2048 x 2048 px"
+        } else {
+            "Could not decode this image"
+        };
+        fb.draw_string(12, y, msg, WARN_COL, None);
+    } else {
+        fb.draw_string(12, y, "Could not decode this image", WARN_COL, None);
+    }
+}
+
+/// Render a byte count as a compact human string (e.g. "3.8 MB", "92.3 KB").
+fn human_size(bytes: usize) -> String {
+    if bytes >= 1 << 20 {
+        let tenths = (bytes * 10) >> 20;
+        format!("{}.{} MB", tenths / 10, tenths % 10)
+    } else if bytes >= 1 << 10 {
+        let tenths = (bytes * 10) >> 10;
+        format!("{}.{} KB", tenths / 10, tenths % 10)
+    } else {
+        format!("{bytes} bytes")
     }
 }

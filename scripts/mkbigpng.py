@@ -22,13 +22,17 @@ def main():
     w = int(sys.argv[2]) if len(sys.argv) > 2 else 1920
     h = int(sys.argv[3]) if len(sys.argv) > 3 else 1080
 
+    # Smooth ramps in every channel: a real full-resolution gradient (lots of
+    # distinct colors to prove it rendered) that still compresses to a small
+    # file so it fits the 16 MB demo disk.
     raw = bytearray()
     for y in range(h):
         raw.append(0)  # filter: none
+        gy = (y * 255) // max(h - 1, 1)
         for x in range(w):
-            raw.append((x * 255) // max(w - 1, 1))   # R ramps across
-            raw.append((y * 255) // max(h - 1, 1))   # G ramps down
-            raw.append((x ^ y) & 0xFF)               # B textured
+            raw.append((x * 255) // max(w - 1, 1))            # R ramps across
+            raw.append(gy)                                    # G ramps down
+            raw.append(((x + y) * 255) // max(w + h - 2, 1))  # B diagonal
     idat = zlib.compress(bytes(raw), 6)
 
     png = b"\x89PNG\r\n\x1a\n"

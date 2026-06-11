@@ -74,6 +74,14 @@ impl FwCfg {
                     return Err(());
                 }
                 if ctl == 0 {
+                    // The device filled `buf` by DMA — invisible to the compiler,
+                    // which in release would otherwise assume the caller's buffer
+                    // is unchanged (e.g. the "QEMU" signature stayed [0;4], so
+                    // from_dtb returned None → no framebuffer / no fw_cfg flags).
+                    // The barrier makes the writes visible; black_box forces the
+                    // optimizer to treat the pointee as clobbered so reads reload.
+                    core::arch::asm!("dsb sy", options(nostack));
+                    core::hint::black_box(buf);
                     return Ok(());
                 }
             }

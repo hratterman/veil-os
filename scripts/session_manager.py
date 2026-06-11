@@ -57,7 +57,10 @@ def ws_binary_frame(payload):
     return head + payload
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KERNEL = os.path.join(ROOT, "target/aarch64-unknown-none/debug/veil")
+# Hosted visitor sessions boot the optimized RELEASE kernel: ~2 s to the
+# desktop (vs ~20 s debug) and the codecs decode an order of magnitude faster.
+# Build with `cargo build --release` (deploy step) before restarting this agent.
+KERNEL = os.path.join(ROOT, "target/aarch64-unknown-none/release/veil")
 NOVNC = os.path.expanduser("~/server/novnc")
 # websockify is not always on PATH (it's a pip --user install here); resolve
 # a concrete path so the per-session websockify actually launches.

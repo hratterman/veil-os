@@ -41,6 +41,7 @@ observed proof.
 | M30 | Pre-boot file upload (hosted demo) | PASSED 2026-06-10 | `scripts/m30_test.sh` (session_manager: POST /upload veiltest.png → POST /boot 302 → spawned QEMU; drive setup → Files lists VEILTEST.PNG (exact font pixels) → opens 320x240 in Viewer, UPLOAD_OK). `landing.html` upload page + selftest green |
 | M31 | Site expansion (9 pages) + GIF player | PASSED 2026-06-10 | `drive_m31_web.py` (9 cross-linked pages, nav bar, no 404s); `drive_m31_gif.py` (GIF_OK — `src/gif.rs` LZW decoder + `gifplayer.rs`; demo.gif + real 400x400 Wikipedia GIF both animate) |
 | M32 | Browser overhaul + Lisp REPL + Adam7 | PASSED 2026-06-11 | `scripts/m32_test.sh` per track: SCROLL_OK, HISTORY_OK, TABLE_OK, INTERNET_OK (real sites via host proxy); `drive_m32_lisp.py` LISP_OK; `drive_m32_interlace.py` INTERLACE_OK. All re-verified 2026-06-11 |
+| M33 | Browser audio + Lisp persistence/IO + icon drag + TLS 1.3 | PASSED 2026-06-11 | AUDIO_BROWSER_OK (`drive_audio_browser.py` headless Chrome + manager log), LISP_PERSIST_OK/LISP_IO_OK (`m33_lisp_test.sh`), DRAG_OK (`m33_icondrag_test.sh`, reboot-persisted), CRYPTO_OK + TLS_OK + HTTPS_OK (`m33_tls_test.sh` boot handshake to example.com; `drive_m33_https.py` browser direct TLS) |
 
 ## M19b notes (2026-06-10)
 
@@ -356,3 +357,51 @@ old alpha/beta/echo/static boot windows no longer exist.)
 - **M17 → frames underflow:** an empty reserved range `(0,0)` wrapped
   `end - 1` and marked all frames used. Fixed: skip empty, tolerate
   overlapping ranges.
+
+## M33 notes (2026-06-11)
+
+Five tracks, all serial-gated.
+
+- **Task 1 — browser audio actually plays.** The PCM WebSocket pipe already
+  delivered; `novnc_audio.js` never played. Three bugs: the ♪ button started
+  unmuted so the first click muted it; gesture-unlock relied on `window`
+  mousedown which noVNC's canvas `stopPropagation`s (context stayed suspended);
+  no scheduling lookahead. Rewrote around a single ♪ control (first click
+  enables inside the gesture handler; PCM scheduled 0.15 s ahead of
+  `currentTime`). Proof: `drive_audio_browser.py` loads the real client in
+  headless Chrome against a stub PCM WS — AudioContext reaches "running", 84 KB
+  decoded+scheduled, lookahead > 0; `session_manager.py` logs **AUDIO_BROWSER_OK**
+  once a browser client has received > 10 KB PCM.
+- **Task 2 — Lisp persistence.** Every `define` serializes the top-level env to
+  `LISP.TXT` (one `(define ...)`/line; atoms, quoted lists/symbols, lambdas as
+  `(lambda (args) body)` source; builtins skipped); restored on open (tolerant
+  of corrupt lines). Self-tests moved to a throwaway interp so they don't leak
+  into the saved env. **LISP_PERSIST_OK** (in-memory round-trip) +
+  `drive_m33_lisp_persist.py` (define → close window → reopen → restored).
+- **Task 3 — Lisp file I/O.** `read-file`/`write-file`/`list-files` over FAT16
+  (8.3 UPPERCASE, documented in `(help)`). **LISP_IO_OK** self-test +
+  `drive_m33_lisp_io.py` (write→#t, read→"world", missing→#f, list-files).
+- **Task 4 — desktop icon drag.** Hold ~200 ms to drag (tap still launches),
+  semi-transparent follow (`fb::blend_rect`), drop inserts at nearest slot,
+  order persisted to `ICONS.TXT` and restored on boot. **DRAG_OK** +
+  `m33_icondrag_test.sh` (boot 1 drags edit→clock slot; boot 2 logs the
+  reordered order — reboot persistence). `gui_test.sh` still green.
+- **Task 5 — TLS 1.3 from scratch.** `src/crypto/` (SHA-256/HMAC, HKDF,
+  ChaCha20-Poly1305, X25519) — all checked against RFC vectors at boot
+  (**CRYPTO_OK**; the vectors caught a `car25519` wrap bug, 37 vs 38·(c−1)).
+  `src/tls.rs` is a full TLS 1.3 client (TLS_CHACHA20_POLY1305_SHA256, X25519),
+  verifies the server Finished MAC (cert chain validation skipped by design).
+  Wired into `browser.rs`: `https://` fetches directly via `tls_connect`.
+
+**Internet mechanism — which path serves what:**
+- `https://` URLs → **direct from-scratch TLS 1.3** (no proxy). Verified live
+  against example.com:443 (Cloudflare 104.20.23.154): ServerHello parsed, server
+  Finished verified, HTTP 200 over the encrypted channel, page renders.
+- `http://` external URLs → host proxy `veil_proxy.py` (10.0.2.2:7779), which
+  also strips/【de-gzips】 pages to the browser's subset. TLS is the fallback's
+  fallback: if a direct `https://` handshake fails, the browser retries it
+  through the proxy.
+- local `/page.htm` → in-kernel HTTP server over loopback.
+
+**Serial tokens fired this milestone:** AUDIO_BROWSER_OK, LISP_PERSIST_OK,
+LISP_IO_OK, DRAG_OK, CRYPTO_OK, TLS_OK, HTTPS_OK.

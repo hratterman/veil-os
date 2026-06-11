@@ -25,12 +25,14 @@ mod fb;
 mod files;
 mod font;
 mod fonts_generated;
+mod freetype;
 mod frames;
 mod fs;
 mod fwcfg;
 mod gic;
 mod gif;
 mod gifplayer;
+mod glyph_cache;
 mod heap;
 mod html;
 mod http;
@@ -107,6 +109,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
     font::selftest(); // M34: prove the generated bitmap fonts loaded
     milestone35_jpeg(); // M35: prove the baseline JPEG decoder
+    milestone35_6_freetype(); // M35.6: FreeType2 vector text from source
     milestone35_wasm(); // M35: prove the WASM interpreter (+ JIT)
     milestone9();
     milestone10(&fdt);
@@ -674,6 +677,32 @@ fn milestone35_wasm() {
         kprintln!("WASM_JIT_FAST: JIT is {speed}x faster than the interpreter");
     }
     kprintln!("WASM_OK: parser + interpreter + AArch64 JIT (hello/compute/fib)");
+}
+
+/// M35.6: initialise FreeType (compiled from C source, heap-backed) and render
+/// a glyph to prove anti-aliased vector rendering works in the kernel.
+fn milestone35_6_freetype() {
+    if !freetype::init() {
+        kprintln!("FREETYPE_FAIL: init");
+        return;
+    }
+    match freetype::render_glyph(freetype::FontId::Ui, 'A', 32) {
+        Some(g) => {
+            let lit = g.data.iter().filter(|&&a| a > 32).count();
+            let partial = g.data.iter().filter(|&&a| a > 0 && a < 255).count();
+            kprintln!(
+                "FREETYPE: glyph 'A' 32px -> {}x{}, {} lit, {} anti-aliased px, adv {}",
+                g.width, g.rows, lit, partial, g.advance
+            );
+            // Anti-aliasing means many partial-coverage (grey) pixels, not just on/off.
+            if g.width > 0 && g.rows > 0 && lit > 20 && partial > 10 {
+                kprintln!("FREETYPE_AA_OK: smooth anti-aliased glyph rendered");
+            } else {
+                kprintln!("FREETYPE_FAIL: glyph not anti-aliased ({lit} lit, {partial} grey)");
+            }
+        }
+        None => kprintln!("FREETYPE_FAIL: render_glyph returned None"),
+    }
 }
 
 fn milestone4() {

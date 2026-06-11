@@ -158,16 +158,17 @@ fn render_static(screen: &Framebuffer) {
     let ch = 320usize;
     let cx = (w - cw) / 2;
     let cy = (h - ch) / 2;
+    use crate::freetype::FontId::{Ui, UiBold};
     screen.fill_round_rect(cx - 1, cy - 1, cw + 2, ch + 2, 12, CARD_EDGE);
     screen.fill_round_rect(cx, cy, cw, ch, 12, CARD);
-    screen.draw_bm_string(cx + 28, cy + 24, "Welcome to Veil OS", crate::font::ui_icon(), HEAD);
-    screen.draw_bm_string(cx + 30, cy + 64, "a bare-metal AArch64 operating system", crate::font::ui_small(), LABEL);
+    screen.draw_text(cx + 28, cy + 22, "Welcome to Veil OS", UiBold, 22, HEAD);
+    screen.draw_text(cx + 30, cy + 62, "a bare-metal AArch64 operating system", Ui, 15, LABEL);
     let fy = cy + 110;
-    screen.draw_bm_string(cx + 30, fy, "Your name", crate::font::ui_small(), LABEL);
+    screen.draw_text(cx + 30, fy, "Your name", Ui, 15, LABEL);
     let ty = cy + 180;
-    screen.draw_bm_string(cx + 30, ty, "Timezone  (left / right arrows)", crate::font::ui_small(), LABEL);
-    screen.draw_string(cx + 38, ty + 22, "<", ACCENT, None);
-    screen.draw_string(cx + cw - 48, ty + 22, ">", ACCENT, None);
+    screen.draw_text(cx + 30, ty, "Timezone  (left / right arrows)", Ui, 15, LABEL);
+    screen.draw_text(cx + 36, ty + 22, "<", Ui, 18, ACCENT);
+    screen.draw_text(cx + cw - 50, ty + 22, ">", Ui, 18, ACCENT);
 }
 
 /// Redraw only the dynamic fields (name input, timezone, button). No full clear.
@@ -178,29 +179,30 @@ fn render(screen: &Framebuffer, name: &str, half: i32, blink: bool) {
     let cx = (w - cw) / 2;
     let cy = (h - ch) / 2;
 
+    use crate::freetype::FontId::Ui;
     // Name field: rounded input with an accent border (focus ring).
     let fy = cy + 110;
-    screen.fill_round_rect(cx + 30, fy + 20, cw - 60, 30, 6, ACCENT);
-    screen.fill_round_rect(cx + 31, fy + 21, cw - 62, 28, 5, FIELD_BG);
-    let cursor = if blink { "_" } else { " " };
-    screen.draw_bm_string(cx + 38, fy + 24, &alloc::format!("{name}{cursor}"), crate::font::ui(), FIELD_TX);
+    screen.fill_round_rect(cx + 30, fy + 20, cw - 60, 32, 6, ACCENT);
+    screen.fill_round_rect(cx + 31, fy + 21, cw - 62, 30, 5, FIELD_BG);
+    let cursor = if blink { "|" } else { " " };
+    screen.draw_text(cx + 38, fy + 27, &alloc::format!("{name}{cursor}"), Ui, 16, FIELD_TX);
 
     // Timezone field.
     let ty = cy + 180;
-    screen.fill_round_rect(cx + 30, ty + 20, cw - 60, 30, 6, FIELD_BG);
-    screen.draw_string(cx + 38, ty + 22, "<", ACCENT, None);
-    screen.draw_string(cx + cw - 48, ty + 22, ">", ACCENT, None);
+    screen.fill_round_rect(cx + 30, ty + 20, cw - 60, 32, 6, FIELD_BG);
+    screen.draw_text(cx + 36, ty + 22, "<", Ui, 18, ACCENT);
+    screen.draw_text(cx + cw - 50, ty + 22, ">", Ui, 18, ACCENT);
     let lbl = tz_label(half);
-    let lw = crate::font::text_width(crate::font::ui(), &lbl);
-    screen.draw_bm_string(cx + cw / 2 - lw / 2, ty + 24, &lbl, crate::font::ui(), FIELD_TX);
+    let (lw, _) = screen.measure_text(&lbl, Ui, 18);
+    screen.draw_text(cx + cw / 2 - lw / 2, ty + 26, &lbl, Ui, 18, FIELD_TX);
 
     // Button: accent when a name is entered.
     let by = cy + ch - 56;
     let valid = !name.trim().is_empty();
     let bg = if valid { BTN_BG } else { 0xff2a_2a2a };
-    screen.fill_round_rect(cx + 30, by, cw - 60, 34, 8, bg);
+    screen.fill_round_rect(cx + 30, by, cw - 60, 36, 8, bg);
     let hint = if valid { "Press Enter to continue" } else { "Type a name to continue" };
-    let hw = crate::font::text_width(crate::font::ui(), hint);
+    let (hw, _) = screen.measure_text(hint, Ui, 15);
     let htx = if valid { BTN_TX } else { 0xff888888 };
-    screen.draw_bm_string(cx + cw / 2 - hw / 2, by + 7, hint, crate::font::ui(), htx);
+    screen.draw_text(cx + cw / 2 - hw / 2, by + 9, hint, Ui, 15, htx);
 }

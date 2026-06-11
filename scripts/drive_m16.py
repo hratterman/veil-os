@@ -17,7 +17,7 @@ screen space through the known window geometry.
 import re
 import sys
 
-from guilib import Driver, check, check_px, finish
+from guilib import Driver, check, check_px, finish, taskbar_xy
 
 # Window geometry (desktop.rs / wm.rs): browser at (510, 30), content
 # 480x620, BORDER=2, TITLE_H=22, browser URL bar TOPBAR=20.
@@ -82,7 +82,7 @@ def main():
     # UX overhaul: nothing opens at boot. Browser is taskbar idx 2 (NIC
     # present, so Chat is in the bar): x = 70 + 2*78 + 36 = 262, y bottom.
     mark = len(d.serial())
-    d.click(262, 768 - 20)
+    d.click(*taskbar_xy(d, "browser"))
     check("browser launched", d.wait_serial("WM: launch 'browser'", 5, mark))
     check("index rendered", d.wait_serial("BROWSER: rendered / -", timeout=40))
     log = d.serial()

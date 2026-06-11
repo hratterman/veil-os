@@ -27,10 +27,10 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Boot stack: 512 KiB above .bss, grows downward. */
+    /* Boot stack: 2 MiB above .bss, grows downward. */
     . = ALIGN(16);
     __stack_bottom = .;
-    . += 0x80000;
+    . += 0x200000;
     __stack_top = .;
 
     __kernel_end = .;

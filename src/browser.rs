@@ -29,7 +29,24 @@ use crate::wm::Window;
 use crate::{css, font, html, kprintln, net, png, scheduler, timer, tls};
 
 /// A selected bitmap font, or None to use the built-in 8x16 font.
-type Font = Option<&'static font::BitmapFont>;
+/// A resolved FreeType font: face id + pixel size. Text is rendered
+/// anti-aliased via `fb::draw_text` and measured via `glyph_cache::text_width`.
+#[derive(Clone, Copy)]
+pub struct Font {
+    pub id: crate::freetype::FontId,
+    pub px: u16,
+}
+
+/// Map the CSS-resolved typography to a FreeType face.
+fn pick_ftid(fam: font::Family, weight: u16, _italic: bool) -> crate::freetype::FontId {
+    use crate::freetype::FontId;
+    match fam {
+        font::Family::Mono => FontId::Mono,
+        font::Family::Cormorant | font::Family::Lora => FontId::Serif,
+        _ if weight >= 600 => FontId::UiBold,
+        _ => FontId::Ui,
+    }
+}
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -635,7 +652,7 @@ fn root_style() -> Style {
         font_fam: font::Family::Default,
         font_weight: 400,
         font_italic: false,
-        font: None,
+        font: Font { id: crate::freetype::FontId::Ui, px: 16 },
         flex_dir: FlexDir::Row,
         flex_wrap: false,
         justify: Justify::Start,
@@ -1033,8 +1050,11 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
     // Record this node so its descendants can match `ancestor key` selectors.
     s.anc = inherited.anc.clone();
     s.anc.push((Some(String::from(tag)), class.map(String::from)));
-    // Resolve the bitmap font from the (possibly inherited) typography + size.
-    s.font = font::pick(s.font_fam, s.font_weight, s.font_italic, (s.scale * 16) as u16);
+    // Resolve the FreeType face + pixel size from the (inherited) typography.
+    s.font = Font {
+        id: pick_ftid(s.font_fam, s.font_weight, s.font_italic),
+        px: ((s.scale * 16) as u16).max(9),
+    };
     s
 }
 
@@ -1054,19 +1074,14 @@ enum Frag {
     Br,
 }
 
-/// Pixel width of a text run in either the chosen bitmap font or the 8x16.
-fn text_w(s: &str, scale: usize, f: Font) -> isize {
-    match f {
-        Some(bm) => font::text_width(bm, s) as isize,
-        None => s.chars().count() as isize * 8 * scale as isize,
-    }
+/// Pixel advance width of a text run in its FreeType face.
+fn text_w(s: &str, _scale: usize, f: Font) -> isize {
+    crate::glyph_cache::text_width(s, f.id, f.px) as isize
 }
 
-fn text_h(scale: usize, f: Font) -> isize {
-    match f {
-        Some(bm) => bm.height as isize,
-        None => 16 * scale as isize,
-    }
+/// Line height for the run (FreeType px size, ~1.25x for leading).
+fn text_h(_scale: usize, f: Font) -> isize {
+    (f.px as isize * 5) / 4
 }
 
 fn frag_w(f: &Frag) -> isize {
@@ -1228,7 +1243,7 @@ fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> is
                     s: value.clone(),
                     color: 0xffe8e8e8,
                     scale: 1,
-                    font: None,
+                    font: Font { id: crate::freetype::FontId::Ui, px: 16 },
                 });
                 ctx.fields.push(InputField { x: bx, y: by, w: fw, h: fh, value, multiline, action: String::new() });
             }
@@ -1369,7 +1384,7 @@ fn layout_block(
             s: m,
             color: style.color,
             scale: 1,
-            font: None,
+            font: Font { id: crate::freetype::FontId::Ui, px: 16 },
         });
     }
 
@@ -1833,10 +1848,8 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
                     // Keep text legible against the page: the site's colors
                     // assume light section backgrounds we don't paint.
                     let color = readable(*color, page_bg);
-                    match font {
-                        Some(bm) => pfb.draw_bm_string((*x).max(0) as usize, *y as usize, s, bm, color),
-                        None => pfb.draw_string_scaled((*x).max(0) as usize, *y as usize, s, color, *scale),
-                    }
+                    let _ = scale;
+                    pfb.draw_text((*x).max(0) as usize, *y as usize, s, font.id, font.px, color);
                 }
             }
             &Item::Image { x, y, idx } => {

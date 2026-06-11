@@ -2,6 +2,7 @@
 //! lines (Bresenham), and a bitmap font blitter.
 
 use crate::font;
+use crate::freetype::{self, FontId, GlyphBitmap};
 
 #[derive(Clone, Copy)]
 pub struct Framebuffer {
@@ -28,6 +29,86 @@ impl Framebuffer {
         if x < self.width && y < self.height {
             unsafe { self.base.add(y * self.stride_px + x).write_volatile(color) };
         }
+    }
+
+    #[inline]
+    pub fn get_pixel(&self, x: usize, y: usize) -> u32 {
+        if x < self.width && y < self.height {
+            unsafe { self.base.add(y * self.stride_px + x).read_volatile() }
+        } else {
+            0
+        }
+    }
+
+    // --- M35.6 FreeType anti-aliased text -----------------------------------
+
+    /// Blit one FreeType glyph (8-bit alpha) at (gx, gy), alpha-blending each
+    /// pixel against the framebuffer: out = fg*a/255 + dst*(255-a)/255.
+    fn blit_glyph(&self, gx: i32, gy: i32, g: &GlyphBitmap, color: u32) {
+        let (cr, cg, cb) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+        for row in 0..g.rows as i32 {
+            let py = gy + row;
+            if py < 0 || py as usize >= self.height {
+                continue;
+            }
+            for col in 0..g.width as i32 {
+                let px = gx + col;
+                if px < 0 || px as usize >= self.width {
+                    continue;
+                }
+                let a = g.data[(row as u32 * g.width + col as u32) as usize] as u32;
+                if a == 0 {
+                    continue;
+                }
+                if a == 255 {
+                    self.put_pixel(px as usize, py as usize, 0xff00_0000 | color);
+                    continue;
+                }
+                let d = self.get_pixel(px as usize, py as usize);
+                let bl = |s: u32, dc: u32| (s * a + dc * (255 - a)) / 255;
+                let out = 0xff00_0000
+                    | bl(cr, (d >> 16) & 0xff) << 16
+                    | bl(cg, (d >> 8) & 0xff) << 8
+                    | bl(cb, d & 0xff);
+                self.put_pixel(px as usize, py as usize, out);
+            }
+        }
+    }
+
+    /// Draw `text` with FreeType at `size_px`, anti-aliased. `y` is the top of
+    /// the line. Returns the advance width. Falls back to the 8x16 bitmap font
+    /// before FreeType is initialised.
+    pub fn draw_text(&self, x: usize, y: usize, text: &str, font: FontId, size_px: u16, color: u32) -> usize {
+        if !freetype::ready() {
+            self.draw_string(x, y, text, color, None);
+            return text.chars().count() * 8;
+        }
+        let baseline = y as i32 + (size_px as i32 * 80) / 100; // ~ascender
+        let mut pen = x as i32;
+        for ch in text.chars() {
+            crate::glyph_cache::with_glyph(font, ch, size_px, |g| match g {
+                Some(g) => {
+                    self.blit_glyph(pen + g.left, baseline - g.top, g, color);
+                    pen += g.advance;
+                }
+                None => pen += (size_px / 3).max(2) as i32, // missing glyph / space
+            });
+        }
+        (pen - x as i32).max(0) as usize
+    }
+
+    /// Pixel width/height of `text` at `size_px` (for layout).
+    pub fn measure_text(&self, text: &str, font: FontId, size_px: u16) -> (usize, usize) {
+        if !freetype::ready() {
+            return (text.chars().count() * 8, 16);
+        }
+        let mut w = 0i32;
+        for ch in text.chars() {
+            crate::glyph_cache::with_glyph(font, ch, size_px, |g| {
+                w += g.map(|g| g.advance).unwrap_or((size_px / 3).max(2) as i32);
+            });
+        }
+        (w.max(0) as usize, size_px as usize)
     }
 
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: u32) {

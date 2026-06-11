@@ -10,8 +10,8 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    breakout, browser, clipboard, clock, files, font, fs, gifplayer, keymap, kprintln, net, netdev,
-    repl, scheduler, shell, snake, snd, timer, video, viewer, wasmapp,
+    breakout, browser, clipboard, clock, files, font, freetype::FontId, fs, gifplayer, keymap,
+    kprintln, net, netdev, repl, scheduler, shell, snake, snd, timer, video, viewer, wasmapp,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -119,28 +119,27 @@ fn icon_abbrev(app: &str) -> &'static str {
     }
 }
 
-/// Draw a Barlow-Condensed UI string; returns its pixel width.
-fn ui_text(fb: &Framebuffer, x: usize, y: usize, s: &str, font: &font::BitmapFont, color: u32) -> usize {
-    fb.draw_bm_string(x, y, s, font, color);
-    font::text_width(font, s)
+/// Draw an anti-aliased FreeType UI string; returns its pixel width.
+fn ui_text(fb: &Framebuffer, x: usize, y: usize, s: &str, font: FontId, size: u16, color: u32) -> usize {
+    fb.draw_text(x, y, s, font, size, color)
 }
 
-/// Draw a Barlow string centred on `cx`.
-fn ui_centered(fb: &Framebuffer, cx: usize, y: usize, s: &str, font: &font::BitmapFont, color: u32) {
-    let w = font::text_width(font, s);
-    fb.draw_bm_string(cx.saturating_sub(w / 2), y, s, font, color);
+/// Draw a FreeType string centred on `cx`.
+fn ui_centered(fb: &Framebuffer, cx: usize, y: usize, s: &str, font: FontId, size: u16, color: u32) {
+    let (w, _) = fb.measure_text(s, font, size);
+    fb.draw_text(cx.saturating_sub(w / 2), y, s, font, size, color);
 }
 
-/// Truncate `s` so it fits in `max_w` pixels in `font` (for narrow pills).
-fn fit_label(s: &str, max_w: usize, font: &font::BitmapFont) -> String {
-    if font::text_width(font, s) <= max_w {
+/// Truncate `s` so it fits in `max_w` pixels at (font, size) (for narrow pills).
+fn fit_label(fb: &Framebuffer, s: &str, max_w: usize, font: FontId, size: u16) -> String {
+    if fb.measure_text(s, font, size).0 <= max_w {
         return String::from(s);
     }
     let mut out = String::new();
     for ch in s.chars() {
         let mut trial = out.clone();
         trial.push(ch);
-        if font::text_width(font, &trial) > max_w {
+        if fb.measure_text(&trial, font, size).0 > max_w {
             break;
         }
         out = trial;
@@ -1306,9 +1305,9 @@ impl Wm {
             back.fill_round_rect(cx, cy, iw, iw, 8, icon_color(app));
             back.fill_round_rect(cx + 2, cy + 2, iw - 4, iw / 3, 6, blend(icon_color(app), 0xffffffff, 36));
             // Two-letter glyph, centred, in bold Barlow.
-            ui_centered(&back, cx + iw / 2, cy + 9, icon_abbrev(app), font::ui_icon(), 0xfff4f4f4);
+            ui_centered(&back, cx + iw / 2, cy + 7, icon_abbrev(app), FontId::UiBold, 19, 0xfff4f4f4);
             // Full app name below.
-            ui_centered(&back, cx + iw / 2, cy + iw + 1, icon_label(app), font::ui_small(), 0xffc8ccd4);
+            ui_centered(&back, cx + iw / 2, cy + iw + 1, icon_label(app), FontId::Ui, 12, 0xffc8ccd4);
         }
 
         let top = self.windows.len().saturating_sub(1);
@@ -1346,7 +1345,7 @@ impl Wm {
                     back.fill_rect(txu, (ty + TITLE_H - 1) as usize, win.cw, 1, ACCENT);
                 }
                 let tcol = if focused { 0xffe8e8e8 } else { 0xff666666 };
-                back.draw_bm_string(txu + 10, tyu + 2, &win.title, font::ui(), tcol);
+                back.draw_text(txu + 10, tyu + 3, &win.title, FontId::Ui, 13, tcol);
                 // Close button: a 5px-radius circle near the right edge.
                 let ccx = (tx + win.cw as isize - 12) as isize;
                 let ccy = ty + TITLE_H / 2;
@@ -1368,7 +1367,7 @@ impl Wm {
         let ty = h - TASKBAR_H;
         back.fill_rect(0, ty, w, TASKBAR_H, 0xff111111);
         back.fill_rect(0, ty, w, 1, 0xff262626); // hairline top edge
-        ui_text(&back, 12, ty + 7, "VEIL", font::ui_bold(), ACCENT);
+        ui_text(&back, 12, ty + 7, "VEIL", FontId::UiBold, 13, ACCENT);
         let layout = self.taskbar_layout();
         if !TASKBAR_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
             for (app, _, x, pw) in &layout {
@@ -1383,12 +1382,12 @@ impl Wm {
                 (0xff1e1e1e, 0xff8a8a8a)
             };
             back.fill_round_rect(*x, ty + 5, *pw, TASKBAR_H - 10, 7, pill);
-            ui_centered(&back, x + pw / 2, ty + 7, &fit_label(label, pw.saturating_sub(6), font::ui_small()), font::ui_small(), txt);
+            ui_centered(&back, x + pw / 2, ty + 8, &fit_label(&back, label, pw.saturating_sub(8), FontId::Ui, 12), FontId::Ui, 12, txt);
         }
         // Clock on the far right.
         let clk = clock_string();
-        let cw_px = font::text_width(font::ui_small(), &clk);
-        back.draw_bm_string(w - cw_px - 12, ty + 7, &clk, font::ui_small(), 0xffb0b0b0);
+        let (cw_px, _) = back.measure_text(&clk, FontId::Ui, 12);
+        back.draw_text(w - cw_px - 12, ty + 8, &clk, FontId::Ui, 12, 0xffb0b0b0);
 
         // The dragged icon floats semi-transparent under the cursor.
         if let Some(slot) = self.icon_drag {
@@ -1397,7 +1396,7 @@ impl Wm {
                 let fx = (self.mx - ICON_W / 2).max(0) as usize;
                 let fy = (self.my - ICON_W / 2).max(0) as usize;
                 back.blend_rect(fx, fy, iw, iw, icon_color(*app), 150);
-                ui_centered(&back, fx + iw / 2, fy + 9, icon_abbrev(app), font::ui_icon(), 0xfff4f4f4);
+                ui_centered(&back, fx + iw / 2, fy + 7, icon_abbrev(app), FontId::UiBold, 19, 0xfff4f4f4);
             }
         }
 
@@ -1526,8 +1525,8 @@ fn shell_raw_key(win: &mut Window, code: u16) -> bool {
 }
 
 fn render_shell(win: &mut Window) {
-    let mono = font::pick(font::Family::Mono, 400, false, 16);
-    let lh = mono.map(|f| f.height as usize + 2).unwrap_or(16);
+    const SH: u16 = 14; // JetBrains Mono px size
+    let lh = 17usize;
     let (input, visible) = {
         let App::Shell { input, lines, .. } = &win.app else { return };
         let rows = win.ch.saturating_sub(lh + 8) / lh;
@@ -1536,26 +1535,22 @@ fn render_shell(win: &mut Window) {
     };
     let fb = win.canvas_fb();
     fb.clear(0xff14_1414);
-    let chev = font::text_width(mono.unwrap_or(font::ui_small()), "> ");
+    let chev = fb.measure_text("> ", FontId::Mono, SH).0;
     let is_err = |s: &str| s.contains("not found") || s.contains("no such") || s.contains("failed") || s.contains(": error");
-    let draw = |fb: &Framebuffer, x: usize, y: usize, s: &str, c: u32| match mono {
-        Some(m) => fb.draw_bm_string(x, y, s, m, c),
-        None => fb.draw_string(x, y, s, c, None),
-    };
     let mut y = 6;
     for line in &visible {
         let text = line.trim_end_matches('\n');
         if let Some(cmd) = text.strip_prefix("> ") {
-            draw(&fb, 6, y, ">", ACCENT); // chevron prompt
-            draw(&fb, 6 + chev, y, cmd, 0xffff_ffff);
+            fb.draw_text(6, y, ">", FontId::Mono, SH, ACCENT); // chevron prompt
+            fb.draw_text(6 + chev, y, cmd, FontId::Mono, SH, 0xffff_ffff);
         } else {
-            draw(&fb, 6, y, text, if is_err(text) { 0xffe0_5555 } else { 0xffcc_cccc });
+            fb.draw_text(6, y, text, FontId::Mono, SH, if is_err(text) { 0xffe0_5555 } else { 0xffcc_cccc });
         }
         y += lh;
     }
     let py = win.ch.saturating_sub(lh + 2);
-    draw(&fb, 6, py, ">", ACCENT);
-    draw(&fb, 6 + chev, py, &format!("{input}_"), 0xffff_ffff);
+    fb.draw_text(6, py, ">", FontId::Mono, SH, ACCENT);
+    fb.draw_text(6 + chev, py, &format!("{input}_"), FontId::Mono, SH, 0xffff_ffff);
 }
 
 // --- paint app (M8) ---------------------------------------------------------

@@ -37,6 +37,14 @@ pub const KEY_C: u16 = 46;
 pub const KEY_V: u16 = 47;
 pub const BTN_LEFT: u16 = 0x110;
 pub const BTN_RIGHT: u16 = 0x111;
+pub const KEY_SYSRQ: u16 = 99; // Print Screen
+pub const KEY_W: u16 = 17;
+pub const KEY_T: u16 = 20;
+pub const KEY_F: u16 = 33;
+pub const KEY_N: u16 = 49;
+pub const KEY_F4: u16 = 62;
+pub const KEY_F5: u16 = 63;
+pub const KEY_F11: u16 = 87;
 
 pub const EV_SYN: u16 = 0;
 pub const EV_KEY: u16 = 1;

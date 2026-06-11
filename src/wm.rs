@@ -263,6 +263,39 @@ const HAND: [&[u8]; 13] = [
     b"..XXXX..",
 ];
 
+// --- Wallpaper (M36): decoded once, scaled to fill the desktop ---------------
+static mut WALLPAPER: Option<crate::png::Image> = None;
+static mut WALLPAPER_ON: bool = false;
+
+/// Toggle the wallpaper on/off, decoding WALLPAPER.PNG/JPG on first enable.
+fn set_wallpaper_next() {
+    unsafe {
+        let on = &mut *core::ptr::addr_of_mut!(WALLPAPER_ON);
+        *on = !*on;
+        if *on && (*core::ptr::addr_of!(WALLPAPER)).is_none() && crate::fs::mounted() {
+            for name in ["WALLPAPER.PNG", "WALLPAPER.JPG", "SUNSET.PNG", "PLASMA.PNG"] {
+                if let Some(data) = crate::fs::read_file(name) {
+                    if let Some(img) = crate::png::decode_any(&data) {
+                        kprintln!("WALLPAPER: loaded {name} {}x{}", img.w, img.h);
+                        *core::ptr::addr_of_mut!(WALLPAPER) = Some(img);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn wallpaper() -> Option<&'static crate::png::Image> {
+    unsafe {
+        if *core::ptr::addr_of!(WALLPAPER_ON) {
+            (*core::ptr::addr_of!(WALLPAPER)).as_ref()
+        } else {
+            None
+        }
+    }
+}
+
 /// Render the pointer at (mx, my) in the requested shape. White fill with a
 /// black outline so it reads on any background.
 fn draw_cursor(fb: &Framebuffer, mx: isize, my: isize, shape: CursorShape) {
@@ -511,6 +544,24 @@ pub struct Wm {
     icon_order: Vec<&'static str>,     // desktop icon display order
     icon_press: Option<(usize, u64)>,  // (order slot, press tick) — pending tap/hold
     icon_drag: Option<usize>,          // order slot currently being dragged
+    toasts: Vec<(String, u64)>,        // (message, expiry tick) bottom-right popups
+    shot_seq: u32,                     // screenshot file counter
+    menu: Option<ContextMenu>,         // open right-click menu
+    flash: u64,                        // screenshot flash effect expiry tick
+}
+
+/// A right-click context menu: items + screen anchor + the target it acts on.
+pub struct ContextMenu {
+    items: Vec<&'static str>,
+    x: isize,
+    y: isize,
+    target: MenuTarget,
+}
+
+#[derive(Clone)]
+enum MenuTarget {
+    Desktop,
+    Window(usize),
 }
 
 impl Wm {
@@ -538,7 +589,53 @@ impl Wm {
             icon_order: load_icon_order(),
             icon_press: None,
             icon_drag: None,
+            toasts: Vec::new(),
+            shot_seq: 0,
+            menu: None,
+            flash: 0,
         }
+    }
+
+    /// Show a transient toast in the bottom-right (auto-dismiss ~3s).
+    pub fn notify(&mut self, msg: &str) {
+        kprintln!("NOTIFY: {msg}");
+        let expiry = timer::ticks() + 150; // ~3s at 50Hz
+        self.toasts.push((String::from(msg), expiry));
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+        self.dirty = true;
+    }
+
+    /// Capture a screenshot (full screen or focused window) to SHOT_NN.PNG.
+    pub fn screenshot(&mut self, focused_only: bool) {
+        let (src, sw, sh, what): (&[u32], usize, usize, &str) =
+            if focused_only && !self.windows.is_empty() {
+                let win = self.windows.last().unwrap();
+                (&win.canvas, win.cw, win.ch, "window")
+            } else {
+                (&self.back, self.screen.width, self.screen.height, "screen")
+            };
+        // Downsample so the largest side is <= 512 — keeps the PNG heap-safe.
+        let factor = (sw.max(sh) / 512).max(1);
+        let (w, h) = (sw / factor, sh / factor);
+        let mut pixels = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                pixels.push(src[(y * factor) * sw + x * factor]);
+            }
+        }
+        let data = crate::png::encode(&pixels, w, h);
+        self.shot_seq += 1;
+        let name = format!("SHOT{:02}.PNG", self.shot_seq);
+        if crate::fs::mounted() && crate::fs::write_file(&name, &data).is_ok() {
+            kprintln!("SCREENSHOT_OK: {name} ({}x{} {} bytes, {what})", w, h, data.len());
+            self.notify(&format!("Screenshot saved: {name}"));
+        } else {
+            self.notify("Screenshot failed (no disk)");
+        }
+        self.flash = timer::ticks() + 6; // brief white flash
+        self.dirty = true;
     }
 
     /// Open `app`'s window at its default position, or raise it if it is
@@ -767,6 +864,7 @@ impl Wm {
                 keymap::BTN_RIGHT => {
                     self.pend_buttons = (self.pend_buttons & !2) | ((value != 0) as u32) << 1;
                 }
+                keymap::KEY_SYSRQ if value == 1 => self.screenshot(self.alt),
                 _ if value == 1 => self.on_key(code),
                 _ => {}
             },
@@ -1162,6 +1260,9 @@ impl Wm {
         if released & 1 != 0 {
             self.on_left_up();
         }
+        if pressed & 2 != 0 {
+            self.on_right_down();
+        }
     }
 
     fn hit_test(&self, px: isize, py: isize) -> Option<(usize, Hit)> {
@@ -1367,8 +1468,77 @@ impl Wm {
         CursorShape::Arrow
     }
 
+    fn on_right_down(&mut self) {
+        if self.menu.take().is_some() {
+            self.dirty = true;
+            return;
+        }
+        if self.my >= self.screen.height as isize - TASKBAR_H as isize {
+            return;
+        }
+        let (items, target): (Vec<&'static str>, MenuTarget) = match self.hit_test(self.mx, self.my) {
+            Some((idx, Hit::Title)) => {
+                let top = self.raise(idx);
+                (vec!["Minimize", "Maximize", "Close"], MenuTarget::Window(top))
+            }
+            Some((idx, Hit::Content(..))) => {
+                let top = self.raise(idx);
+                (vec!["Minimize", "Maximize", "Close"], MenuTarget::Window(top))
+            }
+            None => (
+                vec!["New File", "New Folder", "Screenshot", "Change Wallpaper", "Settings"],
+                MenuTarget::Desktop,
+            ),
+        };
+        let (mw, mh) = (168isize, items.len() as isize * 26 + 8);
+        let x = self.mx.min(self.screen.width as isize - mw - 2).max(0);
+        let y = self.my.min(self.screen.height as isize - mh - TASKBAR_H as isize - 2).max(0);
+        self.menu = Some(ContextMenu { items, x, y, target });
+        self.dirty = true;
+    }
+
+    /// Handle a left click while a menu is open. Returns true if absorbed.
+    fn menu_click(&mut self) -> bool {
+        let Some(menu) = self.menu.take() else { return false };
+        self.dirty = true;
+        let mw = 168isize;
+        let inside = self.mx >= menu.x && self.mx < menu.x + mw && self.my >= menu.y + 4;
+        let row = ((self.my - menu.y - 4) / 26) as usize;
+        if !inside || row >= menu.items.len() {
+            return true; // click outside an item just closes the menu
+        }
+        let item = menu.items[row];
+        match (&menu.target, item) {
+            (MenuTarget::Window(idx), "Minimize") => self.minimize(*idx),
+            (MenuTarget::Window(idx), "Maximize") => self.maximize_toggle(*idx),
+            (MenuTarget::Window(idx), "Close") => {
+                if *idx < self.windows.len() {
+                    let w = self.windows.remove(*idx);
+                    kprintln!("WM: closed '{}'", w.title);
+                }
+            }
+            (MenuTarget::Desktop, "Screenshot") => self.screenshot(false),
+            (MenuTarget::Desktop, "New File") => {
+                if crate::fs::mounted() && crate::fs::write_file("UNTITLED.TXT", b"").is_ok() {
+                    self.notify("Created UNTITLED.TXT");
+                }
+            }
+            (MenuTarget::Desktop, "New Folder") => self.notify("Folders: use the file manager"),
+            (MenuTarget::Desktop, "Change Wallpaper") => {
+                set_wallpaper_next();
+                self.notify("Wallpaper changed");
+            }
+            (MenuTarget::Desktop, "Settings") => self.launch("settings"),
+            _ => {}
+        }
+        true
+    }
+
     fn on_left_down(&mut self) {
         kprintln!("CLICK: left down @ ({}, {})", self.mx, self.my);
+        if self.menu_click() {
+            return;
+        }
         if self.my >= self.screen.height as isize - TASKBAR_H as isize {
             self.taskbar_click(self.mx);
             return;
@@ -1635,6 +1805,11 @@ impl Wm {
     /// wakeup. Marks the WM dirty only when a clock face actually redrew.
     pub fn clock_tick(&mut self) {
         let now = timer::ticks();
+        let before = self.toasts.len();
+        self.toasts.retain(|(_, exp)| now < *exp);
+        if self.toasts.len() != before {
+            self.dirty = true;
+        }
         for win in &mut self.windows {
             if matches!(win.app, App::Clock(_)) && clock::tick(win, now) {
                 self.dirty = true;
@@ -1664,16 +1839,28 @@ impl Wm {
         let back =
             unsafe { Framebuffer::new(self.back.as_mut_ptr(), w, h, w * 4) };
         back.clear(DESKTOP_BG);
-        // Subtle grid texture on the desktop background.
-        let mut gx = 0;
-        while gx < w {
-            back.fill_rect(gx, 0, 1, h, DESKTOP_GRID);
-            gx += 48;
-        }
-        let mut gy = 0;
-        while gy < h {
-            back.fill_rect(0, gy, w, 1, DESKTOP_GRID);
-            gy += 48;
+        if let Some(wp) = wallpaper() {
+            // Scale the decoded wallpaper to fill the desktop (nearest-neighbour).
+            for y in 0..h {
+                let sy = (y * wp.h / h).min(wp.h - 1);
+                for x in 0..w {
+                    let sx = (x * wp.w / w).min(wp.w - 1);
+                    back.put_pixel(x, y, wp.pixels[sy * wp.w + sx]);
+                }
+            }
+            let _ = DESKTOP_GRID;
+        } else {
+            // Subtle grid texture on the desktop background.
+            let mut gx = 0;
+            while gx < w {
+                back.fill_rect(gx, 0, 1, h, DESKTOP_GRID);
+                gx += 48;
+            }
+            let mut gy = 0;
+            while gy < h {
+                back.fill_rect(0, gy, w, 1, DESKTOP_GRID);
+                gy += 48;
+            }
         }
 
         // Desktop icons: two-column grid in the user-defined order. Each slot
@@ -1794,6 +1981,43 @@ impl Wm {
                 back.blend_rect(fx, fy, iw, iw, icon_color(*app), 150);
                 ui_centered(&back, fx + iw / 2, fy + 7, icon_abbrev(app), FontId::UiBold, 19, 0xfff4f4f4);
             }
+        }
+
+        // Right-click context menu.
+        if let Some(menu) = &self.menu {
+            let mw = 168usize;
+            let mh = menu.items.len() * 26 + 8;
+            let mx = (menu.x as usize).min(w.saturating_sub(mw + 2));
+            let my = (menu.y as usize).min(h.saturating_sub(mh + TASKBAR_H + 2));
+            back.blend_rect(mx + 3, my + 3, mw, mh, 0xff00_0000, 90);
+            back.fill_round_rect(mx, my, mw, mh, 8, 0xff24_2424);
+            back.fill_round_rect(mx, my, mw, mh, 8, 0xff24_2424);
+            for (i, item) in menu.items.iter().enumerate() {
+                let iy = my + 4 + i * 26;
+                let hover = self.my >= iy as isize && self.my < (iy + 26) as isize
+                    && self.mx >= mx as isize && self.mx < (mx + mw) as isize;
+                if hover {
+                    back.fill_round_rect(mx + 4, iy, mw - 8, 24, 5, ACCENT);
+                }
+                back.draw_text(mx + 14, iy + 4, item, FontId::Ui, 14, if hover { 0xff0d0d0d } else { 0xffe0e0e0 });
+            }
+        }
+
+        // Toast notifications, stacked in the bottom-right above the taskbar.
+        for (i, (msg, _)) in self.toasts.iter().rev().enumerate() {
+            let tw = (back.measure_text(msg, FontId::Ui, 14).0 + 28).min(w - 20);
+            let th = 34usize;
+            let tx = w - tw - 14;
+            let ty = h - TASKBAR_H - (i + 1) * (th + 8);
+            back.blend_rect(tx + 3, ty + 3, tw, th, 0xff00_0000, 90);
+            back.fill_round_rect(tx, ty, tw, th, 8, 0xff2b_2b2b);
+            back.fill_round_rect(tx, ty, 4, th, 2, ACCENT);
+            back.draw_text(tx + 14, ty + 8, msg, FontId::Ui, 14, 0xffe8e8e8);
+        }
+
+        // Screenshot flash.
+        if timer::ticks() < self.flash {
+            back.blend_rect(0, 0, w, h, 0xffff_ffff, 160);
         }
 
         // Cursor, always on top, shape depends on what is under it.

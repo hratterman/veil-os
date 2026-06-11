@@ -650,3 +650,74 @@ pub fn decode(data: &[u8]) -> Option<Image> {
     note_large_handled(w, h);
     Some(Image { w, h, full_w: w, full_h: h, pixels })
 }
+
+// --- PNG encoder (M36): XRGB8888 -> RGB PNG, stored-deflate (no compression) ---
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b): (u32, u32) = (1, 0);
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let crc = crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Encode an XRGB8888 framebuffer region as a valid RGB PNG (uncompressed
+/// deflate so we need no compressor). Large but openable anywhere.
+pub fn encode(pixels: &[u32], w: usize, h: usize) -> Vec<u8> {
+    // Raw image data: each scanline is a 0 filter byte + RGB triples.
+    let mut raw = Vec::with_capacity(h * (1 + w * 3));
+    for y in 0..h {
+        raw.push(0u8); // filter: none
+        for x in 0..w {
+            let px = pixels[y * w + x];
+            raw.push((px >> 16) as u8);
+            raw.push((px >> 8) as u8);
+            raw.push(px as u8);
+        }
+    }
+    // zlib stream: 2-byte header, stored deflate blocks, adler32.
+    let mut zlib = vec![0x78u8, 0x01];
+    let mut i = 0;
+    while i < raw.len() {
+        let n = (raw.len() - i).min(65535);
+        let final_block = i + n >= raw.len();
+        zlib.push(if final_block { 1 } else { 0 }); // BFINAL, BTYPE=00 (stored)
+        zlib.extend_from_slice(&(n as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(n as u16)).to_le_bytes());
+        zlib.extend_from_slice(&raw[i..i + n]);
+        i += n;
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut out = Vec::with_capacity(zlib.len() + 64);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, color type 2 (RGB)
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &zlib);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}

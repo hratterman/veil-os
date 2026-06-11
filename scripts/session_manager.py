@@ -316,6 +316,9 @@ class Manager:
             "-device", "virtio-net-device,netdev=net0",
             # M26: chat relay on the host, reachable via the slirp gateway.
             "-fw_cfg", "name=opt/veil.relay,string=10.0.2.2:7778",
+            # M37: skip the ~16 s codec regression self-tests on visitor boots
+            # (the MP3/H.264 decoders are still wired into the apps).
+            "-fw_cfg", "name=opt/veil.fastboot,string=1",
             # M28: wav backend writes PCM to the per-session FIFO tap.
             "-audiodev", f"wav,id=snd0,path={s.fifo}",
             "-device", "virtio-sound-device,audiodev=snd0",

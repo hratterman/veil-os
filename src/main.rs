@@ -115,8 +115,12 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     milestone35_jpeg(); // M35: prove the baseline JPEG decoder
     milestone35_6_freetype(); // M35.6: FreeType2 vector text from source
     milestone35_wasm(); // M35: prove the WASM interpreter (+ JIT)
-    milestone_mp3(); // M37: prove the from-scratch MP3 Layer III decoder
-    milestone_h264(); // M37: prove the from-scratch H.264 baseline decoder
+    // M37 codec self-tests are ~16 s in the debug build; skip them on hosted
+    // (fastboot) visitor boots — the decoders are still wired into the apps.
+    if !fastboot(&fdt) {
+        milestone_mp3(); // M37: prove the from-scratch MP3 Layer III decoder
+        milestone_h264(); // M37: prove the from-scratch H.264 baseline decoder
+    }
     milestone9();
     milestone10(&fdt);
     if milestone12(&fdt) {
@@ -222,6 +226,17 @@ fn read_mode(fdt: &dtb::Fdt) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = [0u8; 16];
     let n = fw.read_file(f, &mut buf).ok()?;
     Some(buf[..n].to_vec())
+}
+
+/// `opt/veil.fastboot` fw_cfg flag — set by the hosted session manager so
+/// visitor boots skip the heavy codec regression self-tests (the decoders are
+/// still wired in; the feature works, only the ~16 s boot proof is skipped).
+fn fastboot(fdt: &dtb::Fdt) -> bool {
+    (|| {
+        let fw = fwcfg::FwCfg::from_dtb(fdt)?;
+        fw.find_file("opt/veil.fastboot")
+    })()
+    .is_some()
 }
 
 /// M12: virtio-net up; emit a hand-crafted raw Ethernet frame (the host

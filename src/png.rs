@@ -9,8 +9,12 @@
 //! and palette). Alpha (from the alpha channel or tRNS) is composited onto
 //! the dark UI background. Output is XRGB8888 rows, ready to blit.
 
+use crate::kprintln;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static INTERLACE_DONE: AtomicBool = AtomicBool::new(false);
 
 pub struct Image {
     pub w: usize,
@@ -234,6 +238,83 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
+const BG: (u32, u32, u32) = (0x14, 0x18, 0x1c); // composite transparency here
+
+/// Read the s-th sample of an unfiltered scanline as an 8-bit-ish value: a
+/// whole byte at depth 8, the high byte at depth 16, or `depth` MSB-first
+/// bits below 8.
+fn read_sample(cur: &[u8], s: usize, depth: usize) -> u32 {
+    match depth {
+        16 => cur[s * 2] as u32,
+        8 => cur[s] as u32,
+        d => {
+            let bit = s * d;
+            (cur[bit / 8] as u32 >> (8 - d - (bit % 8))) & ((1 << d) - 1)
+        }
+    }
+}
+
+/// Map pixel `x` of an unfiltered scanline to an XRGB8888 value, compositing
+/// any alpha (channel or palette tRNS) onto the UI background.
+fn extract_pixel(
+    cur: &[u8],
+    x: usize,
+    color: u8,
+    depth: usize,
+    maxv: u32,
+    plte: &[u32],
+    trns: &[u8],
+) -> u32 {
+    let to8 = |v: u32| if depth >= 8 { v } else { v * 255 / maxv };
+    let comp = |r: u32, g: u32, b: u32, a: u32| -> u32 {
+        if a >= 255 {
+            0xff00_0000 | r << 16 | g << 8 | b
+        } else {
+            let bl = |s: u32, d: u32| (s * a + d * (255 - a)) / 255;
+            0xff00_0000 | bl(r, BG.0) << 16 | bl(g, BG.1) << 8 | bl(b, BG.2)
+        }
+    };
+    let rd = |s: usize| read_sample(cur, s, depth);
+    match color {
+        0 => {
+            let g = to8(rd(x));
+            comp(g, g, g, 255)
+        }
+        2 => comp(rd(x * 3), rd(x * 3 + 1), rd(x * 3 + 2), 255),
+        3 => {
+            let idx = rd(x) as usize;
+            let rgb = plte.get(idx).copied().unwrap_or(0xff00_0000);
+            let a = trns.get(idx).copied().unwrap_or(255) as u32;
+            comp((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff, a)
+        }
+        4 => {
+            let g = to8(rd(x * 2));
+            let a = to8(rd(x * 2 + 1));
+            comp(g, g, g, a)
+        }
+        _ => comp(rd(x * 4), rd(x * 4 + 1), rd(x * 4 + 2), rd(x * 4 + 3)),
+    }
+}
+
+/// Undo a scanline's PNG filter in place (`fbpp` = byte distance to the
+/// left pixel's same channel).
+fn unfilter_row(filt: u8, cur: &mut [u8], prev: &[u8], fbpp: usize) -> Option<()> {
+    for i in 0..cur.len() {
+        let a = if i >= fbpp { cur[i - fbpp] } else { 0 };
+        let up = prev[i];
+        let c = if i >= fbpp { prev[i - fbpp] } else { 0 };
+        cur[i] = cur[i].wrapping_add(match filt {
+            0 => 0,
+            1 => a,
+            2 => up,
+            3 => ((a as u16 + up as u16) / 2) as u8,
+            4 => paeth(a, up, c),
+            _ => return None,
+        });
+    }
+    Some(())
+}
+
 pub fn decode(data: &[u8]) -> Option<Image> {
     const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     if data.len() < 8 || data[..8] != SIG {
@@ -242,7 +323,7 @@ pub fn decode(data: &[u8]) -> Option<Image> {
     let be32 = |o: usize| -> Option<usize> {
         Some(u32::from_be_bytes(data.get(o..o + 4)?.try_into().ok()?) as usize)
     };
-    let (mut w, mut h, mut depth, mut color) = (0usize, 0usize, 0u8, 0u8);
+    let (mut w, mut h, mut depth, mut color, mut interlace) = (0usize, 0usize, 0u8, 0u8, 0u8);
     let mut idat = Vec::new();
     let mut plte: Vec<u32> = Vec::new(); // palette RGB (0xff_RRGGBB)
     let mut trns: Vec<u8> = Vec::new(); // per-index alpha (colour type 3)
@@ -261,8 +342,9 @@ pub fn decode(data: &[u8]) -> Option<Image> {
                 h = be32(pos + 12)?;
                 depth = body[8];
                 color = body[9];
-                if body[12] != 0 {
-                    return None; // interlacing not supported
+                interlace = body[12]; // 0 = none, 1 = Adam7
+                if interlace > 1 {
+                    return None;
                 }
                 seen_ihdr = true;
             }
@@ -300,87 +382,67 @@ pub fn decode(data: &[u8]) -> Option<Image> {
 
     let depth = depth as usize;
     let raw = inflate(&idat)?;
-    let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8)
     let fbpp = (channels * depth / 8).max(1); // filter back-reference, in bytes
-    if stride == 0 || raw.len() < h * (stride + 1) {
-        return None;
-    }
-
-    const BG: (u32, u32, u32) = (0x14, 0x18, 0x1c); // composite transparency here
     let maxv = ((1u32 << depth) - 1).max(1);
+    let mut pixels = vec![0u32; w * h];
 
-    // Read the s-th sample of a row as an 8-bit-ish value: a whole byte at
-    // depth 8, the high byte at depth 16, or `depth` MSB-first bits below 8.
-    let read = |cur: &[u8], s: usize| -> u32 {
-        match depth {
-            16 => cur[s * 2] as u32,
-            8 => cur[s] as u32,
-            d => {
-                let bit = s * d;
-                let byte = cur[bit / 8] as u32;
-                (byte >> (8 - d - (bit % 8))) & ((1 << d) - 1)
+    if interlace == 0 {
+        let stride = (w * channels * depth + 7) / 8; // ceil(bits / 8)
+        if stride == 0 || raw.len() < h * (stride + 1) {
+            return None;
+        }
+        let mut prev = vec![0u8; stride];
+        for y in 0..h {
+            let base = y * (stride + 1);
+            let filt = *raw.get(base)?;
+            let mut cur = raw.get(base + 1..base + 1 + stride)?.to_vec();
+            unfilter_row(filt, &mut cur, &prev, fbpp)?;
+            for x in 0..w {
+                pixels[y * w + x] = extract_pixel(&cur, x, color, depth, maxv, &plte, &trns);
+            }
+            prev = cur;
+        }
+    } else {
+        // Adam7: seven passes, each its own filtered sub-image, placed back
+        // into the canvas at (x_start + px*x_step, y_start + py*y_step).
+        // Standard Adam7 (x_start, y_start, x_step, y_step). NB: the brief's
+        // table swaps the steps for passes 3/5/7, which doesn't tile — this
+        // is the correct RFC 2083 schedule.
+        const PASSES: [(usize, usize, usize, usize); 7] = [
+            (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+            (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
+        ];
+        let mut off = 0usize;
+        for &(xs, ys, xstep, ystep) in &PASSES {
+            if xs >= w || ys >= h {
+                continue;
+            }
+            let pw = (w - xs).div_ceil(xstep);
+            let ph = (h - ys).div_ceil(ystep);
+            if pw == 0 || ph == 0 {
+                continue;
+            }
+            let stride = (pw * channels * depth + 7) / 8;
+            let mut prev = vec![0u8; stride];
+            for py in 0..ph {
+                if off + 1 + stride > raw.len() {
+                    return None;
+                }
+                let filt = raw[off];
+                let mut cur = raw[off + 1..off + 1 + stride].to_vec();
+                off += 1 + stride;
+                unfilter_row(filt, &mut cur, &prev, fbpp)?;
+                let cy = ys + py * ystep;
+                for px in 0..pw {
+                    let cx = xs + px * xstep;
+                    pixels[cy * w + cx] = extract_pixel(&cur, px, color, depth, maxv, &plte, &trns);
+                }
+                prev = cur;
             }
         }
-    };
-    // Scale a raw grayscale/alpha sample to 8 bits (identity at depth >= 8,
-    // where `read` already returns a byte).
-    let to8 = |v: u32| if depth >= 8 { v } else { v * 255 / maxv };
-    let comp = |r: u32, g: u32, b: u32, a: u32| -> u32 {
-        if a >= 255 {
-            0xff00_0000 | r << 16 | g << 8 | b
-        } else {
-            let bl = |s: u32, d: u32| (s * a + d * (255 - a)) / 255;
-            0xff00_0000 | bl(r, BG.0) << 16 | bl(g, BG.1) << 8 | bl(b, BG.2)
+        if !INTERLACE_DONE.swap(true, Ordering::Relaxed) {
+            kprintln!("INTERLACE_OK");
         }
-    };
-
-    let mut prev = vec![0u8; stride];
-    let mut pixels = Vec::with_capacity(w * h);
-    for y in 0..h {
-        let base = y * (stride + 1);
-        let filt = *raw.get(base)?;
-        let mut cur = raw.get(base + 1..base + 1 + stride)?.to_vec();
-        for i in 0..stride {
-            let a = if i >= fbpp { cur[i - fbpp] } else { 0 };
-            let up = prev[i];
-            let c = if i >= fbpp { prev[i - fbpp] } else { 0 };
-            cur[i] = cur[i].wrapping_add(match filt {
-                0 => 0,
-                1 => a,
-                2 => up,
-                3 => ((a as u16 + up as u16) / 2) as u8,
-                4 => paeth(a, up, c),
-                _ => return None,
-            });
-        }
-        for x in 0..w {
-            let px = match color {
-                0 => {
-                    let g = to8(read(&cur, x));
-                    comp(g, g, g, 255)
-                }
-                2 => comp(read(&cur, x * 3), read(&cur, x * 3 + 1), read(&cur, x * 3 + 2), 255),
-                3 => {
-                    let idx = read(&cur, x) as usize;
-                    let rgb = plte.get(idx).copied().unwrap_or(0xff00_0000);
-                    let a = trns.get(idx).copied().unwrap_or(255) as u32;
-                    comp((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff, a)
-                }
-                4 => {
-                    let g = to8(read(&cur, x * 2));
-                    let a = to8(read(&cur, x * 2 + 1));
-                    comp(g, g, g, a)
-                }
-                _ => comp(
-                    read(&cur, x * 4),
-                    read(&cur, x * 4 + 1),
-                    read(&cur, x * 4 + 2),
-                    read(&cur, x * 4 + 3),
-                ),
-            };
-            pixels.push(px);
-        }
-        prev = cur;
     }
     Some(Image { w, h, pixels })
 }

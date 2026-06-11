@@ -8,7 +8,7 @@
 //! 16-bit-stereo PCM as a ring of period buffers on the tx queue, refilling
 //! each as the device returns it, and STOP at the end.
 
-use crate::{dtb, frames, fs, kprintln, virtio};
+use crate::{dtb, frames, fs, gic, kprintln, virtio};
 use alloc::string::String;
 use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -59,7 +59,10 @@ pub fn init(fdt: &dtb::Fdt) -> bool {
         let base = dtb::cells(reg, 0, addr_cells) as usize;
         let mmio = virtio::Mmio { base };
         if mmio.probe() == Some(VIRTIO_ID_SOUND) {
-            init_device(mmio);
+            let irq = fdt.prop(n, "interrupts").expect("virtio-sound node without irq");
+            assert!(dtb::cells(irq, 0, 1) == 0, "virtio-sound irq is not an SPI?");
+            let intid = 32 + dtb::cells(irq, 4, 1) as u32;
+            init_device(mmio, intid);
             return true;
         }
         node = fdt.find_compatible_after("virtio,mmio", n);
@@ -67,7 +70,15 @@ pub fn init(fdt: &dtb::Fdt) -> bool {
     false
 }
 
-fn init_device(mmio: virtio::Mmio) {
+fn on_irq(_intid: u32) {
+    // ACK the device-level interrupt so the used ring is visible.
+    // The handler returning causes maybe_preempt() -> yield to the audio task.
+    if let Some(dev) = snd() {
+        dev.mmio.irq_ack();
+    }
+}
+
+fn init_device(mmio: virtio::Mmio, intid: u32) {
     mmio.init(0).expect("virtio-sound feature negotiation failed");
 
     // Rings: control(0), event(1), tx(2), rx(3). We only drive control + tx,
@@ -89,7 +100,10 @@ fn init_device(mmio: virtio::Mmio) {
     let data = frames::alloc_contiguous(NUM_BUFS * PERIOD / frames::FRAME_SIZE)
         .expect("snd pcm buffers");
 
-    kprintln!("SND: virtio-sound at {:#x}, output stream {STREAM_ID}", mmio.base);
+    kprintln!("SND: virtio-sound at {:#x}, INTID {intid}, output stream {STREAM_ID}", mmio.base);
+    gic::register_handler(intid, on_irq);
+    gic::set_edge(intid);
+    gic::enable(intid);
     unsafe {
         *core::ptr::addr_of_mut!(SND) =
             Some(Snd { mmio, ctrl, tx, ctrl_buf, xfer, status, data });

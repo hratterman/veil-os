@@ -10,8 +10,8 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    breakout, browser, clipboard, clock, files, fs, gifplayer, keymap, kprintln, net, netdev, repl,
-    scheduler, shell, snake, snd, timer, video, viewer, wasmapp,
+    breakout, browser, clipboard, clock, files, font, fs, gifplayer, keymap, kprintln, net, netdev,
+    repl, scheduler, shell, snake, snd, timer, video, viewer, wasmapp,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -22,7 +22,7 @@ pub const BORDER: isize = 2;
 pub const TITLE_H: isize = 22;
 /// Bottom launcher bar (UX overhaul): always composited on top; windows
 /// are clamped so their frames stay above it.
-pub const TASKBAR_H: usize = 40;
+pub const TASKBAR_H: usize = 32;
 const CLOSE_W: isize = 18; // rightmost title-bar pixels = close hit zone
 
 // Desktop icon grid (shared by compose(), hit-testing, and drag drop-targets).
@@ -64,9 +64,22 @@ const LAUNCHERS: [(&str, &str); 13] = [
     ("snake", "Snake"),
     ("breakout", "Brick"),
 ];
+// Per-app icon colours (modern, muted): browser blue, shell green, files amber,
+// lisp purple, games teal/orange, etc. Indexed by LAUNCHERS order.
 const ICON_COLORS: [u32; 13] = [
-    0xff50_88c0, 0xffc0_8850, 0xff58_a878, 0xffb0_5878, 0xff60_6878, 0xff90_70b0, 0xff40_9088,
-    0xffc0_6090, 0xff58_78b0, 0xffd0_7048, 0xff60_30a0, 0xff4a_a06a, 0xffd0_7a4a,
+    0xff4a62a0, // edit  - slate blue
+    0xff3f99b0, // clock - cyan
+    0xff5b8af0, // browser - blue
+    0xffc85a9a, // paint - pink
+    0xff4f9e6a, // shell - green
+    0xff4aa8a0, // chat - teal
+    0xff7a6ad0, // viewer - indigo
+    0xffd88a44, // audio - orange
+    0xffd6a844, // files - amber
+    0xffd05a4a, // gif - red
+    0xff9a6ad6, // lisp - purple
+    0xff45a87a, // snake - emerald
+    0xffe07a44, // breakout - orange
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -84,6 +97,53 @@ fn launcher_name(name: &str) -> Option<&'static str> {
 
 fn icon_label(app: &str) -> &'static str {
     LAUNCHERS.iter().find(|(a, _)| *a == app).map(|(_, l)| *l).unwrap_or("?")
+}
+
+/// Two-letter glyph for a desktop icon.
+fn icon_abbrev(app: &str) -> &'static str {
+    match app {
+        "edit" => "Ed",
+        "clock" => "Cl",
+        "browser" => "Br",
+        "paint" => "Pt",
+        "shell" => "Sh",
+        "chat" => "Ch",
+        "viewer" => "Vw",
+        "audio" => "Au",
+        "files" => "Fl",
+        "gif" => "Gf",
+        "lisp" => "Li",
+        "snake" => "Sn",
+        "breakout" => "Bk",
+        _ => "Ap",
+    }
+}
+
+/// Draw a Barlow-Condensed UI string; returns its pixel width.
+fn ui_text(fb: &Framebuffer, x: usize, y: usize, s: &str, font: &font::BitmapFont, color: u32) -> usize {
+    fb.draw_bm_string(x, y, s, font, color);
+    font::text_width(font, s)
+}
+
+/// Draw a Barlow string centred on `cx`.
+fn ui_centered(fb: &Framebuffer, cx: usize, y: usize, s: &str, font: &font::BitmapFont, color: u32) {
+    let w = font::text_width(font, s);
+    fb.draw_bm_string(cx.saturating_sub(w / 2), y, s, font, color);
+}
+
+/// Blend colour `a` toward `b` by `t`/255.
+fn blend(a: u32, b: u32, t: u32) -> u32 {
+    let ch = |sh: u32| {
+        let (x, y) = ((a >> sh) & 0xff, (b >> sh) & 0xff);
+        (x * (255 - t) + y * t) / 255
+    };
+    0xff00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0)
+}
+
+/// Taskbar clock — local HH:MM (or uptime before NTP sync).
+fn clock_string() -> String {
+    let secs = timer::wall_ticks50().map(|t| t / 50).unwrap_or_else(timer::uptime_secs);
+    format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
 }
 
 /// An app keeps its colour when reordered (colour follows the app, not the
@@ -1200,11 +1260,13 @@ impl Wm {
             }
             let (cx, cy) = icon_slot_xy(i, col0_count);
             let (cx, cy) = (cx as usize, cy as usize);
-            let label = icon_label(app);
-            back.fill_rect(cx, cy, iw, iw, icon_color(app));
-            back.draw_char_scaled(cx + 16, cy + 8, label.as_bytes()[0], 0xffff_ffff, 2);
-            let lx = cx + iw / 2 - label.len() * 4;
-            back.draw_string(lx, cy + 50, label, 0xffd0_dce8, None);
+            // Rounded-rect tile in the app's colour, with a subtle inner sheen.
+            back.fill_round_rect(cx, cy, iw, iw, 8, icon_color(app));
+            back.fill_round_rect(cx + 2, cy + 2, iw - 4, iw / 3, 6, blend(icon_color(app), 0xffffffff, 36));
+            // Two-letter glyph, centred, in bold Barlow.
+            ui_centered(&back, cx + iw / 2, cy + 9, icon_abbrev(app), font::ui_icon(), 0xfff4f4f4);
+            // Full app name below.
+            ui_centered(&back, cx + iw / 2, cy + iw + 1, icon_label(app), font::ui_small(), 0xffc8ccd4);
         }
 
         let top = self.windows.len().saturating_sub(1);
@@ -1231,46 +1293,56 @@ impl Wm {
                     back.fill_rect(fx, fy, fw as usize, fh as usize, if focused { FRAME_FOCUSED } else { FRAME_COLOR });
                 }
             }
-            // Title bar + caption.
+            // Title bar: a touch lighter than the body, Barlow title, a circular
+            // close button, and an accent underline on the focused window.
             let tx = win.x + BORDER;
             let ty = win.y + BORDER;
             if tx >= 0 && ty >= 0 {
-                back.fill_rect(
-                    tx as usize,
-                    ty as usize,
-                    win.cw,
-                    TITLE_H as usize,
-                    if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED },
-                );
-                // A thin accent underline marks the focused window.
+                let (txu, tyu) = (tx as usize, ty as usize);
+                back.fill_rect(txu, tyu, win.cw, TITLE_H as usize, if focused { 0xff222222 } else { 0xff181818 });
                 if focused {
-                    back.fill_rect(tx as usize, (ty + TITLE_H - 1) as usize, win.cw, 1, ACCENT);
+                    back.fill_rect(txu, (ty + TITLE_H - 1) as usize, win.cw, 1, ACCENT);
                 }
-                let tcol = if focused { TITLE_TEXT } else { MUTED };
-                back.draw_string(tx as usize + 6, ty as usize + 3, &win.title, tcol, None);
-                // Close button: the rightmost CLOSE_W px of the title bar.
-                let close_col = if focused { 0xffd0_5a4a } else { MUTED };
-                back.draw_string((tx + win.cw as isize - CLOSE_W) as usize + 5, ty as usize + 3, "x", close_col, None);
+                let tcol = if focused { 0xffe8e8e8 } else { 0xff666666 };
+                back.draw_bm_string(txu + 10, tyu + 2, &win.title, font::ui(), tcol);
+                // Close button: a 5px-radius circle near the right edge.
+                let ccx = (tx + win.cw as isize - 12) as isize;
+                let ccy = ty + TITLE_H / 2;
+                let close_col = if focused { 0xffe05555 } else { 0xff555555 };
+                back.fill_circle(ccx, ccy, 5, close_col);
             }
             // Content.
             back.blit(win.x + BORDER, win.y + BORDER + TITLE_H, &win.canvas, win.cw, win.ch);
+            // Round the outer corners of the whole window (mask to desktop bg).
+            if win.x >= 0 && win.y >= 0 {
+                let fw = win.frame_w() as usize;
+                let fh = win.frame_h() as usize;
+                back.round_corners(win.x as usize, win.y as usize, fw, fh, 4, DESKTOP_BG);
+            }
         }
 
-        // Taskbar: always-on-top launcher strip across the bottom.
+        // Taskbar: a slim dark strip with pill launchers, a wordmark, a clock.
         let ty = h - TASKBAR_H;
-        back.fill_rect(0, ty, w, TASKBAR_H, TASKBAR_BG);
-        back.draw_string(8, ty + 12, "VEIL", 0xff80_b0e0, None);
+        back.fill_rect(0, ty, w, TASKBAR_H, 0xff111111);
+        back.fill_rect(0, ty, w, 1, 0xff262626); // hairline top edge
+        ui_text(&back, 12, ty + 7, "VEIL", font::ui_bold(), ACCENT);
         let mut bx = 70usize;
         for (app, label) in launchers() {
+            // Keep the 70/+78 layout (hit-test compatible); draw a pill inside it.
             let open = self.windows.iter().any(|w| w.title == app);
-            back.fill_rect(bx, ty + 6, 72, 28, if open { TASKBAR_BTN_OPEN } else { TASKBAR_BTN });
-            back.draw_string(bx + (72 - label.len() * 8) / 2, ty + 12, label, TASKBAR_TEXT, None);
+            let (pill, txt) = if open {
+                (blend(0xff111111, ACCENT, 70), ACCENT)
+            } else {
+                (0xff1e1e1e, 0xff8a8a8a)
+            };
+            back.fill_round_rect(bx, ty + 5, 72, TASKBAR_H - 10, 7, pill);
+            ui_centered(&back, bx + 36, ty + 7, label, font::ui_small(), txt);
             bx += 78;
         }
-        // Status text sits just past the last launcher button (its x scales
-        // with the number of launchers so they never overlap).
-        let sx = 70 + launchers().len() * 78 + 16;
-        back.draw_string(sx, ty + 12, "Veil OS", 0xff60_7888, None);
+        // Clock on the far right.
+        let clk = clock_string();
+        let cw_px = font::text_width(font::ui_small(), &clk);
+        back.draw_bm_string(w - cw_px - 14, ty + 7, &clk, font::ui_small(), 0xffb0b0b0);
 
         // The dragged icon floats semi-transparent under the cursor.
         if let Some(slot) = self.icon_drag {
@@ -1278,8 +1350,8 @@ impl Wm {
                 let iw = ICON_W as usize;
                 let fx = (self.mx - ICON_W / 2).max(0) as usize;
                 let fy = (self.my - ICON_W / 2).max(0) as usize;
-                back.blend_rect(fx, fy, iw, iw, icon_color(app), 150);
-                back.draw_char_scaled(fx + 16, fy + 8, icon_label(app).as_bytes()[0], 0xffff_ffff, 2);
+                back.blend_rect(fx, fy, iw, iw, icon_color(*app), 150);
+                ui_centered(&back, fx + iw / 2, fy + 9, icon_abbrev(app), font::ui_icon(), 0xfff4f4f4);
             }
         }
 
@@ -1408,19 +1480,36 @@ fn shell_raw_key(win: &mut Window, code: u16) -> bool {
 }
 
 fn render_shell(win: &mut Window) {
+    let mono = font::pick(font::Family::Mono, 400, false, 16);
+    let lh = mono.map(|f| f.height as usize + 2).unwrap_or(16);
     let (input, visible) = {
         let App::Shell { input, lines, .. } = &win.app else { return };
-        let rows = (win.ch - 28) / 16;
+        let rows = win.ch.saturating_sub(lh + 8) / lh;
         let skip = lines.len().saturating_sub(rows);
         (input.clone(), lines[skip..].to_vec())
     };
     let fb = win.canvas_fb();
-    fb.clear(SHELL_BG);
-    for (i, line) in visible.iter().enumerate() {
-        fb.draw_string(6, 4 + 16 * i, line.trim_end_matches('\n'), SHELL_TEXT, None);
+    fb.clear(0xff14_1414);
+    let chev = font::text_width(mono.unwrap_or(font::ui_small()), "> ");
+    let is_err = |s: &str| s.contains("not found") || s.contains("no such") || s.contains("failed") || s.contains(": error");
+    let draw = |fb: &Framebuffer, x: usize, y: usize, s: &str, c: u32| match mono {
+        Some(m) => fb.draw_bm_string(x, y, s, m, c),
+        None => fb.draw_string(x, y, s, c, None),
+    };
+    let mut y = 6;
+    for line in &visible {
+        let text = line.trim_end_matches('\n');
+        if let Some(cmd) = text.strip_prefix("> ") {
+            draw(&fb, 6, y, ">", ACCENT); // chevron prompt
+            draw(&fb, 6 + chev, y, cmd, 0xffff_ffff);
+        } else {
+            draw(&fb, 6, y, text, if is_err(text) { 0xffe0_5555 } else { 0xffcc_cccc });
+        }
+        y += lh;
     }
-    let prompt = format!("> {input}_");
-    fb.draw_string(6, win.ch - 20, &prompt, SHELL_PROMPT, None);
+    let py = win.ch.saturating_sub(lh + 2);
+    draw(&fb, 6, py, ">", ACCENT);
+    draw(&fb, 6 + chev, py, &format!("{input}_"), 0xffff_ffff);
 }
 
 // --- paint app (M8) ---------------------------------------------------------

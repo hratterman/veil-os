@@ -1973,10 +1973,11 @@ pub fn paint_view(win: &mut Window) {
     let view_h = ch - TOPBAR;
     let fb = win.canvas_fb();
     if doc_h > view_h {
-        fb.fill_rect(cw - 2, TOPBAR, 2, view_h, 0xff20_2830); // track
-        let thumb_h = (view_h * view_h / doc_h).max(8).min(view_h);
+        // Thin (4px) rounded scrollbar: #444 track, #888 thumb.
+        fb.fill_round_rect(cw - 5, TOPBAR + 1, 4, view_h - 2, 2, 0xff44_4444);
+        let thumb_h = (view_h * view_h / doc_h).max(16).min(view_h);
         let thumb_y = TOPBAR + scroll * (view_h - thumb_h) / (doc_h - view_h);
-        fb.fill_rect(cw - 2, thumb_y, 2, thumb_h, 0xff70_90b0); // thumb
+        fb.fill_round_rect(cw - 5, thumb_y, 4, thumb_h, 2, 0xff88_8888);
     }
     fb.fill_rect(0, 0, cw, TOPBAR, BAR_BG);
     // Back button: a `<` in its own 18px zone, then the address bar.

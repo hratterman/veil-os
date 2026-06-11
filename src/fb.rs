@@ -48,6 +48,68 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Filled rounded rectangle (fast interior fills + per-pixel corners).
+    pub fn fill_round_rect(&self, x: usize, y: usize, w: usize, h: usize, radius: usize, color: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let r = radius.min(w / 2).min(h / 2);
+        self.fill_rect(x, y + r, w, h - 2 * r, color);
+        self.fill_rect(x + r, y, w - 2 * r, r, color);
+        self.fill_rect(x + r, y + h - r, w - 2 * r, r, color);
+        let r2 = (r * r) as isize;
+        let corners = [
+            (x + r, y + r, -1isize, -1isize),
+            (x + w - 1 - r, y + r, 1, -1),
+            (x + r, y + h - 1 - r, -1, 1),
+            (x + w - 1 - r, y + h - 1 - r, 1, 1),
+        ];
+        for &(cx, cy, sx, sy) in &corners {
+            for dy in 0..=r as isize {
+                for dx in 0..=r as isize {
+                    if dx * dx + dy * dy <= r2 {
+                        self.put_pixel((cx as isize + sx * dx) as usize, (cy as isize + sy * dy) as usize, color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Knock the four corners of a rect out to `bg` (rounded-corner mask).
+    pub fn round_corners(&self, x: usize, y: usize, w: usize, h: usize, radius: usize, bg: u32) {
+        let r = radius.min(w / 2).min(h / 2);
+        let r2 = (r * r) as isize;
+        let corners = [
+            (x + r, y + r, -1isize, -1isize),
+            (x + w - 1 - r, y + r, 1, -1),
+            (x + r, y + h - 1 - r, -1, 1),
+            (x + w - 1 - r, y + h - 1 - r, 1, 1),
+        ];
+        for &(cx, cy, sx, sy) in &corners {
+            for dy in 0..=r as isize {
+                for dx in 0..=r as isize {
+                    if dx * dx + dy * dy > r2 {
+                        self.put_pixel((cx as isize + sx * dx) as usize, (cy as isize + sy * dy) as usize, bg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Filled circle centred at (cx, cy).
+    pub fn fill_circle(&self, cx: isize, cy: isize, r: isize, color: u32) {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy <= r * r {
+                    let (px, py) = (cx + dx, cy + dy);
+                    if px >= 0 && py >= 0 {
+                        self.put_pixel(px as usize, py as usize, color);
+                    }
+                }
+            }
+        }
+    }
+
     /// Alpha-blend a filled rect over the existing pixels. `alpha` is 0..=255
     /// (0 = invisible, 255 = opaque). Used for the semi-transparent icon that
     /// follows the cursor while a desktop icon is being dragged.

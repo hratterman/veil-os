@@ -9,16 +9,16 @@ use crate::fb::Framebuffer;
 use crate::{fs, input, keymap, kprintln, timer};
 use alloc::string::String;
 
-const BG: u32 = 0xff0b_1018;
-const CARD: u32 = 0xff15_1d2a;
-const CARD_EDGE: u32 = 0xff2a_3850;
-const HEAD: u32 = 0xff9c_c0ff;
-const LABEL: u32 = 0xff8a_94a4;
-const FIELD_BG: u32 = 0xff0e_141e;
-const FIELD_TX: u32 = 0xffe8_eef4;
-const ACCENT: u32 = 0xff40_a0e0;
-const BTN_BG: u32 = 0xff2a_7d4f;
-const BTN_TX: u32 = 0xffff_ffff;
+const BG: u32 = 0xff0d_0d0d;
+const CARD: u32 = 0xff1a_1a1a;
+const CARD_EDGE: u32 = 0xff2a_2a2a;
+const HEAD: u32 = 0xffe8_e8e8;
+const LABEL: u32 = 0xff88_8888;
+const FIELD_BG: u32 = 0xff14_1414;
+const FIELD_TX: u32 = 0xffe8_e8e8;
+const ACCENT: u32 = 0xff5b_8af0;
+const BTN_BG: u32 = 0xff5b_8af0;
+const BTN_TX: u32 = 0xff0d_0d0d;
 
 const MIN_HALF: i32 = -24; // UTC-12:00
 const MAX_HALF: i32 = 28; //  UTC+14:00
@@ -158,14 +158,14 @@ fn render_static(screen: &Framebuffer) {
     let ch = 320usize;
     let cx = (w - cw) / 2;
     let cy = (h - ch) / 2;
-    screen.fill_rect(cx - 1, cy - 1, cw + 2, ch + 2, CARD_EDGE);
-    screen.fill_rect(cx, cy, cw, ch, CARD);
-    screen.draw_string_scaled(cx + 28, cy + 28, "Welcome to Veil OS", HEAD, 3);
-    screen.draw_string(cx + 30, cy + 70, "a bare-metal AArch64 operating system", LABEL, None);
+    screen.fill_round_rect(cx - 1, cy - 1, cw + 2, ch + 2, 12, CARD_EDGE);
+    screen.fill_round_rect(cx, cy, cw, ch, 12, CARD);
+    screen.draw_bm_string(cx + 28, cy + 24, "Welcome to Veil OS", crate::font::ui_icon(), HEAD);
+    screen.draw_bm_string(cx + 30, cy + 64, "a bare-metal AArch64 operating system", crate::font::ui_small(), LABEL);
     let fy = cy + 110;
-    screen.draw_string(cx + 30, fy, "Your name", LABEL, None);
+    screen.draw_bm_string(cx + 30, fy, "Your name", crate::font::ui_small(), LABEL);
     let ty = cy + 180;
-    screen.draw_string(cx + 30, ty, "Timezone  (left / right arrows)", LABEL, None);
+    screen.draw_bm_string(cx + 30, ty, "Timezone  (left / right arrows)", crate::font::ui_small(), LABEL);
     screen.draw_string(cx + 38, ty + 22, "<", ACCENT, None);
     screen.draw_string(cx + cw - 48, ty + 22, ">", ACCENT, None);
 }
@@ -178,25 +178,29 @@ fn render(screen: &Framebuffer, name: &str, half: i32, blink: bool) {
     let cx = (w - cw) / 2;
     let cy = (h - ch) / 2;
 
-    // Name field: clear and redraw just the input box row.
+    // Name field: rounded input with an accent border (focus ring).
     let fy = cy + 110;
-    screen.fill_rect(cx + 30, fy + 20, cw - 60, 30, FIELD_BG);
+    screen.fill_round_rect(cx + 30, fy + 20, cw - 60, 30, 6, ACCENT);
+    screen.fill_round_rect(cx + 31, fy + 21, cw - 62, 28, 5, FIELD_BG);
     let cursor = if blink { "_" } else { " " };
-    screen.draw_string(cx + 38, fy + 28, &alloc::format!("{name}{cursor}"), FIELD_TX, None);
+    screen.draw_bm_string(cx + 38, fy + 24, &alloc::format!("{name}{cursor}"), crate::font::ui(), FIELD_TX);
 
-    // Timezone field: clear and redraw the value area only.
+    // Timezone field.
     let ty = cy + 180;
-    screen.fill_rect(cx + 30, ty + 20, cw - 60, 30, FIELD_BG);
+    screen.fill_round_rect(cx + 30, ty + 20, cw - 60, 30, 6, FIELD_BG);
     screen.draw_string(cx + 38, ty + 22, "<", ACCENT, None);
     screen.draw_string(cx + cw - 48, ty + 22, ">", ACCENT, None);
     let lbl = tz_label(half);
-    screen.draw_string_scaled(cx + cw / 2 - lbl.len() * 8, ty + 24, &lbl, FIELD_TX, 2);
+    let lw = crate::font::text_width(crate::font::ui(), &lbl);
+    screen.draw_bm_string(cx + cw / 2 - lw / 2, ty + 24, &lbl, crate::font::ui(), FIELD_TX);
 
-    // Button: only changes when name goes empty <-> non-empty.
+    // Button: accent when a name is entered.
     let by = cy + ch - 56;
     let valid = !name.trim().is_empty();
-    let bg = if valid { BTN_BG } else { 0xff31_3a48 };
-    screen.fill_rect(cx + 30, by, cw - 60, 34, bg);
+    let bg = if valid { BTN_BG } else { 0xff2a_2a2a };
+    screen.fill_round_rect(cx + 30, by, cw - 60, 34, 8, bg);
     let hint = if valid { "Press Enter to continue" } else { "Type a name to continue" };
-    screen.draw_string(cx + cw / 2 - hint.len() * 4, by + 10, hint, BTN_TX, None);
+    let hw = crate::font::text_width(crate::font::ui(), hint);
+    let htx = if valid { BTN_TX } else { 0xff888888 };
+    screen.draw_bm_string(cx + cw / 2 - hw / 2, by + 7, hint, crate::font::ui(), htx);
 }

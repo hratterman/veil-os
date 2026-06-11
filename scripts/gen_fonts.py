@@ -48,7 +48,7 @@ VARIANTS = [
     ("BARLOW_600", "barlow-600.ttf", None, False),
     ("MONO_400", "mono.ttf", 400, False),
 ]
-SIZES = [16, 24]
+SIZES = [11, 14, 16, 24]
 FIRST, LAST = 0x20, 0x7E  # printable ASCII
 
 

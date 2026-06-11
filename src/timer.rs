@@ -27,6 +27,11 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Seconds since boot from the always-running hardware counter (cntpct).
+pub fn uptime_secs() -> u64 {
+    counter() / frequency()
+}
+
 // --- wall clock (M19b) -------------------------------------------------------
 // NTP anchors real UTC to the always-running hardware counter (cntpct),
 // NOT the software tick: the tick rate changes between boot phases (10 Hz

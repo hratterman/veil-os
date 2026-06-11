@@ -80,6 +80,26 @@ pub fn match_family(value: &str) -> Family {
 
 /// Pick the pre-rasterized bitmap font for a family/weight/style/size, or None
 /// for `Family::Default` (use the built-in 8x16 font). `px` is the target size.
+// M35.5 GUI chrome fonts: Barlow Condensed for all window/desktop UI.
+/// Window titles + general chrome (~17px).
+pub fn ui() -> &'static BitmapFont {
+    &crate::fonts_generated::BARLOW_400_14
+}
+pub fn ui_bold() -> &'static BitmapFont {
+    &crate::fonts_generated::BARLOW_600_14
+}
+/// Small labels: taskbar, icon names, clock (~14px).
+pub fn ui_small() -> &'static BitmapFont {
+    &crate::fonts_generated::BARLOW_400_11
+}
+pub fn ui_small_bold() -> &'static BitmapFont {
+    &crate::fonts_generated::BARLOW_600_11
+}
+/// Desktop-icon abbreviation + wordmark (~20px bold).
+pub fn ui_icon() -> &'static BitmapFont {
+    &crate::fonts_generated::BARLOW_600_16
+}
+
 pub fn pick(fam: Family, weight: u16, italic: bool, px: u16) -> Option<&'static BitmapFont> {
     let big = px >= 20;
     Some(match fam {

@@ -74,6 +74,7 @@ mod syscall;
 mod timer;
 mod tls;
 mod uart;
+mod users;
 mod vfs;
 mod video;
 mod viewer;
@@ -167,6 +168,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         netfs::selftest(); // M42 step 7: network filesystem protocol + mount registry
         pkg::selftest(); // M42 step 9: .veil package format + pkg manager (install/list/remove)
         pkg::sdk_app_selftest(); // M42 step 12: external SDK app (Calculator) -> .veil -> run in Veil
+        users::selftest(); // M42 step 14: multi-user accounts + /home + .veilrc + history
         wm::multiplayer_selftest(); // M42 step 10: shared-desktop multi-cursor + peer registry
         wm::window_anim_selftest(); // M42 step 13: window animations (easing/tween) + Expose grid
     }

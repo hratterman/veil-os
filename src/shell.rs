@@ -1026,6 +1026,38 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
         "mount" => (mount_cmd(&rest), 0),
         "umount" | "unmount" => (umount_cmd(&rest), 0),
         "pkg" => pkg_cmd(&rest),
+        "whoami" => (format!("{}\n", crate::users::current()), 0),
+        "users" => (crate::users::list().join(" ") + "\n", 0),
+        "useradd" | "adduser" => match rest.first() {
+            Some(n) => match crate::users::useradd(n) {
+                Ok(()) => (format!("created user {n}\n"), 0),
+                Err(e) => (format!("{e}\n"), 1),
+            },
+            None => ("useradd: usage: useradd <name>\n".to_string(), 2),
+        },
+        "userdel" | "deluser" => match rest.first() {
+            Some(n) => {
+                let purge = rest.iter().any(|a| a == "-r" || a == "--remove");
+                match crate::users::userdel(n, purge) {
+                    Ok(()) => (format!("removed user {n}\n"), 0),
+                    Err(e) => (format!("{e}\n"), 1),
+                }
+            }
+            None => ("userdel: usage: userdel <name> [-r]\n".to_string(), 2),
+        },
+        "su" | "login" => match rest.first() {
+            Some(n) => match crate::users::su(n) {
+                Ok(()) => {
+                    st.vars.insert("USER".into(), n.clone());
+                    st.vars.insert("HOME".into(), crate::users::home_of(n));
+                    st.vars.insert("PWD".into(), crate::vfs::get().cwd_path());
+                    (String::new(), 0)
+                }
+                Err(e) => (format!("{e}\n"), 1),
+            },
+            None => (format!("{}\n", crate::users::current()), 0),
+        },
+        "history" => (crate::users::history_load(&crate::users::current()).join("\n") + "\n", 0),
         "cp" => leaf(cp(&args_joined)),
         "mv" => leaf(mv(&args_joined)),
         "rm" => leaf(rm(&args_joined)),

@@ -1625,6 +1625,8 @@ impl Wm {
         if cmd.is_empty() {
             return;
         }
+        // M42 step 14: record the command in the current user's ~/.history.
+        crate::users::history_append(cmd);
         let first = cmd.split_whitespace().next().unwrap_or("");
         // `run <app>` or a bare launcher name opens a GUI app.
         let target = if first == "run" {
@@ -2888,8 +2890,11 @@ fn render_shell(win: &mut Window) {
         y += lh;
     }
     let py = win.ch.saturating_sub(lh + 2);
-    fb.draw_text(6, py, ">", FontId::Mono, SH, ACCENT);
-    fb.draw_text(6 + chev, py, &format!("{input}_"), FontId::Mono, SH, 0xffff_ffff);
+    // M42 step 14: the live prompt shows `user@veil:~$` ahead of the input.
+    let prompt = crate::users::prompt();
+    let pw = fb.measure_text(&prompt, FontId::Mono, SH).0;
+    fb.draw_text(6, py, &prompt, FontId::Mono, SH, ACCENT);
+    fb.draw_text(6 + pw, py, &format!("{input}_"), FontId::Mono, SH, 0xffff_ffff);
 }
 
 /// Mouse-wheel over the shell: scroll the output scrollback ~3 lines per notch.

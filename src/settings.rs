@@ -51,6 +51,9 @@ impl SettingsState {
     fn save(&self) {
         let body = format!("volume={}\nusername={}\n", self.volume, self.username);
         let _ = crate::fs::write_file("SETTINGS.TXT", body.as_bytes());
+        // M42 step 14: mirror preferences into the current user's ~/.veilrc, so
+        // the per-user profile (read on next login) reflects Settings changes.
+        crate::users::pref_set("volume", &format!("{}", self.volume));
     }
 }
 

@@ -56,6 +56,8 @@ pub enum Host {
     ClassList(usize),
     /// element.dataset
     Dataset(usize),
+    /// a 2D canvas rendering context (index into Interp.canvases)
+    Canvas(usize),
 }
 
 impl Val {

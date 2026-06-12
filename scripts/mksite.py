@@ -280,7 +280,8 @@ WEB = page("""<h1>The Real Web</h1>
 <a href="flextest.htm">Flexbox test</a> - <a href="fonttest.htm">Fonts test</a> -
 <a href="navtest.htm">Nav/selector test</a> -
 <a href="formtest.htm">Form input test</a> -
-<a href="csstest.htm">CSS math/dark test</a></p>
+<a href="csstest.htm">CSS math/dark test</a> -
+<a href="canvas.htm">Canvas chart test</a></p>
 <p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
@@ -390,6 +391,37 @@ CSSTEST = page("""<style>
 <div class="box">A rounded card: calc() padding, max() width, dark-mode bg.</div>
 <p class="tight">Tight padding chosen by min().</p>
 <p class="darkonly">DARK MODE TEXT IS GREEN AND VISIBLE</p>
+<p><a href="web.htm">Back</a></p>""")
+
+CANVASTEST = page("""<h1>Canvas bar chart</h1>
+<p>Drawn by page JavaScript into a &lt;canvas&gt; via our from-scratch 2D context:</p>
+<canvas id="chart" width="360" height="200"></canvas>
+<script>
+const ctx = document.getElementById('chart').getContext('2d');
+ctx.fillStyle = '#ffffff';
+ctx.fillRect(0, 0, 360, 200);
+const data = [40, 95, 60, 140, 80, 110];
+const colors = ['#e0533a', '#5b8af0', '#40c080', '#e0b040', '#a060e0', '#40b0c0'];
+ctx.strokeStyle = '#404040';
+ctx.lineWidth = 2;
+ctx.beginPath();
+ctx.moveTo(30, 10);
+ctx.lineTo(30, 175);
+ctx.lineTo(350, 175);
+ctx.stroke();
+for (let i = 0; i < data.length; i++) {
+  const x = 45 + i * 50;
+  const h = data[i];
+  ctx.fillStyle = colors[i];
+  ctx.fillRect(x, 175 - h, 36, h);
+  ctx.fillStyle = '#202020';
+  ctx.font = '13px sans';
+  ctx.fillText(String(data[i]), x + 6, 170 - h);
+}
+ctx.fillStyle = '#101010';
+ctx.font = '16px sans';
+ctx.fillText('Veil canvas demo', 90, 195);
+</script>
 <p><a href="web.htm">Back</a></p>""")
 
 IMGTEST = page("""<h1>External images</h1>
@@ -659,6 +691,7 @@ def main():
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
         "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST, "fonttest.htm": FONTTEST,
         "navtest.htm": NAVTEST, "formtest.htm": FORMTEST, "csstest.htm": CSSTEST,
+        "canvas.htm": CANVASTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

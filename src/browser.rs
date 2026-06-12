@@ -2415,6 +2415,17 @@ fn collect_inline(
                         buf.push(Frag::Img { idx, w: slot.w, h: slot.h });
                     }
                 }
+                "canvas" => {
+                    // A <canvas> the scripts drew into is registered as a
+                    // `__canvas:N` image slot; emit it as a replaced inline box.
+                    if let Some(n) = node.attr("__cvs").and_then(|v| v.trim().parse::<usize>().ok()) {
+                        let key = alloc::format!("__canvas:{n}");
+                        if let Some(idx) = ctx.imgs.iter().position(|s| s.src == key) {
+                            let slot = &ctx.imgs[idx];
+                            buf.push(Frag::Img { idx, w: slot.w, h: slot.h });
+                        }
+                    }
+                }
                 "video" => {
                     // src on <video> itself or on a child <source>.
                     let src = node
@@ -3527,10 +3538,12 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     // document order, run them against the DOM, and continue layout with the
     // (possibly heavily mutated) tree. Cross-origin scripts (analytics beacons)
     // are skipped. This is what makes JS-rendered pages actually show content.
+    let mut js_canvases: Vec<crate::js::CanvasImg> = Vec::new();
     let scripts = collect_scripts(&doc);
     if !scripts.is_empty() {
         let res = crate::js::run(&doc, &scripts);
         doc = res.tree;
+        js_canvases = res.canvases;
         if !res.errors.is_empty() {
             kprintln!("BROWSER: js: {} issue(s); first: {}", res.errors.len(), res.errors[0]);
         }
@@ -3611,6 +3624,33 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
         } else {
             slots.push(ImgSlot { src, w: bw, h: bh });
             pixels.push(None);
+        }
+    }
+
+    // Canvas: register each <canvas> the page's scripts drew into as a ready
+    // (pre-decoded) image slot keyed by a synthetic `__canvas:N` src, so the
+    // existing img layout/paint path blits it where the element sits.
+    if !js_canvases.is_empty() {
+        let mut canvas_nodes = Vec::new();
+        doc.find_all("canvas", &mut canvas_nodes);
+        for node in canvas_nodes {
+            let Some(n) = node.attr("__cvs").and_then(|v| v.trim().parse::<usize>().ok()) else { continue };
+            let Some(cv) = js_canvases.get(n) else { continue };
+            let key = alloc::format!("__canvas:{n}");
+            if slots.iter().any(|s| s.src == key) {
+                continue;
+            }
+            let img = png::Image {
+                w: cv.w as usize, h: cv.h as usize,
+                full_w: cv.w as usize, full_h: cv.h as usize,
+                pixels: cv.px.clone(),
+            };
+            slots.push(ImgSlot { src: key, w: cv.w as isize, h: cv.h as isize });
+            pixels.push(Some(img));
+        }
+        kprintln!("BROWSER: {} canvas(es) drawn by JS", js_canvases.len());
+        if !CANVAS_DONE.swap(true, Ordering::Relaxed) {
+            kprintln!("CANVAS_PAGE_OK");
         }
     }
 
@@ -3796,6 +3836,7 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
 
 static INTERNET_DONE: AtomicBool = AtomicBool::new(false);
 static HTTPS_DONE: AtomicBool = AtomicBool::new(false);
+static CANVAS_DONE: AtomicBool = AtomicBool::new(false);
 
 /// A one-line stand-in page for fetch/parse failures.
 fn render_message(win: &mut Window, path: &str, msg: &str) {

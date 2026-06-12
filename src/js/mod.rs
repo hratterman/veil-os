@@ -7,6 +7,7 @@
 //! mutated arena back into a tree for the existing layout/paint pipeline.
 
 mod ast;
+mod canvas;
 mod dom;
 mod interp;
 pub mod jit;
@@ -19,10 +20,20 @@ use crate::html::Node;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// A canvas the scripts drew into: its drawing-buffer size and pixels (already
+/// flattened over white into XRGB). Indexed by the `__cvs` attribute the engine
+/// stamped on the owning `<canvas>` element.
+pub struct CanvasImg {
+    pub w: u32,
+    pub h: u32,
+    pub px: Vec<u32>,
+}
+
 /// Result of running a page's scripts.
 pub struct JsResult {
     pub tree: Node,
     pub errors: Vec<String>,
+    pub canvases: Vec<CanvasImg>,
 }
 
 /// Run `scripts` (in document order) against the DOM of `tree`, returning the
@@ -35,7 +46,12 @@ pub fn run(tree: &Node, scripts: &[String]) -> JsResult {
         it.run(src);
     }
     it.drain_deferred();
-    JsResult { tree: it.dom.to_tree(), errors: it.errors }
+    let canvases = it
+        .canvases
+        .iter()
+        .map(|c| CanvasImg { w: c.w as u32, h: c.h as u32, px: c.flatten() })
+        .collect();
+    JsResult { tree: it.dom.to_tree(), errors: it.errors, canvases }
 }
 
 /// Boot self-test entry: run the three real henryratterman.com scripts against
@@ -224,6 +240,67 @@ pub fn jit_selftest() {
         crate::kprintln!("JS_JIT_OK: native codegen agrees ({speed}x; wanted >=50x)");
     } else {
         crate::kprintln!("JS_JIT_FAIL: results disagree (interp={interp_val} jit={jit_val})");
+    }
+}
+
+/// Canvas self-test: run a script that draws shapes/lines/text into a
+/// `<canvas>` 2D context and verify the resulting pixels (the from-scratch
+/// rasterizer). Emits CANVAS_OK.
+pub fn canvas_selftest() {
+    let skeleton = "<html><body><canvas id=cv width=200 height=100></canvas></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        const c = document.getElementById('cv');
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#ff0000';
+        ctx.fillRect(0, 0, 50, 50);
+        ctx.fillStyle = 'rgb(0,128,0)';
+        ctx.beginPath();
+        ctx.arc(150, 50, 30, 0, 6.2832, false);
+        ctx.fill();
+        ctx.strokeStyle = 'blue';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(0, 90);
+        ctx.lineTo(200, 90);
+        ctx.stroke();
+        ctx.fillStyle = 'black';
+        ctx.font = '18px sans';
+        ctx.fillText('Hi', 60, 35);
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    let Some(cv) = res.canvases.first() else {
+        crate::kprintln!("CANVAS_FAIL: getContext returned no canvas");
+        return;
+    };
+    let (w, _h) = (cv.w as usize, cv.h as usize);
+    let at = |x: usize, y: usize| -> (u32, u32, u32) {
+        let p = cv.px[y * w + x];
+        ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff)
+    };
+    let (rr, rg, rb) = at(10, 10); // inside the red fillRect
+    let (gr, gg, gb) = at(150, 50); // center of the green arc
+    let (br, bg, bb) = at(100, 90); // on the blue stroked line
+    // Some non-white pixel where the text was drawn (60..90, ~20..35).
+    let mut text_px = false;
+    for y in 18..36 {
+        for x in 58..95 {
+            let (r, g, b) = at(x, y);
+            if r < 200 && g < 200 && b < 200 {
+                text_px = true;
+            }
+        }
+    }
+    let red_ok = rr > 200 && rg < 90 && rb < 90;
+    let green_ok = gr < 90 && gg > 100 && gb < 90;
+    let blue_ok = br < 90 && bg < 90 && bb > 180;
+    crate::kprintln!(
+        "JS_CANVAS: red=({rr},{rg},{rb}) arc=({gr},{gg},{gb}) line=({br},{bg},{bb}) text={text_px}"
+    );
+    if red_ok && green_ok && blue_ok && text_px {
+        crate::kprintln!("CANVAS_OK: from-scratch <canvas> 2D context — fillRect, arc fill, stroked line, fillText all rasterized");
+    } else {
+        crate::kprintln!("CANVAS_FAIL: red={red_ok} green={green_ok} blue={blue_ok} text={text_px}");
     }
 }
 

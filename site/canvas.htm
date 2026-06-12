@@ -1,0 +1,36 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a> | <a href="web.htm">Web</a></div>
+<h1>Canvas bar chart</h1>
+<p>Drawn by page JavaScript into a &lt;canvas&gt; via our from-scratch 2D context:</p>
+<canvas id="chart" width="360" height="200"></canvas>
+<script>
+const ctx = document.getElementById('chart').getContext('2d');
+ctx.fillStyle = '#ffffff';
+ctx.fillRect(0, 0, 360, 200);
+const data = [40, 95, 60, 140, 80, 110];
+const colors = ['#e0533a', '#5b8af0', '#40c080', '#e0b040', '#a060e0', '#40b0c0'];
+ctx.strokeStyle = '#404040';
+ctx.lineWidth = 2;
+ctx.beginPath();
+ctx.moveTo(30, 10);
+ctx.lineTo(30, 175);
+ctx.lineTo(350, 175);
+ctx.stroke();
+for (let i = 0; i < data.length; i++) {
+  const x = 45 + i * 50;
+  const h = data[i];
+  ctx.fillStyle = colors[i];
+  ctx.fillRect(x, 175 - h, 36, h);
+  ctx.fillStyle = '#202020';
+  ctx.font = '13px sans';
+  ctx.fillText(String(data[i]), x + 6, 170 - h);
+}
+ctx.fillStyle = '#101010';
+ctx.font = '16px sans';
+ctx.fillText('Veil canvas demo', 90, 195);
+</script>
+<p><a href="web.htm">Back</a></p>
+</body>
+</html>

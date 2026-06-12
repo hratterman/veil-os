@@ -56,6 +56,10 @@ pub struct Interp {
     /// cached (which would otherwise alias a stale compile — an ABA bug).
     jit: BTreeMap<usize, (Rc<Func>, JitSlot)>,
     jit_enabled: bool,
+    /// 2D canvas contexts created via `<canvas>.getContext('2d')`; the owning
+    /// element stores its index in a `__cvs` attribute so the browser can blit
+    /// the drawn buffer where the canvas sits in layout.
+    pub canvases: Vec<super::canvas::Canvas>,
 }
 
 /// Cap on distinct cached functions before the whole table is dropped (bounds
@@ -85,6 +89,7 @@ impl Interp {
             resolvers: Vec::new(),
             jit: BTreeMap::new(),
             jit_enabled: true,
+            canvases: Vec::new(),
         };
         it.install_globals();
         it
@@ -1535,6 +1540,11 @@ impl Interp {
                 let origin = crate::browser::current_origin();
                 crate::browser::storage_set(local, &origin, prop, &v.to_str());
             }
+            Val::Host(Host::Canvas(n)) => {
+                if let Some(c) = self.canvases.get_mut(*n) {
+                    c.set_prop(prop, &v.to_str());
+                }
+            }
             Val::Host(Host::Location) => { /* navigation ignored */ }
             _ => {}
         }
@@ -1676,6 +1686,21 @@ impl Interp {
                 // Direct property access: localStorage.foo === localStorage.getItem('foo')
                 crate::browser::storage_get(local, &origin, prop).map(Val::str).unwrap_or(Val::Undef)
             }
+            Host::Canvas(n) => {
+                // `ctx.canvas` reflects back the context; fillStyle/lineWidth/etc.
+                // read the stored state; everything else is a drawing method.
+                if prop == "canvas" {
+                    return Val::Host(Host::Canvas(n));
+                }
+                if let Some(s) = self.canvases.get(n).and_then(|c| c.get_prop(prop)) {
+                    // numeric props as numbers, colors/strings as strings
+                    return match prop {
+                        "lineWidth" | "globalAlpha" | "width" | "height" => Val::Num(s.parse().unwrap_or(0.0)),
+                        _ => Val::str(s),
+                    };
+                }
+                Val::Native(Native::Method(Box::new(Val::Host(Host::Canvas(n))), Rc::from(prop)))
+            }
             Host::ClassList(_) | Host::Console | Host::History
             | Host::Style(_) | Host::Dataset(_) => {
                 if let Host::Style(idx) = h {
@@ -1708,6 +1733,7 @@ impl Interp {
             Val::Host(Host::SessionStorage) => Ok(Some(self.storage_method(false, name, args))),
             Val::Host(Host::History) => Ok(Some(Val::Undef)),
             Val::Host(Host::Location) => Ok(Some(Val::Undef)),
+            Val::Host(Host::Canvas(n)) => Ok(Some(self.canvas_method(*n, name, args))),
             Val::Host(Host::ClassList(idx)) => Ok(Some(self.classlist_method(*idx, name, args))),
             Val::Host(Host::Style(_)) => Ok(Some(Val::Undef)),
             Val::Node(idx) => Ok(self.node_method(*idx, name, args)?),
@@ -1910,9 +1936,123 @@ impl Interp {
                 self.dom.query_all(&s0).contains(&idx) || self.dom.has_class(n, s0.trim_start_matches('.'))
             }),
             "cloneNode" => Val::Node(idx),
+            "getContext" => {
+                // 2D context only. Reuse the canvas if getContext was called
+                // before; otherwise allocate one sized from the width/height attrs.
+                if !s0.starts_with("2d") {
+                    return Ok(Some(Val::Null));
+                }
+                let n = match self.dom.nodes[idx].attr("__cvs").and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) if n < self.canvases.len() => n,
+                    _ => {
+                        let w = self.dom.nodes[idx].attr("width").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(300);
+                        let h = self.dom.nodes[idx].attr("height").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(150);
+                        let n = self.canvases.len();
+                        self.canvases.push(super::canvas::Canvas::new(w, h));
+                        self.dom.nodes[idx].set_attr("__cvs", &alloc::format!("{n}"));
+                        n
+                    }
+                };
+                Val::Host(Host::Canvas(n))
+            }
             _ => return Ok(None),
         };
         Ok(Some(r))
+    }
+
+    /// HTML5 canvas 2D context methods, dispatched on the canvas index `n`.
+    fn canvas_method(&mut self, n: usize, name: &str, args: &[Val]) -> Val {
+        let f = |i: usize| args.get(i).map(|v| v.as_num()).unwrap_or(0.0);
+        // drawImage / putImageData read other objects before borrowing the canvas.
+        match name {
+            "measureText" => {
+                let s = args.first().map(|v| v.to_str()).unwrap_or_default();
+                let w = self.canvases.get(n).map(|c| c.measure_text(&s)).unwrap_or(0.0);
+                let mut o = Obj::new();
+                o.insert("width".into(), Val::Num(w));
+                return Val::object(o);
+            }
+            "getImageData" => {
+                let (data, w, h) = match self.canvases.get(n) {
+                    Some(c) => c.get_image_data(f(0), f(1), f(2), f(3)),
+                    None => return Val::Undef,
+                };
+                let mut o = Obj::new();
+                o.insert("width".into(), Val::Num(w as f64));
+                o.insert("height".into(), Val::Num(h as f64));
+                o.insert("data".into(), Val::array(data.into_iter().map(|b| Val::Num(b as f64)).collect()));
+                return Val::object(o);
+            }
+            "putImageData" => {
+                if let Some(Val::Object(o)) = args.first() {
+                    let ob = o.borrow();
+                    let w = ob.get("width").map(|v| v.as_num() as usize).unwrap_or(0);
+                    let h = ob.get("height").map(|v| v.as_num() as usize).unwrap_or(0);
+                    let bytes: Vec<u8> = match ob.get("data") {
+                        Some(Val::Array(a)) => a.borrow().iter().map(|v| v.as_num() as u8).collect(),
+                        _ => Vec::new(),
+                    };
+                    drop(ob);
+                    if let Some(c) = self.canvases.get_mut(n) {
+                        c.put_image_data(&bytes, w, h, f(1), f(2));
+                    }
+                }
+                return Val::Undef;
+            }
+            "drawImage" => {
+                // Only canvas->canvas is supported (an <img>'s pixels live in the
+                // browser, not the interpreter).
+                let src = match args.first() {
+                    Some(Val::Host(Host::Canvas(m))) if *m < self.canvases.len() => {
+                        Some(self.canvases[*m].snapshot())
+                    }
+                    _ => None,
+                };
+                if let (Some((buf, sw, sh)), Some(c)) = (src, self.canvases.get_mut(n)) {
+                    let (dx, dy, dw, dh) = match args.len() {
+                        n if n >= 9 => (f(5), f(6), f(7), f(8)),
+                        n if n >= 5 => (f(1), f(2), f(3), f(4)),
+                        _ => (f(1), f(2), sw as f64, sh as f64),
+                    };
+                    c.draw_image_buf(&buf, sw, sh, dx, dy, dw, dh);
+                }
+                return Val::Undef;
+            }
+            _ => {}
+        }
+        let Some(c) = self.canvases.get_mut(n) else { return Val::Undef };
+        match name {
+            "fillRect" => c.fill_rect(f(0), f(1), f(2), f(3)),
+            "strokeRect" => c.stroke_rect(f(0), f(1), f(2), f(3)),
+            "clearRect" => c.clear_rect(f(0), f(1), f(2), f(3)),
+            "beginPath" => c.begin_path(),
+            "closePath" => c.close_path(),
+            "moveTo" => c.move_to(f(0), f(1)),
+            "lineTo" => c.line_to(f(0), f(1)),
+            "rect" => c.rect(f(0), f(1), f(2), f(3)),
+            "arc" => c.arc(f(0), f(1), f(2), f(3), f(4), args.get(5).map(|v| v.truthy()).unwrap_or(false)),
+            "arcTo" => c.arc_to(f(0), f(1), f(2), f(3), f(4)),
+            "ellipse" => c.arc(f(0), f(1), f(2).max(f(3)), f(4), f(5), args.get(7).map(|v| v.truthy()).unwrap_or(false)),
+            "bezierCurveTo" => c.bezier_curve_to(f(0), f(1), f(2), f(3), f(4), f(5)),
+            "quadraticCurveTo" => c.quadratic_curve_to(f(0), f(1), f(2), f(3)),
+            "fill" => c.fill(),
+            "stroke" => c.stroke(),
+            "fillText" => c.fill_text(&args.first().map(|v| v.to_str()).unwrap_or_default(), f(1), f(2)),
+            "strokeText" => c.stroke_text(&args.first().map(|v| v.to_str()).unwrap_or_default(), f(1), f(2)),
+            "save" => c.save(),
+            "restore" => c.restore(),
+            "translate" => c.translate(f(0), f(1)),
+            "scale" => c.scale(f(0), f(1)),
+            "rotate" => c.rotate(f(0)),
+            "transform" => c.transform(f(0), f(1), f(2), f(3), f(4), f(5)),
+            "setTransform" => c.set_transform(f(0), f(1), f(2), f(3), f(4), f(5)),
+            "resetTransform" => c.reset_transform(),
+            // No-op context methods sites call but we don't need.
+            "setLineDash" | "getLineDash" | "clip" | "createLinearGradient"
+            | "createRadialGradient" | "createPattern" | "closePathAll" => {}
+            _ => {}
+        }
+        Val::Undef
     }
 
     fn array_method(&mut self, a: Rc<RefCell<Vec<Val>>>, name: &str, args: &[Val]) -> Result<Option<Val>, Val> {

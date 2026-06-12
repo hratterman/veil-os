@@ -55,6 +55,7 @@ mod netdev;
 mod netfs;
 mod paging;
 mod perms;
+mod pkg;
 #[cfg(feature = "pi4")]
 mod pi4;
 mod png;
@@ -163,6 +164,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     if !fastboot(&fdt) {
         vfs::selftest(); // M42 step 6: mkdir/cd/paths + /home dotfiles + disk persistence
         netfs::selftest(); // M42 step 7: network filesystem protocol + mount registry
+        pkg::selftest(); // M42 step 9: .veil package format + pkg manager (install/list/remove)
     }
     if milestone12(&fdt) {
         // M14/M15 services (tcp echo, http) as a preemptible kernel task.

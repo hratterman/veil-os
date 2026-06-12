@@ -1025,6 +1025,7 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
         "cat" => leaf(cat_router(&rest, stdin.as_deref())),
         "mount" => (mount_cmd(&rest), 0),
         "umount" | "unmount" => (umount_cmd(&rest), 0),
+        "pkg" => pkg_cmd(&rest),
         "cp" => leaf(cp(&args_joined)),
         "mv" => leaf(mv(&args_joined)),
         "rm" => leaf(rm(&args_joined)),
@@ -1270,6 +1271,47 @@ fn mount_cmd(rest: &[String]) -> String {
     match crate::netfs::mount(&rest[0], &rest[1]) {
         Ok(()) => format!("mounted {} at {}\n", rest[0], rest[1]),
         Err(e) => format!("{e}\n"),
+    }
+}
+
+/// `pkg install <name>` / `pkg remove <name>` / `pkg list` / `pkg update <name>`.
+fn pkg_cmd(rest: &[String]) -> (String, i32) {
+    let sub = rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "list" | "ls" => {
+            let installed = crate::pkg::list_installed();
+            if installed.is_empty() {
+                return ("no packages installed\n".to_string(), 0);
+            }
+            let mut out = String::new();
+            for (name, ver) in installed {
+                out.push_str(&format!("{name} {ver}\n"));
+            }
+            (out, 0)
+        }
+        "install" | "add" | "update" | "upgrade" => {
+            let Some(name) = rest.get(1) else {
+                return ("pkg: usage: pkg install <name>\n".to_string(), 2);
+            };
+            if matches!(sub, "update" | "upgrade") {
+                let _ = crate::pkg::remove(name); // reinstall on update
+            }
+            match crate::pkg::fetch_and_install(name) {
+                Ok(n) => (format!("installed {n} (from {})\n", crate::pkg::REGISTRY), 0),
+                Err(e) => (format!("{e}\n"), 1),
+            }
+        }
+        "remove" | "rm" | "uninstall" => {
+            let Some(name) = rest.get(1) else {
+                return ("pkg: usage: pkg remove <name>\n".to_string(), 2);
+            };
+            match crate::pkg::remove(name) {
+                Ok(()) => (format!("removed {name}\n"), 0),
+                Err(e) => (format!("{e}\n"), 1),
+            }
+        }
+        "" => ("pkg: usage: pkg <install|remove|list|update> [name]\n".to_string(), 2),
+        other => (format!("pkg: unknown subcommand '{other}'\n"), 2),
     }
 }
 

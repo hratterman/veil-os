@@ -21,6 +21,7 @@ mod crypto;
 mod css;
 mod desktop;
 mod dtb;
+mod editor;
 mod exceptions;
 mod fb;
 mod files;

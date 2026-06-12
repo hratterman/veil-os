@@ -12,7 +12,7 @@ canvas x cw-52..cw-8, LOD at cw-100..cw-56, both y 2..26.
 """
 import sys
 
-from guilib import Driver, check, finish
+from guilib import Driver, check, finish, taskbar_xy
 
 WIN_X, WIN_Y, CW, CH = 40, 40, 420, 300
 CONTENT_X = WIN_X + 2
@@ -43,7 +43,7 @@ def main():
     # UX overhaul: nothing opens at boot. Launch the Editor from the
     # taskbar (idx 0: x=70+0*78+36=106, bottom 40px strip).
     mark0 = len(d.serial())
-    d.click(106, 768 - 20)
+    d.click(*taskbar_xy(d, "edit"))
     check("editor launched", d.wait_serial("WM: launch 'edit'", 5, mark0))
 
     if phase == "save":
@@ -52,6 +52,11 @@ def main():
         d.click(200, 200)  # focus the editor (clicks in the text area are inert)
         for line in TYPED.split("\n"):
             d.type_text(line + "\n")
+        # Move the cursor to the start so the snapshot's cursor block matches the
+        # load phase (which opens with the cursor at offset 0).
+        for q in ("up", "up", "home"):
+            d.send([{"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": q}}}])
+            d.send([{"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": q}}}])
         # drop the trailing enter we just typed to match TYPED exactly:
         # easier to just keep it — the buffer ends with '\n', deterministic
         # in both phases since LOD reloads the same bytes.

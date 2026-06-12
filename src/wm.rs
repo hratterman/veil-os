@@ -10,9 +10,9 @@
 
 use crate::fb::Framebuffer;
 use crate::{
-    breakout, browser, calc, clipboard, clock, files, font, freetype::FontId, fs, gifplayer, keymap,
-    kprintln, net, netdev, repl, scheduler, settings, shell, snake, snd, store, timer, video, viewer,
-    wasmapp,
+    breakout, browser, calc, clipboard, clock, editor, files, font, freetype::FontId, fs, gifplayer,
+    keymap, kprintln, net, netdev, repl, scheduler, settings, shell, snake, snd, store, timer, video,
+    viewer, wasmapp,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -420,20 +420,13 @@ pub struct PaintState {
     last: Option<(isize, isize)>,
 }
 
-pub struct EditorState {
-    file: String,   // 8.3 FAT name, e.g. NOTE.TXT
-    text: String,   // the buffer; insertion point is always the end
-    status: String, // last action, shown in the toolbar
-    scroll: usize,  // top visible row; usize::MAX = follow the cursor (bottom)
-}
-
 pub enum App {
     Echo { text: String },
     Static,
     Paint(PaintState),
     Shell { input: String, lines: Vec<String>, history: Vec<String>, hist: usize, scroll: usize },
     Browser(browser::BrowserState),
-    Editor(EditorState),
+    Editor(editor::EditorState),
     Clock(clock::ClockState),
     Chat(ChatState),
     Viewer(viewer::ViewerState),
@@ -506,7 +499,7 @@ pub fn render_window_content(win: &mut Window) {
         App::Wasm(_) => wasmapp::render(win),
         App::Breakout(_) => breakout::render(win),
         App::Shell { .. } => render_shell(win),
-        App::Editor(_) => render_editor(win),
+        App::Editor(_) => editor::render(win),
         App::Clock(_) => clock::render(win, timer::ticks()),
         App::Chat(_) => render_chat(win),
         App::Viewer(_) => viewer::render(win),
@@ -728,7 +721,7 @@ impl Wm {
                 App::Shell { input: String::new(), lines: Vec::new(), history: Vec::new(), hist: 0, scroll: usize::MAX },
             ),
             "edit" => {
-                self.add_window("edit", 40, 40, 420, 300, App::Editor(EditorState::open("NOTE.TXT")));
+                self.add_window("edit", 40, 40, 420, 300, App::Editor(editor::EditorState::open("NOTE.TXT")));
                 kprintln!("EDITOR: window open on NOTE.TXT");
             }
             "clock" => self.add_window("clock", 700, 36, 260, 260, App::Clock(clock::ClockState::new())),
@@ -871,7 +864,7 @@ impl Wm {
             render_shell(&mut win);
         }
         if matches!(win.app, App::Editor(_)) {
-            render_editor(&mut win);
+            editor::render(&mut win);
         }
         if matches!(win.app, App::Clock(_)) {
             clock::render(&mut win, timer::ticks());
@@ -921,7 +914,7 @@ impl Wm {
             .iter()
             .any(|e| name.ends_with(e))
         {
-            self.add_window(name, 60, 60, 460, 360, App::Editor(EditorState::open(name)));
+            self.add_window(name, 60, 60, 460, 360, App::Editor(editor::EditorState::open(name)));
             kprintln!("FILES: open {name} in Editor");
         } else if name.ends_with(".GIF") {
             self.add_window(name, 200, 90, 280, 240, App::Gif(gifplayer::GifPlayerState::with_file(name)));
@@ -980,7 +973,7 @@ impl Wm {
                 if let Some(win) = self.windows.last_mut() {
                     let handled = match &win.app {
                         App::Browser(_) => browser::wheel(win, dy),
-                        App::Editor(_) => editor_wheel(win, dy),
+                        App::Editor(_) => editor::wheel(win, dy),
                         App::Shell { .. } => shell_wheel(win, dy),
                         App::Files(_) => files::wheel(win, dy),
                         App::Lisp(_) => repl::wheel(win, dy),
@@ -1037,6 +1030,15 @@ impl Wm {
             return;
         }
         if self.ctrl {
+            // Editor shortcuts (save/undo/redo/find/replace/goto/tree) take the
+            // Ctrl combo before the generic clipboard/browser handling.
+            let shift = self.shift;
+            if let Some(win) = self.windows.last_mut() {
+                if matches!(win.app, App::Editor(_)) && editor::ctrl_key(win, code, shift) {
+                    self.dirty = true;
+                    return;
+                }
+            }
             match code {
                 keymap::KEY_F => {
                     if let Some(win) = self.windows.last_mut() {
@@ -1095,7 +1097,13 @@ impl Wm {
             }
         }
         // Browser scroll keys / viewer arrow keys have no character form.
+        let shift = self.shift;
         if let Some(win) = self.windows.last_mut() {
+            // Editor cursor movement / Enter / Tab / Delete (no char form).
+            if matches!(win.app, App::Editor(_)) && editor::key(win, code, shift) {
+                self.dirty = true;
+                return;
+            }
             if matches!(win.app, App::Browser(_)) && browser::key(win, code) {
                 self.dirty = true;
                 return;
@@ -1191,7 +1199,7 @@ impl Wm {
                     self.dirty = true;
                 }
                 App::Editor(_) => {
-                    editor_key(win, ch);
+                    editor::char_input(win, ch);
                     self.dirty = true;
                 }
                 App::Chat(_) => {
@@ -1307,8 +1315,9 @@ impl Wm {
             App::Browser(_) => {
                 browser::paste(win);
             }
-            App::Editor(_) => {
-                editor_paste(win, &text);
+            App::Editor(st) => {
+                st.paste(&text);
+                editor::render(win);
             }
             App::Lisp(_) => {
                 for c in text.chars().filter(|c| *c != '\n') {
@@ -1891,7 +1900,10 @@ impl Wm {
                         self.dirty = true;
                     }
                     App::Editor(_) => {
-                        editor_mouse_down(win, rx, ry);
+                        // A click on the file-tree sidebar opens that file.
+                        if let Some(name) = editor::click(win, rx, ry) {
+                            self.open_file(&name);
+                        }
                         self.dirty = true;
                     }
                     App::Wasm(_) => {
@@ -3121,306 +3133,3 @@ impl Wm {
     }
 }
 
-// --- editor app (M18) ---------------------------------------------------------
-// Toolbar strip (same height/style as Paint) with the filename + status on
-// the left and LOD / SAV buttons on the right; white text area below.
-// Insertion point is always the end of the buffer (no cursor movement in
-// v1), drawn as an inverted block. Lines wrap at the window edge and clip
-// at the bottom (no scrollback, per spec).
-
-const EDITOR_TEXT: u32 = 0xff18_2028;
-const EDITOR_MAX: usize = 8192;
-
-/// Bytes from disk -> editable text: keep newlines + printable ASCII.
-fn editor_decode(data: &[u8]) -> String {
-    data.iter()
-        .map(|&b| b as char)
-        .filter(|&c| c == '\n' || (' '..='~').contains(&c))
-        .collect()
-}
-
-impl EditorState {
-    /// Open `file` from the FAT16 disk, creating it empty if missing.
-    pub fn open(file: &str) -> EditorState {
-        let (text, status) = match fs::read_file(file) {
-            Some(data) => {
-                kprintln!("EDITOR: opened {file} ({} bytes)", data.len());
-                (editor_decode(&data), format!("{} bytes", data.len()))
-            }
-            None => {
-                let status = match fs::write_file(file, b"") {
-                    Ok(()) => "new file",
-                    Err(()) => "create failed",
-                };
-                kprintln!("EDITOR: {file} missing -> {status}");
-                (String::new(), String::from(status))
-            }
-        };
-        EditorState { file: String::from(file), text, status, scroll: usize::MAX }
-    }
-}
-
-/// Rows of text that fit in an editor window of canvas height `ch`.
-fn editor_rows(ch: usize) -> usize {
-    const LH: usize = 17;
-    (ch.saturating_sub(TOOLBAR_H as usize + 4)) / LH
-}
-
-/// Mouse-wheel in the editor: scroll the view by ~3 lines per notch. Positive
-/// `notches` scrolls up (toward the top of the file).
-fn editor_wheel(win: &mut Window, notches: i32) -> bool {
-    let ch = win.ch;
-    let App::Editor(st) = &mut win.app else { return false };
-    let nlines = if st.text.is_empty() { 1 } else { st.text.split('\n').count() };
-    let rows = editor_rows(ch);
-    let max_scroll = nlines.saturating_sub(rows);
-    let cur = if st.scroll == usize::MAX { max_scroll } else { st.scroll.min(max_scroll) };
-    let next = (cur as isize - notches as isize * 3).clamp(0, max_scroll as isize) as usize;
-    // Snapping back to the bottom re-enables cursor-follow.
-    st.scroll = if next >= max_scroll { usize::MAX } else { next };
-    kprintln!("EDITOR: scroll top={next} (max={max_scroll})");
-    true
-}
-
-fn render_editor_toolbar(fb: &Framebuffer, cw: usize, file: &str, status: &str) {
-    fb.fill_rect(0, 0, cw, TOOLBAR_H as usize, 0xffc8_ccd4);
-    fb.draw_string(6, 6, &format!("{file}  [{status}]"), 0xff30_3840, None);
-    fb.fill_rect(cw - 100, 2, 44, 24, 0xffb0_c8e0);
-    fb.draw_string(cw - 94, 6, "LOD", 0xff20_4080, None);
-    fb.fill_rect(cw - 52, 2, 44, 24, 0xffb0_e0b8);
-    fb.draw_string(cw - 46, 6, "SAV", 0xff20_6030, None);
-}
-
-// Dark code-editor theme (VS Code-ish).
-const ED_BG: u32 = 0xff1e_1e1e;
-const ED_GUTTER: u32 = 0xff25_2526;
-const ED_LINENO: u32 = 0xff85_8585;
-const ED_FG: u32 = 0xffd4_d4d4;
-const ED_KW: u32 = 0xff56_9cd6;
-const ED_STR: u32 = 0xffce_9178;
-const ED_NUM: u32 = 0xffb5_cea8;
-const ED_COMMENT: u32 = 0xff6a_9955;
-
-fn editor_lang(file: &str) -> &'static str {
-    let f = file.to_ascii_uppercase();
-    if f.ends_with(".RS") {
-        "rust"
-    } else if f.ends_with(".PY") {
-        "py"
-    } else if f.ends_with(".JS") {
-        "js"
-    } else if f.ends_with(".HTM") || f.ends_with(".HTML") {
-        "html"
-    } else if f.ends_with(".CSS") {
-        "css"
-    } else if f.ends_with(".SH") {
-        "sh"
-    } else {
-        "text"
-    }
-}
-
-fn is_keyword(word: &str, lang: &str) -> bool {
-    const RUST: &[&str] = &["fn", "let", "mut", "pub", "struct", "enum", "impl", "for", "while", "loop",
-        "if", "else", "match", "return", "use", "mod", "const", "static", "self", "Self", "trait", "where",
-        "as", "in", "ref", "move", "unsafe", "async", "await", "type", "dyn", "crate", "super", "true", "false"];
-    const PY: &[&str] = &["def", "class", "import", "from", "if", "else", "elif", "for", "while", "return",
-        "self", "None", "True", "False", "and", "or", "not", "in", "is", "lambda", "with", "as", "try", "except", "pass", "yield"];
-    const JS: &[&str] = &["function", "var", "let", "const", "if", "else", "for", "while", "return", "class",
-        "new", "this", "typeof", "instanceof", "null", "undefined", "true", "false", "async", "await", "import", "export"];
-    const SH: &[&str] = &["if", "then", "else", "fi", "for", "while", "do", "done", "case", "esac", "echo",
-        "export", "return", "function", "in"];
-    let set: &[&str] = match lang {
-        "rust" => RUST,
-        "py" => PY,
-        "js" | "html" | "css" => JS,
-        "sh" => SH,
-        _ => &[],
-    };
-    set.contains(&word)
-}
-
-/// Tokenise a source line into coloured spans for syntax highlighting.
-fn highlight_line(line: &str, lang: &str) -> Vec<(String, u32)> {
-    if lang == "text" {
-        return alloc::vec![(line.to_string(), ED_FG)];
-    }
-    let comment = if lang == "py" || lang == "sh" { "#" } else { "//" };
-    let mut spans = Vec::new();
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        // line comment to end
-        if line[byte_at(line, i)..].starts_with(comment) {
-            spans.push((chars[i..].iter().collect(), ED_COMMENT));
-            break;
-        }
-        if c == '"' || c == '\'' {
-            let q = c;
-            let mut s = String::new();
-            s.push(c);
-            i += 1;
-            while i < chars.len() {
-                s.push(chars[i]);
-                if chars[i] == q {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            spans.push((s, ED_STR));
-            continue;
-        }
-        if c.is_ascii_digit() {
-            let mut s = String::new();
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
-                s.push(chars[i]);
-                i += 1;
-            }
-            spans.push((s, ED_NUM));
-            continue;
-        }
-        if c.is_alphabetic() || c == '_' {
-            let mut s = String::new();
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                s.push(chars[i]);
-                i += 1;
-            }
-            let col = if is_keyword(&s, lang) { ED_KW } else { ED_FG };
-            spans.push((s, col));
-            continue;
-        }
-        spans.push((c.to_string(), ED_FG));
-        i += 1;
-    }
-    spans
-}
-
-fn byte_at(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
-}
-
-fn render_editor(win: &mut Window) {
-    let (file, status, text, user_scroll) = {
-        let App::Editor(st) = &win.app else { return };
-        (st.file.clone(), st.status.clone(), st.text.clone(), st.scroll)
-    };
-    let lang = editor_lang(&file);
-    let (cw, ch) = (win.cw, win.ch);
-    const LH: usize = 17;
-    const GUT_W: usize = 44;
-    let top = TOOLBAR_H as usize;
-    let rows = (ch - top - 4) / LH;
-
-    // Split on hard newlines only (no soft wrap with proportional metrics).
-    let src_lines: Vec<&str> = if text.is_empty() { alloc::vec![""] } else { text.split('\n').collect() };
-    let nlines = src_lines.len();
-    let cur_line = nlines; // cursor is at the end (1-based last line)
-    let cur_col = src_lines.last().map(|l| l.chars().count()).unwrap_or(0) + 1;
-    let total_rows = src_lines.len();
-    let max_scroll = total_rows.saturating_sub(rows);
-    // Follow the cursor (bottom) unless the user has scrolled up with the wheel.
-    let scroll = if user_scroll == usize::MAX { max_scroll } else { user_scroll.min(max_scroll) };
-
-    let fb = win.canvas_fb();
-    fb.fill_rect(0, top, cw, ch - top, ED_BG);
-    fb.fill_rect(0, top, GUT_W, ch - top, ED_GUTTER);
-    render_editor_toolbar(&fb, cw, &file, &status);
-    for (r, line) in src_lines.iter().skip(scroll).take(rows).enumerate() {
-        let y = top + 2 + r * LH;
-        let lineno = scroll + r + 1;
-        let num = format!("{lineno}");
-        let (nw, _) = fb.measure_text(&num, FontId::Mono, 13);
-        fb.draw_text(GUT_W - nw - 6, y + 1, &num, FontId::Mono, 13, ED_LINENO);
-        let mut x = GUT_W + 6;
-        for (span, col) in highlight_line(line, lang) {
-            fb.draw_text(x, y, &span, FontId::Mono, 14, col);
-            x += fb.measure_text(&span, FontId::Mono, 14).0;
-        }
-    }
-    // Cursor at the end of the buffer.
-    if cur_line > scroll && cur_line - scroll <= rows {
-        let y = top + 2 + (cur_line - 1 - scroll) * LH;
-        let cx = GUT_W + 6 + fb.measure_text(src_lines.last().unwrap_or(&""), FontId::Mono, 14).0;
-        fb.fill_rect(cx, y, 2, LH - 1, ED_FG);
-    }
-    // Status bar: line/col + size.
-    let sy = ch - 18;
-    fb.fill_rect(0, sy, cw, 18, 0xff007a_cc & 0x00ff_ffff | 0xff00_0000);
-    let info = format!("Ln {cur_line}, Col {cur_col}    {} bytes    {}", text.len(), lang);
-    fb.draw_text(8, sy + 2, &info, FontId::Ui, 12, 0xffffffff);
-}
-
-fn editor_key(win: &mut Window, ch: char) {
-    {
-        let App::Editor(st) = &mut win.app else { return };
-        match ch {
-            '\u{8}' => {
-                st.text.pop();
-            }
-            c if st.text.len() < EDITOR_MAX => st.text.push(c),
-            _ => {}
-        }
-        st.scroll = usize::MAX; // typing jumps back to the cursor
-        st.status = String::from("edited");
-    }
-    render_editor(win);
-}
-
-/// Append clipboard text at the editor's (end-of-buffer) cursor.
-fn editor_paste(win: &mut Window, text: &str) {
-    {
-        let App::Editor(st) = &mut win.app else { return };
-        let room = EDITOR_MAX.saturating_sub(st.text.len());
-        for c in text.chars().take(room) {
-            st.text.push(c);
-        }
-        st.scroll = usize::MAX; // jump to the cursor
-        st.status = String::from("edited");
-    }
-    render_editor(win);
-}
-
-fn editor_save(win: &mut Window) {
-    let App::Editor(st) = &mut win.app else { return };
-    match fs::write_file(&st.file, st.text.as_bytes()) {
-        Ok(()) => {
-            kprintln!("EDITOR: saved {} bytes to {}", st.text.len(), st.file);
-            kprintln!("EDITOR_OK");
-            st.status = format!("saved {} bytes", st.text.len());
-        }
-        Err(()) => {
-            kprintln!("EDITOR: save of {} failed (no filesystem?)", st.file);
-            st.status = String::from("save FAILED");
-        }
-    }
-}
-
-fn editor_load(win: &mut Window) {
-    let App::Editor(st) = &mut win.app else { return };
-    match fs::read_file(&st.file) {
-        Some(data) => {
-            st.text = editor_decode(&data);
-            kprintln!("EDITOR: loaded {} bytes from {}", data.len(), st.file);
-            kprintln!("EDITOR_OK");
-            st.status = format!("loaded {} bytes", data.len());
-        }
-        None => {
-            kprintln!("EDITOR: load of {} failed (missing or no filesystem)", st.file);
-            st.status = String::from("load FAILED");
-        }
-    }
-}
-
-fn editor_mouse_down(win: &mut Window, rx: isize, ry: isize) {
-    let cw = win.cw as isize;
-    if ry >= 2 && ry < 26 {
-        if rx >= cw - 52 && rx < cw - 8 {
-            editor_save(win);
-        } else if rx >= cw - 100 && rx < cw - 56 {
-            editor_load(win);
-        }
-    }
-    render_editor(win);
-}

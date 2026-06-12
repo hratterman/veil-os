@@ -269,6 +269,68 @@ pub fn remove(name: &str) -> Result<(), String> {
 
 // ---- self-test -------------------------------------------------------------
 
+/// M42 step 12: a third-party app (the SDK Calculator) built *externally* on a
+/// normal machine (`rustup run … cargo build --target wasm32-unknown-unknown`),
+/// packaged as a `.veil`, and proven end-to-end inside Veil: parse the package,
+/// run its SDK-built WASM in the on-OS runtime, and confirm the calculator's
+/// from-scratch expression parser evaluates with correct operator precedence.
+pub const CALC_VEIL: &[u8] = include_bytes!("../assets/apps/veil-calc.veil");
+
+pub fn sdk_app_selftest() {
+    // 1) Parse the .veil package built by the external SDK toolchain.
+    let p = match parse(CALC_VEIL) {
+        Ok(p) => p,
+        Err(e) => { crate::kprintln!("SDK_APP_FAIL: package parse {e}"); return; }
+    };
+    let manifest_ok = p.manifest.name == "veil-calc" && p.manifest.entry == "main.wasm";
+    let wasm = match p.file("main.wasm") {
+        Some(w) => w.to_vec(),
+        None => { crate::kprintln!("SDK_APP_FAIL: no main.wasm"); return; }
+    };
+    let is_wasm = wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]);
+
+    // 2) Run the SDK-built WASM in the on-OS runtime, driving the calculator via
+    //    its exported `eval_ascii(byte)` hook over one persistent instance (so
+    //    the expression buffer in linear memory accumulates across calls).
+    let module = match crate::wasm::parser::parse(&wasm) {
+        Some(m) => m,
+        None => { crate::kprintln!("SDK_APP_FAIL: wasm parse"); return; }
+    };
+    // Evaluate "2+3*4" — correct precedence gives 14 (not 20).
+    let run_expr = |expr: &str| -> Option<i64> {
+        let mut host = crate::wasm::host::Host::new();
+        let mut inst = crate::wasm::runtime::Instance::new(&module, &mut host);
+        let f = inst.find_export("eval_ascii")?;
+        let mut last = None;
+        for b in expr.bytes() {
+            last = inst.call(f, &[b as i64], 0)?.first().copied();
+        }
+        // '=' evaluates
+        last = inst.call(f, &[b'=' as i64], 0)?.first().copied();
+        last
+    };
+    let r1 = run_expr("2+3*4");        // -> 14 (precedence)
+    let r2 = run_expr("10+20+30");     // -> 60
+    let r3 = run_expr("100-2*9");      // -> 82
+    let r4 = run_expr("(1+2)*4");      // -> 12 (parentheses)
+
+    crate::kprintln!(
+        "SDK_APP: manifest_ok={manifest_ok} is_wasm={is_wasm} bytes={} | 2+3*4={r1:?} 10+20+30={r2:?} 100-2*9={r3:?} (1+2)*4={r4:?}",
+        wasm.len()
+    );
+    let math_ok = r1 == Some(14) && r2 == Some(60) && r3 == Some(82) && r4 == Some(12);
+    // 3) Install the package via the manager and confirm it lands in /apps.
+    crate::vfs::get();
+    let installed = install_bytes(CALC_VEIL).is_ok();
+    let on_disk = crate::vfs::get().read("/apps/veil-calc/main.wasm").is_some();
+    let _ = remove("veil-calc");
+    if manifest_ok && is_wasm && math_ok && installed && on_disk {
+        crate::kprintln!("SDK_APP_OK: a third-party SDK app (Calculator, built externally to wasm32) — .veil parsed, its WASM ran in Veil with correct operator precedence (2+3*4=14, (1+2)*4=12), and `pkg install` placed it in /apps");
+    } else {
+        crate::kprintln!("SDK_APP_FAIL: manifest={manifest_ok} wasm={is_wasm} math={math_ok} install={installed} disk={on_disk}");
+    }
+}
+
 pub fn selftest() {
     // A tiny valid WASM module (header only) as the package payload.
     let wasm: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];

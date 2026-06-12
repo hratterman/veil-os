@@ -166,6 +166,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         vfs::selftest(); // M42 step 6: mkdir/cd/paths + /home dotfiles + disk persistence
         netfs::selftest(); // M42 step 7: network filesystem protocol + mount registry
         pkg::selftest(); // M42 step 9: .veil package format + pkg manager (install/list/remove)
+        pkg::sdk_app_selftest(); // M42 step 12: external SDK app (Calculator) -> .veil -> run in Veil
         wm::multiplayer_selftest(); // M42 step 10: shared-desktop multi-cursor + peer registry
     }
     if milestone12(&fdt) {

@@ -1,0 +1,6 @@
+name = "veil-calc"
+version = "1.0.0"
+description = "A calculator with a real expression parser, built with the Veil SDK"
+author = "henry"
+entry = "main.wasm"
+permissions = ["storage"]

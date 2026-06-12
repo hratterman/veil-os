@@ -901,6 +901,137 @@ pub fn js_ws_close(id: usize) {
     }
 }
 
+// --- Web Storage (localStorage / sessionStorage) ----------------------------
+// Both survive across the per-render JS interpreter instances. localStorage is
+// persisted to FAT16 (LOCALSTG.DAT); sessionStorage is in-memory, cleared when
+// the browser window closes. Both are keyed by origin (the page's host).
+use alloc::collections::BTreeMap;
+type OriginStore = BTreeMap<String, BTreeMap<String, String>>;
+static mut LOCAL_STORAGE: Option<OriginStore> = None;
+static mut SESSION_STORAGE: OriginStore = BTreeMap::new();
+const LOCALSTG_FILE: &str = "LOCALSTG.DAT";
+
+/// The current page's storage origin (host), or "veil" for the local site.
+pub fn current_origin() -> String {
+    match page_base() {
+        Some(base) => url_host(&base),
+        None => String::from("veil"),
+    }
+}
+
+fn local_store() -> &'static mut OriginStore {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(LOCAL_STORAGE);
+        if slot.is_none() {
+            *slot = Some(load_local_from_disk());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn session_store() -> &'static mut OriginStore {
+    unsafe { &mut *core::ptr::addr_of_mut!(SESSION_STORAGE) }
+}
+
+/// Parse the on-disk store: lines of `origin\tkey\tvalue` (value %-newline-safe).
+fn load_local_from_disk() -> OriginStore {
+    let mut map: OriginStore = BTreeMap::new();
+    if let Some(data) = crate::fs::read_file(LOCALSTG_FILE) {
+        let text = String::from_utf8_lossy(&data);
+        for line in text.lines() {
+            let mut parts = line.splitn(3, '\t');
+            if let (Some(o), Some(k), Some(v)) = (parts.next(), parts.next(), parts.next()) {
+                map.entry(o.into()).or_default().insert(k.into(), unescape_nl(v));
+            }
+        }
+    }
+    map
+}
+
+fn save_local_to_disk() {
+    let store = local_store();
+    let mut out = String::new();
+    for (origin, kv) in store.iter() {
+        for (k, v) in kv.iter() {
+            out.push_str(origin);
+            out.push('\t');
+            out.push_str(k);
+            out.push('\t');
+            out.push_str(&escape_nl(v));
+            out.push('\n');
+        }
+    }
+    let _ = crate::fs::write_file(LOCALSTG_FILE, out.as_bytes());
+}
+
+fn escape_nl(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
+}
+fn unescape_nl(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn store_for(local: bool) -> &'static mut OriginStore {
+    if local {
+        local_store()
+    } else {
+        session_store()
+    }
+}
+
+pub fn storage_get(local: bool, origin: &str, key: &str) -> Option<String> {
+    store_for(local).get(origin).and_then(|kv| kv.get(key)).cloned()
+}
+
+pub fn storage_set(local: bool, origin: &str, key: &str, val: &str) {
+    store_for(local).entry(origin.into()).or_default().insert(key.into(), val.into());
+    if local {
+        save_local_to_disk();
+    }
+}
+
+pub fn storage_remove(local: bool, origin: &str, key: &str) {
+    if let Some(kv) = store_for(local).get_mut(origin) {
+        kv.remove(key);
+    }
+    if local {
+        save_local_to_disk();
+    }
+}
+
+pub fn storage_clear(local: bool, origin: &str) {
+    if let Some(kv) = store_for(local).get_mut(origin) {
+        kv.clear();
+    }
+    if local {
+        save_local_to_disk();
+    }
+}
+
+pub fn storage_keys(local: bool, origin: &str) -> Vec<String> {
+    store_for(local).get(origin).map(|kv| kv.keys().cloned().collect()).unwrap_or_default()
+}
+
+/// Clear sessionStorage when the browser window closes.
+pub fn storage_clear_session() {
+    session_store().clear();
+}
+
 /// Fetch `path`, optionally with a POST `body`. Local paths ("/page.htm") hit
 /// our own HTTP server on loopback; `https://` URLs use the from-scratch TLS 1.3
 /// stack directly; other external `http://` URLs go direct over our TCP stack,

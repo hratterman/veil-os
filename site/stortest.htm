@@ -1,0 +1,17 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<h1>Storage test</h1>
+<div id="out">pending</div>
+<script>
+let lc = parseInt(localStorage.getItem('lc') || '0') + 1;
+localStorage.setItem('lc', lc);
+let sc = parseInt(sessionStorage.getItem('sc') || '0') + 1;
+sessionStorage.setItem('sc', sc);
+localStorage.note = 'persisted';
+const msg = 'STG lc=' + lc + ' sc=' + sc + ' len=' + localStorage.length + ' note=' + localStorage.note;
+console.log(msg);
+document.getElementById('out').textContent = msg;
+</script>
+</body>
+</html>

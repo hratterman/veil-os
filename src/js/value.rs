@@ -47,6 +47,7 @@ pub enum Host {
     Console,
     Math,
     LocalStorage,
+    SessionStorage,
     History,
     Location,
     /// element.style

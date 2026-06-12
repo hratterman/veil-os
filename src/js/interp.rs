@@ -100,7 +100,7 @@ impl Interp {
         b.vars.insert("console".into(), Val::Host(Host::Console));
         b.vars.insert("Math".into(), Val::Host(Host::Math));
         b.vars.insert("localStorage".into(), Val::Host(Host::LocalStorage));
-        b.vars.insert("sessionStorage".into(), Val::Host(Host::LocalStorage));
+        b.vars.insert("sessionStorage".into(), Val::Host(Host::SessionStorage));
         b.vars.insert("history".into(), Val::Host(Host::History));
         b.vars.insert("location".into(), Val::Host(Host::Location));
         for f in ["setTimeout", "setInterval", "requestAnimationFrame", "clearTimeout",
@@ -1530,6 +1530,11 @@ impl Interp {
             Val::Host(Host::Style(idx)) => {
                 self.dom.set_style(*idx, prop, &v.to_str());
             }
+            Val::Host(h @ (Host::LocalStorage | Host::SessionStorage)) => {
+                let local = matches!(h, Host::LocalStorage);
+                let origin = crate::browser::current_origin();
+                crate::browser::storage_set(local, &origin, prop, &v.to_str());
+            }
             Val::Host(Host::Location) => { /* navigation ignored */ }
             _ => {}
         }
@@ -1659,7 +1664,19 @@ impl Interp {
                 "origin" => Val::str("https://henryratterman.com"),
                 _ => Val::Native(Native::Method(Box::new(Val::Host(Host::Location)), Rc::from(prop))),
             },
-            Host::ClassList(_) | Host::Console | Host::LocalStorage | Host::History
+            Host::LocalStorage | Host::SessionStorage => {
+                let local = matches!(h, Host::LocalStorage);
+                let origin = crate::browser::current_origin();
+                if prop == "length" {
+                    return Val::Num(crate::browser::storage_keys(local, &origin).len() as f64);
+                }
+                if matches!(prop, "getItem" | "setItem" | "removeItem" | "clear" | "key") {
+                    return Val::Native(Native::Method(Box::new(Val::Host(h)), Rc::from(prop)));
+                }
+                // Direct property access: localStorage.foo === localStorage.getItem('foo')
+                crate::browser::storage_get(local, &origin, prop).map(Val::str).unwrap_or(Val::Undef)
+            }
+            Host::ClassList(_) | Host::Console | Host::History
             | Host::Style(_) | Host::Dataset(_) => {
                 if let Host::Style(idx) = h {
                     return Val::str(self.dom.get_style(idx, prop));
@@ -1687,20 +1704,8 @@ impl Interp {
                 Ok(Some(Val::Undef))
             }
             Val::Host(Host::Math) => Ok(Some(math_method(name, args))),
-            Val::Host(Host::LocalStorage) => match name {
-                "getItem" => Ok(Some(
-                    self.storage.get(&a0().to_str()).map(|s| Val::str(s.clone())).unwrap_or(Val::Null),
-                )),
-                "setItem" => {
-                    self.storage.insert(a0().to_str(), args.get(1).map(|v| v.to_str()).unwrap_or_default());
-                    Ok(Some(Val::Undef))
-                }
-                "removeItem" => {
-                    self.storage.remove(&a0().to_str());
-                    Ok(Some(Val::Undef))
-                }
-                _ => Ok(Some(Val::Undef)),
-            },
+            Val::Host(Host::LocalStorage) => Ok(Some(self.storage_method(true, name, args))),
+            Val::Host(Host::SessionStorage) => Ok(Some(self.storage_method(false, name, args))),
             Val::Host(Host::History) => Ok(Some(Val::Undef)),
             Val::Host(Host::Location) => Ok(Some(Val::Undef)),
             Val::Host(Host::ClassList(idx)) => Ok(Some(self.classlist_method(*idx, name, args))),
@@ -1711,6 +1716,34 @@ impl Interp {
             Val::Num(n) => Ok(Some(num_method(*n, name, args))),
             Val::Object(o) => self.object_method(o.clone(), name, args),
             _ => Ok(None),
+        }
+    }
+
+    /// localStorage / sessionStorage methods, persisted via the browser (which
+    /// keeps them across the per-render interpreter instances).
+    fn storage_method(&mut self, local: bool, name: &str, args: &[Val]) -> Val {
+        let origin = crate::browser::current_origin();
+        let a0 = args.first().map(|v| v.to_str()).unwrap_or_default();
+        match name {
+            "getItem" => crate::browser::storage_get(local, &origin, &a0).map(Val::str).unwrap_or(Val::Null),
+            "setItem" => {
+                let v = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                crate::browser::storage_set(local, &origin, &a0, &v);
+                Val::Undef
+            }
+            "removeItem" => {
+                crate::browser::storage_remove(local, &origin, &a0);
+                Val::Undef
+            }
+            "clear" => {
+                crate::browser::storage_clear(local, &origin);
+                Val::Undef
+            }
+            "key" => {
+                let keys = crate::browser::storage_keys(local, &origin);
+                keys.get(a0.parse::<usize>().unwrap_or(usize::MAX)).cloned().map(Val::str).unwrap_or(Val::Null)
+            }
+            _ => Val::Undef,
         }
     }
 

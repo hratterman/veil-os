@@ -19,6 +19,9 @@ fi
 # file is committed, so this only runs on a fresh checkout; needs Pillow +
 # network. Tolerate failure (the committed file is the fallback).
 [ -f src/fonts_generated.rs ] || python3 scripts/gen_fonts.py || true
+# M41 step 17: trusted root CA store (Mozilla bundle via certifi). Committed, so
+# this only runs on a fresh checkout; tolerate failure (the file is the fallback).
+[ -f src/x509_roots.rs ] || python3 scripts/gen_roots.py || true
 
 (cd user && cargo build --release --quiet)
 for bin in hello ls cat echo spin evil; do

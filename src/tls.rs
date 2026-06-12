@@ -140,6 +140,8 @@ pub struct TlsConn {
     rx: Rx,
     client: Keys, // application traffic
     server: Keys,
+    /// The server's presented certificate chain (leaf first), for validation.
+    pub cert_chain: Vec<Vec<u8>>,
 }
 
 impl TlsConn {
@@ -283,6 +285,38 @@ fn parse_server_hello(sh: &[u8]) -> Option<[u8; 32]> {
     None
 }
 
+/// Parse a TLS 1.3 Certificate message body (after the 4-byte handshake header)
+/// into the DER certificate chain (leaf first).
+fn parse_certificate_msg(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    // certificate_request_context: 1-byte length + bytes.
+    let ctx_len = *body.first().unwrap_or(&0) as usize;
+    let mut p = 1 + ctx_len;
+    if p + 3 > body.len() {
+        return out;
+    }
+    // certificate_list: u24 length, then entries.
+    let list_len = ((body[p] as usize) << 16) | ((body[p + 1] as usize) << 8) | body[p + 2] as usize;
+    p += 3;
+    let end = (p + list_len).min(body.len());
+    while p + 3 <= end {
+        let clen = ((body[p] as usize) << 16) | ((body[p + 1] as usize) << 8) | body[p + 2] as usize;
+        p += 3;
+        if p + clen > end {
+            break;
+        }
+        out.push(body[p..p + clen].to_vec());
+        p += clen;
+        // per-cert extensions: u16 length + bytes.
+        if p + 2 > end {
+            break;
+        }
+        let elen = ((body[p] as usize) << 8) | body[p + 1] as usize;
+        p += 2 + elen;
+    }
+    out
+}
+
 /// Full TLS 1.3 handshake to `host:port`. Returns a ready TlsConn on success.
 pub fn tls_connect(host: &str, port: u16) -> Option<TlsConn> {
     let ip = net::dns_resolve(host)?;
@@ -346,6 +380,7 @@ pub fn tls_connect(host: &str, port: u16) -> Option<TlsConn> {
     // running buffer (a message may span records). Verify the server Finished.
     let mut hs_data: Vec<u8> = Vec::new();
     let mut server_finished_ok = false;
+    let mut cert_chain: Vec<Vec<u8>> = Vec::new();
     'flight: loop {
         // Consume any complete handshake messages already buffered.
         while hs_data.len() >= 4 {
@@ -367,9 +402,11 @@ pub fn tls_connect(host: &str, port: u16) -> Option<TlsConn> {
                 transcript.extend_from_slice(&msg);
                 break 'flight;
             }
-            // EncryptedExtensions / Certificate / CertificateVerify: cert
-            // validation deliberately skipped — just keep the transcript.
-            let _ = (HS_ENCRYPTED_EXT, HS_CERTIFICATE, HS_CERT_VERIFY);
+            // Capture the Certificate message's chain for validation (M41 #17).
+            if mtype == HS_CERTIFICATE {
+                cert_chain = parse_certificate_msg(&msg[4..]);
+            }
+            let _ = (HS_ENCRYPTED_EXT, HS_CERT_VERIFY);
             transcript.extend_from_slice(&msg);
         }
         // Need more record data.
@@ -418,9 +455,11 @@ pub fn tls_connect(host: &str, port: u16) -> Option<TlsConn> {
     net::tcp_write(sock, &fin_rec);
 
     kprintln!("TLS: handshake complete — application keys ready");
+    kprintln!("TLS: server presented {} certificate(s)", cert_chain.len());
     Some(TlsConn {
         rx,
         client: traffic_keys(&c_ap),
         server: traffic_keys(&s_ap),
+        cert_chain,
     })
 }

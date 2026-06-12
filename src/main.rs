@@ -55,6 +55,7 @@ mod perms;
 mod pi4;
 mod png;
 mod repl;
+mod rsa;
 mod scheduler;
 mod semihosting;
 mod settings;
@@ -74,6 +75,7 @@ mod wasm;
 mod wasmapp;
 mod websocket;
 mod wm;
+mod x509;
 
 use core::panic::PanicInfo;
 use core::ptr::{read_volatile, write_volatile};
@@ -133,6 +135,9 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
         shell::selftest(); // M41: bash-subset shell interpreter
         shell::coreutils_selftest(); // M41: grep(regex)/sed/awk/cut/tr standalone tools
+        rsa::selftest(); // M41: from-scratch RSA modexp for X.509 validation
+        x509::selftest(); // M41: X.509 parse + chain validation (self-signed/expired/hostname)
+        browser::hsts_selftest(); // M41: HSTS record + http->https upgrade
     }
     milestone9();
     milestone10(&fdt);

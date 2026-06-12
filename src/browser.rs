@@ -1001,6 +1001,21 @@ fn tls_get(url: &str, body: Option<&[u8]>) -> Option<(u32, String, Vec<u8>)> {
         None => (hostport, 443u16),
     };
     let mut conn = tls::tls_connect(host, port)?;
+    // M41 step 17: validate the certificate chain (expiry / hostname / trusted
+    // CA). On failure, unless the user has overridden this host, return a
+    // browser-style warning page instead of the content.
+    let now = timer::wall_ticks50().map(|t| (t / 50) as i64).unwrap_or(0);
+    let status = crate::x509::validate(&conn.cert_chain, host, now);
+    if !status.ok() {
+        kprintln!("CERT_INVALID: {host} — {}", status.reason());
+        if !cert_overridden(host) {
+            conn.close();
+            return Some((526, String::from("text/html"), cert_warning_page(host, path, status).into_bytes()));
+        }
+        kprintln!("CERT: proceeding to {host} despite warning (user override)");
+    } else {
+        kprintln!("CERT_OK: {host} certificate validated (trusted CA, in-date, hostname matches)");
+    }
     let req = build_request(path, host, body);
     conn.write(&req);
     let deadline = timer::ticks() + 600;
@@ -1019,11 +1034,95 @@ fn tls_get(url: &str, body: Option<&[u8]>) -> Option<(u32, String, Vec<u8>)> {
     }
     conn.close();
     harvest_cookies(&resp, host);
+    harvest_hsts(&resp, host);
     let parsed = parse_response(&resp, url)?;
     if parsed.0 == 200 && !TLS_OK_DONE.swap(true, Ordering::Relaxed) {
         kprintln!("TLS_OK");
     }
     Some(parsed)
+}
+
+// --- M41 step 17: cert-warning override + HSTS --------------------------------
+
+// Hosts the user accepted despite a certificate warning.
+static mut CERT_OVERRIDES: Vec<String> = Vec::new();
+// Hosts that sent Strict-Transport-Security — future http:// is upgraded.
+static mut HSTS_HOSTS: Vec<String> = Vec::new();
+
+fn cert_overridden(host: &str) -> bool {
+    unsafe { (*core::ptr::addr_of!(CERT_OVERRIDES)).iter().any(|h| h == host) }
+}
+
+fn add_cert_override(host: &str) {
+    unsafe {
+        let v = &mut *core::ptr::addr_of_mut!(CERT_OVERRIDES);
+        if !v.iter().any(|h| h == host) {
+            v.push(String::from(host));
+        }
+    }
+    kprintln!("CERT_OVERRIDE: {host} added to exceptions");
+}
+
+/// Record an HSTS host from a Strict-Transport-Security response header.
+fn harvest_hsts(resp: &[u8], host: &str) {
+    let text = String::from_utf8_lossy(resp);
+    let head = text.split("\r\n\r\n").next().unwrap_or("");
+    for line in head.lines() {
+        if line.to_ascii_lowercase().starts_with("strict-transport-security") {
+            unsafe {
+                let v = &mut *core::ptr::addr_of_mut!(HSTS_HOSTS);
+                if !v.iter().any(|h| h == host) {
+                    v.push(String::from(host));
+                    kprintln!("HSTS: {host} now HTTPS-only (Strict-Transport-Security)");
+                }
+            }
+        }
+    }
+}
+
+/// Boot self-test: HSTS is recorded from a response header and upgrades a later
+/// http:// URL for that host.
+pub fn hsts_selftest() {
+    let resp = b"HTTP/1.1 200 OK\r\nStrict-Transport-Security: max-age=31536000\r\n\r\nhi";
+    harvest_hsts(resp, "hsts-test.example");
+    let up = hsts_upgrade("http://hsts-test.example/page");
+    let other = hsts_upgrade("http://plain.example/page");
+    if up == "https://hsts-test.example/page" && other == "http://plain.example/page" {
+        kprintln!("HSTS_OK: Strict-Transport-Security recorded; http:// upgraded to https://");
+    } else {
+        kprintln!("HSTS_FAIL: up={up} other={other}");
+    }
+}
+
+/// If `url` is http:// to an HSTS host, upgrade it to https://.
+fn hsts_upgrade(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+        let is_hsts = unsafe { (*core::ptr::addr_of!(HSTS_HOSTS)).iter().any(|h| h == host) };
+        if is_hsts {
+            kprintln!("HSTS: upgrading http://{host} -> https://");
+            return format!("https://{rest}");
+        }
+    }
+    String::from(url)
+}
+
+/// A browser-style certificate warning page with an "I understand the risks"
+/// override link (a `cert-override:` URL the navigator handles).
+fn cert_warning_page(host: &str, path: &str, status: crate::x509::CertStatus) -> String {
+    format!(
+        "<html><head><style>body{{background:#3a1414;color:#f0d0d0;font-family:sans-serif;\
+        padding:30px}}h1{{color:#ff8080}}a{{color:#ffd060}}.box{{background:#241010;\
+        padding:18px;border-radius:8px;max-width:560px}}</style></head><body>\
+        <div class=box><h1>&#9888; Your connection is not secure</h1>\
+        <p>Veil could not verify the identity of <b>{host}</b>.</p>\
+        <p>Reason: {reason}.</p>\
+        <p>Attackers might be trying to steal your information. You should not \
+        proceed.</p>\
+        <p><a href=\"cert-override:https://{host}{path}\">I understand the risks — proceed anyway</a></p>\
+        </div></body></html>",
+        reason = status.reason()
+    )
 }
 
 static DIRECT_HTTP_DONE: AtomicBool = AtomicBool::new(false);
@@ -3463,7 +3562,17 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
 /// Navigate, optionally POSTing `body` (form submission). The body is sent only
 /// on the first request; any 302/303 redirect is then followed with a GET.
 pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_click: bool) {
-    let path = compat_rewrite(&resolve_href(path));
+    // M41 step 17: "I understand the risks" — `cert-override:<url>` adds the
+    // host to the exception list and re-fetches the real URL.
+    if let Some(real) = path.strip_prefix("cert-override:") {
+        if let Some(host) = real.strip_prefix("https://").and_then(|r| r.split('/').next()) {
+            add_cert_override(host);
+        }
+        return navigate_body(win, real, None, true);
+    }
+    // HSTS: upgrade http:// to https:// for hosts that demanded it.
+    let path = hsts_upgrade(path);
+    let path = compat_rewrite(&resolve_href(&path));
     let was_external = is_external(&path);
     let path_for_log = path.clone();
     // Set the base so this page's relative stylesheets/images/links resolve

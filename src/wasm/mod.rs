@@ -50,6 +50,47 @@ pub fn call_export_jit(data: &[u8], name: &str, arg: i32) -> Option<(i64, bool)>
     call_export(data, name, &[arg as i64]).map(|r| (r, false))
 }
 
+/// One frame of a graphical WASM app (M41 step 12). The app's linear memory
+/// holds its state across frames; `mem` carries it forward. If `cb` is given
+/// (e.g. ("on_click", [x, y]) or ("init", [])) it runs before `render`.
+pub struct AppFrame {
+    pub px: Vec<u32>,
+    pub mem: Vec<u8>,
+    pub log: String,
+}
+
+pub fn app_has_render(data: &[u8]) -> bool {
+    parser::parse(data).map(|m| m.exports.iter().any(|e| e.kind == 0 && e.name == "render")).unwrap_or(false)
+}
+
+/// Run one app frame: restore memory, run an optional callback, then `render`,
+/// drawing into a fresh `w*h` host surface. Returns the surface + new memory.
+pub fn app_frame(
+    data: &[u8],
+    w: usize,
+    h: usize,
+    mem: Option<Vec<u8>>,
+    cb: Option<(&str, &[i64])>,
+) -> Option<AppFrame> {
+    let module = parser::parse(data)?;
+    let mut host = host::Host::new_graphical(w, h);
+    let mut inst = runtime::Instance::new(&module, &mut host);
+    if let Some(m) = mem {
+        let n = m.len().min(inst.mem.len());
+        inst.mem[..n].copy_from_slice(&m[..n]);
+    }
+    if let Some((name, args)) = cb {
+        if let Some(idx) = inst.find_export(name) {
+            inst.call(idx, args, 0);
+        }
+    }
+    if let Some(idx) = inst.find_export("render") {
+        inst.call(idx, &[], 0);
+    }
+    let px = inst.host.fb.as_ref().map(|f| f.px.clone()).unwrap_or_default();
+    Some(AppFrame { px, mem: inst.mem.clone(), log: inst.host.output.clone() })
+}
+
 /// A short human description of a module (for the WASM window header).
 pub fn describe(data: &[u8]) -> String {
     match parser::parse(data) {

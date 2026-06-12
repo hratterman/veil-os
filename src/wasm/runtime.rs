@@ -136,6 +136,18 @@ impl<'a> Instance<'a> {
                         do_branch(&mut stack, &mut ctrl, &mut pc, l)?;
                     }
                 }
+                0x0e => {
+                    // br_table: count labels, then a default; pop the index.
+                    let count = uleb(body, &mut pc)? as usize;
+                    let mut labels: Vec<usize> = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        labels.push(uleb(body, &mut pc)? as usize);
+                    }
+                    let default = uleb(body, &mut pc)? as usize;
+                    let idx = pop(&mut stack)? as u32 as usize;
+                    let l = if idx < count { labels[idx] } else { default };
+                    do_branch(&mut stack, &mut ctrl, &mut pc, l)?;
+                }
                 0x0f => {
                     let n = stack.len();
                     return Some(stack.split_off(n.saturating_sub(nresults)));
@@ -211,6 +223,41 @@ impl<'a> Instance<'a> {
                     self.mem.resize(self.mem.len() + n * PAGE, 0);
                     stack.push(old as i64);
                 }
+                0xfc => {
+                    // Bulk-memory / saturating-truncate prefix. We need
+                    // memory.copy (0x0a) and memory.fill (0x0b); real compilers
+                    // emit these to zero-init / move stack arrays.
+                    let sub = uleb(body, &mut pc)?;
+                    match sub {
+                        0x0a => {
+                            pc += 2; // two memory indices
+                            let n = pop(&mut stack)? as u32 as usize;
+                            let src = pop(&mut stack)? as u32 as usize;
+                            let dst = pop(&mut stack)? as u32 as usize;
+                            if src + n <= self.mem.len() && dst + n <= self.mem.len() {
+                                self.mem.copy_within(src..src + n, dst);
+                            } else {
+                                return None;
+                            }
+                        }
+                        0x0b => {
+                            pc += 1; // memory index
+                            let n = pop(&mut stack)? as u32 as usize;
+                            let val = pop(&mut stack)? as u8;
+                            let dst = pop(&mut stack)? as u32 as usize;
+                            if dst + n <= self.mem.len() {
+                                for b in &mut self.mem[dst..dst + n] {
+                                    *b = val;
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                        // saturating float→int truncations (0x00..0x07): pop one,
+                        // push it back clamped to i32/i64 — apps rarely hit these.
+                        _ => {}
+                    }
+                }
                 0x41 => {
                     let v = sleb(body, &mut pc)?;
                     stack.push(v as i32 as i64);
@@ -278,6 +325,20 @@ impl<'a> Instance<'a> {
             ($f:expr) => {{
                 let b = a32(pop(st)?);
                 let a = a32(pop(st)?);
+                st.push(if $f(a, b) { 1 } else { 0 });
+            }};
+        }
+        macro_rules! bin64 {
+            ($f:expr) => {{
+                let b = pop(st)?;
+                let a = pop(st)?;
+                st.push($f(a, b));
+            }};
+        }
+        macro_rules! cmp64 {
+            ($f:expr) => {{
+                let b = pop(st)?;
+                let a = pop(st)?;
                 st.push(if $f(a, b) { 1 } else { 0 });
             }};
         }
@@ -351,6 +412,21 @@ impl<'a> Instance<'a> {
             0x76 => bin32!(|a: i32, b: i32| ((a as u32).wrapping_shr(b as u32)) as i32),
             0x77 => bin32!(|a: i32, b: i32| a.rotate_left(b as u32)),
             0x78 => bin32!(|a: i32, b: i32| a.rotate_right(b as u32)),
+            // i64 comparisons (operands kept full-width on the stack).
+            0x50 => {
+                let a = pop(st)?;
+                st.push(if a == 0 { 1 } else { 0 });
+            }
+            0x51 => cmp64!(|a: i64, b: i64| a == b),
+            0x52 => cmp64!(|a: i64, b: i64| a != b),
+            0x53 => cmp64!(|a: i64, b: i64| a < b),
+            0x54 => cmp64!(|a: i64, b: i64| (a as u64) < (b as u64)),
+            0x55 => cmp64!(|a: i64, b: i64| a > b),
+            0x56 => cmp64!(|a: i64, b: i64| (a as u64) > (b as u64)),
+            0x57 => cmp64!(|a: i64, b: i64| a <= b),
+            0x58 => cmp64!(|a: i64, b: i64| (a as u64) <= (b as u64)),
+            0x59 => cmp64!(|a: i64, b: i64| a >= b),
+            0x5a => cmp64!(|a: i64, b: i64| (a as u64) >= (b as u64)),
             // a handful of i64 ops (add/sub/mul/and/or/xor) on the full width.
             0x7c => {
                 let b = pop(st)?;
@@ -367,6 +443,46 @@ impl<'a> Instance<'a> {
                 let a = pop(st)?;
                 st.push(a.wrapping_mul(b));
             }
+            0x7f => {
+                let b = pop(st)?;
+                let a = pop(st)?;
+                if b == 0 {
+                    return None;
+                }
+                st.push(a.wrapping_div(b));
+            } // i64.div_s
+            0x80 => {
+                let b = pop(st)? as u64;
+                let a = pop(st)? as u64;
+                if b == 0 {
+                    return None;
+                }
+                st.push((a / b) as i64);
+            } // i64.div_u
+            0x81 => {
+                let b = pop(st)?;
+                let a = pop(st)?;
+                if b == 0 {
+                    return None;
+                }
+                st.push(a.wrapping_rem(b));
+            } // i64.rem_s
+            0x82 => {
+                let b = pop(st)? as u64;
+                let a = pop(st)? as u64;
+                if b == 0 {
+                    return None;
+                }
+                st.push((a % b) as i64);
+            } // i64.rem_u
+            0x83 => bin64!(|a: i64, b: i64| a & b),
+            0x84 => bin64!(|a: i64, b: i64| a | b),
+            0x85 => bin64!(|a: i64, b: i64| a ^ b),
+            0x86 => bin64!(|a: i64, b: i64| a.wrapping_shl(b as u32)),
+            0x87 => bin64!(|a: i64, b: i64| a.wrapping_shr(b as u32)),
+            0x88 => bin64!(|a: i64, b: i64| ((a as u64).wrapping_shr(b as u32)) as i64),
+            0x89 => bin64!(|a: i64, b: i64| a.rotate_left(b as u32)),
+            0x8a => bin64!(|a: i64, b: i64| a.rotate_right(b as u32)),
             0xa7 => {
                 let a = pop(st)?;
                 st.push(a as i32 as i64);
@@ -494,6 +610,18 @@ fn instr_len(d: &[u8], pc: usize) -> usize {
             skip_uleb(&mut p);
         }
         0x3f | 0x40 => p += 1,
+        0xfc => {
+            // prefix + uleb subopcode + per-op immediates
+            let sub_start = p;
+            skip_uleb(&mut p);
+            // re-read the (small) subopcode to size its immediates
+            let sub = d.get(sub_start).copied().unwrap_or(0);
+            match sub {
+                0x0a => p += 2, // memory.copy: two memory indices
+                0x0b => p += 1, // memory.fill: one memory index
+                _ => {}         // sat-truncate ops: no immediates
+            }
+        }
         0x0e => {
             // br_table: count, count+1 ulebs
             let mut count = 0u64;

@@ -1867,6 +1867,10 @@ impl Wm {
                         editor_mouse_down(win, rx, ry);
                         self.dirty = true;
                     }
+                    App::Wasm(_) => {
+                        wasmapp::click(win, rx, ry);
+                        self.dirty = true;
+                    }
                     App::Clock(_) => {
                         clock::click(win, rx, ry);
                         self.dirty = true;

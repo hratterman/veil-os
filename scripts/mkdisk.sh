@@ -78,6 +78,8 @@ python3 scripts/mkwasm.py assets >/dev/null 2>&1 || true
 cp assets/hello.wasm "$MNT/HELLO.WSM" 2>/dev/null || true
 cp assets/compute.wasm "$MNT/COMPUTE.WSM" 2>/dev/null || true
 cp assets/netget.wasm "$MNT/NETGET.WSM" 2>/dev/null || true
+# M41 step 12: the SDK "Hello, Veil" example app (graphical: render + on_click).
+cp assets/helloapp.wasm "$MNT/HELLOAPP.WSM" 2>/dev/null || true
 # M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
 python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
 # M37 codecs: a from-scratch-decoded MP3 (Layer III) and H.264 baseline MP4.

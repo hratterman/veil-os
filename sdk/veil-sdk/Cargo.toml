@@ -1,0 +1,9 @@
+[package]
+name = "veil-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Ergonomic Rust bindings for the Veil OS WebAssembly app ABI"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]

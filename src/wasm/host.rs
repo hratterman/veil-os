@@ -6,11 +6,21 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// A host-owned drawing surface a graphical WASM app renders into via the
+/// `veil_*` graphics ABI (M41 step 12). The app window blits it after each call.
+pub struct HostFb {
+    pub px: Vec<u32>,
+    pub w: usize,
+    pub h: usize,
+}
+
 pub struct Host {
     pub output: String,
     /// Open TCP sockets opened by `veil_tcp_connect`, indexed by the handle the
     /// guest holds. (M41 step 11: network access for WASM apps.)
     sockets: Vec<Option<crate::net::Handle>>,
+    /// Drawing surface for a graphical app (None for plain WASI modules).
+    pub fb: Option<HostFb>,
 }
 
 /// Read a guest string given (ptr, len) i64 args.
@@ -31,12 +41,79 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 
 impl Host {
     pub fn new() -> Host {
-        Host { output: String::new(), sockets: Vec::new() }
+        Host { output: String::new(), sockets: Vec::new(), fb: None }
+    }
+
+    /// A host with a `w*h` drawing surface (for graphical apps).
+    pub fn new_graphical(w: usize, h: usize) -> Host {
+        Host { output: String::new(), sockets: Vec::new(), fb: Some(HostFb { px: vec![0xff14_1414; w * h], w, h }) }
     }
 
     /// Dispatch an imported function call. Returns its (single) i32/i64 result.
     pub fn call(&mut self, field: &str, args: &[i64], mem: &mut [u8]) -> Option<i64> {
         match field {
+            // ---- M41 step 12: Veil graphics / storage / log ABI ----
+            "veil_width" => Some(self.fb.as_ref().map(|f| f.w as i64).unwrap_or(0)),
+            "veil_height" => Some(self.fb.as_ref().map(|f| f.h as i64).unwrap_or(0)),
+            "veil_clear" => {
+                if let Some(f) = self.fb.as_mut() {
+                    let c = *args.first()? as u32;
+                    for p in f.px.iter_mut() {
+                        *p = c | 0xff00_0000;
+                    }
+                }
+                Some(0)
+            }
+            "veil_fill_rect" => {
+                if let Some(f) = self.fb.as_mut() {
+                    let fb = unsafe { crate::fb::Framebuffer::new(f.px.as_mut_ptr(), f.w, f.h, f.w * 4) };
+                    let (x, y, w, h) = (*args.first()? as isize, *args.get(1)? as isize, *args.get(2)? as isize, *args.get(3)? as isize);
+                    let color = *args.get(4)? as u32 | 0xff00_0000;
+                    if x >= 0 && y >= 0 && w > 0 && h > 0 {
+                        fb.fill_rect(x as usize, y as usize, (w as usize).min(f.w), (h as usize).min(f.h), color);
+                    }
+                }
+                Some(0)
+            }
+            "veil_draw_text" => {
+                let s = mem_str(mem, *args.get(2)?, *args.get(3)?)?;
+                if let Some(f) = self.fb.as_mut() {
+                    let fb = unsafe { crate::fb::Framebuffer::new(f.px.as_mut_ptr(), f.w, f.h, f.w * 4) };
+                    let (x, y) = (*args.first()? as isize, *args.get(1)? as isize);
+                    let color = *args.get(4)? as u32 | 0xff00_0000;
+                    let size = (*args.get(5).unwrap_or(&16) as u16).clamp(8, 64);
+                    if x >= 0 && y >= 0 {
+                        fb.draw_text(x as usize, y as usize, &s, crate::freetype::FontId::Ui, size, color);
+                    }
+                }
+                Some(0)
+            }
+            "veil_log" => {
+                let s = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                crate::kprintln!("WASM_APP: {s}");
+                self.output.push_str(&s);
+                self.output.push('\n');
+                Some(0)
+            }
+            "veil_store_set" => {
+                let k = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                let v = mem_str(mem, *args.get(2)?, *args.get(3)?)?;
+                crate::browser::storage_set(true, "wasmapp", &k, &v);
+                Some(0)
+            }
+            "veil_store_get" => {
+                let k = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                let out = *args.get(2)? as u32 as usize;
+                let cap = *args.get(3)? as u32 as usize;
+                let v = crate::browser::storage_get(true, "wasmapp", &k).unwrap_or_default();
+                let b = v.as_bytes();
+                let n = b.len().min(cap);
+                if let Some(slot) = mem.get_mut(out..out + n) {
+                    slot.copy_from_slice(&b[..n]);
+                }
+                Some(b.len() as i64)
+            }
+            "veil_beep" => Some(0), // audio tone — reserved in the ABI, no-op here
             // ---- M41 step 11: Veil network host functions ----
             // veil_http_get(url_ptr, url_len, out_ptr, out_cap) -> body length
             // (full length even if truncated to out_cap; -1 on failure).

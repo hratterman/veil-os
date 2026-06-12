@@ -18,7 +18,9 @@ struct Cache {
 }
 
 static mut CACHE: Cache = Cache { map: BTreeMap::new(), clock: 0 };
-const CAP: usize = 512;
+// Large enough to hold a full text-heavy page's working set across several
+// web fonts + sizes without thrashing (each entry is a tiny alpha bitmap).
+const CAP: usize = 6144;
 
 fn fid(f: FontId) -> u8 {
     match f {
@@ -26,6 +28,16 @@ fn fid(f: FontId) -> u8 {
         FontId::UiBold => 1,
         FontId::Mono => 2,
         FontId::Serif => 3,
+        FontId::Web(i) => 4u8.saturating_add(i as u8),
+    }
+}
+
+/// Clear the glyph cache — called when web fonts are re-registered on a new
+/// page so stale Web(i) glyphs don't bleed across navigations.
+pub fn clear() {
+    unsafe {
+        let c = &mut *core::ptr::addr_of_mut!(CACHE);
+        c.map.clear();
     }
 }
 

@@ -4,6 +4,7 @@
 //! the embedded TTF faces, and render anti-aliased 8-bit alpha glyphs.
 
 use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -83,6 +84,7 @@ unsafe extern "C" {
         face: FtFace,
         codepoint: u64,
         size_px: u32,
+        no_hint: i32,
         out_buf: *mut *const u8,
         w: *mut i32,
         rows: *mut i32,
@@ -105,6 +107,8 @@ pub enum FontId {
     UiBold,
     Mono,
     Serif,
+    /// A dynamically registered web font (index into WEB_FONTS).
+    Web(u16),
 }
 
 const NFONTS: usize = 4;
@@ -117,12 +121,76 @@ struct Ft {
 
 static mut FT: Ft = Ft { lib: ptr::null_mut(), faces: [ptr::null_mut(); NFONTS], ok: false };
 
+/// A web font fetched from a stylesheet's @font-face (the TTF Google Fonts
+/// serves to a generic User-Agent). `_data` keeps the TTF alive for FreeType.
+struct WebFace {
+    family: alloc::string::String,
+    weight: u16,
+    italic: bool,
+    face: FtFace,
+    _data: Vec<u8>,
+}
+
+static mut WEB_FONTS: Vec<WebFace> = Vec::new();
+
 fn font_index(f: FontId) -> usize {
     match f {
         FontId::Ui => 0,
         FontId::UiBold => 1,
         FontId::Mono => 2,
         FontId::Serif => 3,
+        FontId::Web(_) => 0,
+    }
+}
+
+/// Register a web font (TTF bytes) under `family`. Returns its `FontId::Web`
+/// index, or None if the face won't load.
+pub fn register_web_font(family: &str, weight: u16, italic: bool, ttf: Vec<u8>) -> Option<u16> {
+    if !init() {
+        return None;
+    }
+    let lib = unsafe { (*ptr::addr_of!(FT)).lib };
+    let mut face: FtFace = ptr::null_mut();
+    if unsafe { veil_ft_new_face(lib, ttf.as_ptr(), ttf.len() as i64, &mut face) } != 0 || face.is_null() {
+        return None;
+    }
+    let web = unsafe { &mut *ptr::addr_of_mut!(WEB_FONTS) };
+    let id = web.len() as u16;
+    web.push(WebFace { family: family.to_ascii_lowercase(), weight, italic, face, _data: ttf });
+    Some(id)
+}
+
+/// Find the best registered web font for `family` (case-insensitive), preferring
+/// matching italic and the closest weight.
+pub fn find_web_font(family: &str, weight: u16, italic: bool) -> Option<u16> {
+    let fam = family.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
+    let web = unsafe { &*ptr::addr_of!(WEB_FONTS) };
+    let mut best: Option<(u16, i32)> = None;
+    for (i, w) in web.iter().enumerate() {
+        if w.family == fam {
+            let score = (w.weight as i32 - weight as i32).abs() + if w.italic == italic { 0 } else { 400 };
+            if best.map(|(_, s)| score < s).unwrap_or(true) {
+                best = Some((i as u16, score));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// True if any web font for `family` is registered.
+pub fn has_web_family(family: &str) -> bool {
+    find_web_font(family, 400, false).is_some()
+}
+
+pub fn web_font_count() -> usize {
+    unsafe { (*ptr::addr_of!(WEB_FONTS)).len() }
+}
+
+/// Drop all web fonts (called when navigating to a new page, so faces from a
+/// previous page don't leak or mis-match).
+pub fn clear_web_fonts() {
+    unsafe {
+        (*ptr::addr_of_mut!(WEB_FONTS)).clear();
     }
 }
 
@@ -174,16 +242,25 @@ pub fn render_glyph(font: FontId, codepoint: char, size_px: u16) -> Option<Glyph
     if !init() {
         return None;
     }
-    let face = unsafe { (*ptr::addr_of!(FT)).faces[font_index(font)] };
+    let face = match font {
+        FontId::Web(i) => unsafe {
+            let web = &*ptr::addr_of!(WEB_FONTS);
+            web.get(i as usize).map(|w| w.face).unwrap_or(ptr::null_mut())
+        },
+        _ => unsafe { (*ptr::addr_of!(FT)).faces[font_index(font)] },
+    };
     if face.is_null() {
         return None;
     }
     let (mut buf, mut w, mut rows, mut pitch, mut left, mut top, mut adv) =
         (ptr::null(), 0i32, 0i32, 0i32, 0i32, 0i32, 0i32);
+    // Web fonts skip the autofitter (NO_HINTING) to avoid its pathological
+    // slowness/hangs on complex faces; bundled UI fonts keep light hinting.
+    let no_hint = matches!(font, FontId::Web(_)) as i32;
     let rc = unsafe {
         veil_render_glyph(
-            face, codepoint as u64, size_px as u32, &mut buf, &mut w, &mut rows, &mut pitch,
-            &mut left, &mut top, &mut adv,
+            face, codepoint as u64, size_px as u32, no_hint, &mut buf, &mut w, &mut rows,
+            &mut pitch, &mut left, &mut top, &mut adv,
         )
     };
     if rc != 0 {

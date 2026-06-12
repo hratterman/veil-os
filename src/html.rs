@@ -185,6 +185,30 @@ pub fn parse(src: &str) -> Node {
         if CLOSES_P.contains(&tag.as_str()) {
             close_if_open(&mut stack, "p", &close);
         }
+        // Raw-text elements: their content is CDATA-like (may contain `<`, `>`,
+        // template literals) and must not be parsed as markup. Read verbatim to
+        // the matching close tag.
+        if matches!(tag.as_str(), "script" | "style" | "textarea") && !self_closed {
+            let close_tag = alloc::format!("</{tag}");
+            let lower = src[i..].to_ascii_lowercase();
+            let end_rel = lower.find(&close_tag).unwrap_or(src.len() - i);
+            let raw = &src[i..i + end_rel];
+            let mut node = Node::Element { tag: tag.clone(), attrs, children: Vec::new() };
+            if !raw.is_empty() {
+                if let Node::Element { children, .. } = &mut node {
+                    children.push(Node::Text(String::from(raw)));
+                }
+            }
+            push_child(&mut stack, node);
+            // advance past the raw content and its closing tag
+            i += end_rel;
+            if let Some(gt) = src[i..].find('>') {
+                i += gt + 1;
+            } else {
+                i = b.len();
+            }
+            continue;
+        }
         let node = Node::Element { tag: tag.clone(), attrs, children: Vec::new() };
         if self_closed || VOID.contains(&tag.as_str()) {
             push_child(&mut stack, node);

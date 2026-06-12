@@ -37,9 +37,22 @@ pub struct Font {
     pub px: u16,
 }
 
-/// Map the CSS-resolved typography to a FreeType face.
-fn pick_ftid(fam: font::Family, weight: u16, _italic: bool) -> crate::freetype::FontId {
-    use crate::freetype::FontId;
+/// Map the CSS-resolved typography to a FreeType face. Prefers an actual web
+/// font (registered from the page's @font-face rules) over the bundled
+/// fallbacks, so e.g. Cormorant Garamond renders in its real typeface.
+fn pick_ftid(fam: font::Family, weight: u16, italic: bool) -> crate::freetype::FontId {
+    use crate::freetype::{find_web_font, FontId};
+    let web_name = match fam {
+        font::Family::Cormorant => Some("Cormorant Garamond"),
+        font::Family::Lora => Some("Lora"),
+        font::Family::Barlow => Some("Barlow Condensed"),
+        _ => None,
+    };
+    if let Some(name) = web_name {
+        if let Some(i) = find_web_font(name, weight, italic) {
+            return FontId::Web(i);
+        }
+    }
     match fam {
         font::Family::Mono => FontId::Mono,
         font::Family::Cormorant | font::Family::Lora => FontId::Serif,
@@ -48,7 +61,7 @@ fn pick_ftid(fam: font::Family, weight: u16, _italic: bool) -> crate::freetype::
     }
 }
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -588,6 +601,7 @@ enum Display {
     Inline,
     None,
     Flex,
+    Grid,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -635,6 +649,8 @@ struct Style {
     justify: Justify,
     align: AlignItems,
     gap: isize,
+    // Grid container: number of columns (from grid-template-columns).
+    grid_cols: usize,
     // Flex item property (this element as a child of a flex container).
     flex_grow: u32,
     // Hidden-overlay detection (don't inherit). `transparent` = opacity:0,
@@ -669,6 +685,7 @@ fn root_style() -> Style {
         justify: Justify::Start,
         align: AlignItems::Stretch,
         gap: 0,
+        grid_cols: 1,
         flex_grow: 0,
         transparent: false,
         pointer_none: false,
@@ -895,6 +912,7 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
                 "inline" | "inline-block" => Display::Inline,
                 "block" => Display::Block,
                 "flex" | "inline-flex" => Display::Flex,
+                "grid" | "inline-grid" => Display::Grid,
                 _ => s.display,
             }
         }
@@ -919,7 +937,11 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
                 _ => AlignItems::Stretch,
             }
         }
-        "gap" | "grid-gap" => s.gap = parse_px(val).unwrap_or(s.gap),
+        "gap" | "grid-gap" | "grid-column-gap" | "column-gap" => {
+            // gap may be "row col"; use the first (column gaps drive our grid).
+            s.gap = parse_px(val.split_whitespace().next().unwrap_or(val)).unwrap_or(s.gap);
+        }
+        "grid-template-columns" => s.grid_cols = count_grid_columns(val),
         "flex" => {
             // `flex: <grow>` (also accept the shorthand's first number).
             let first = val.split_whitespace().next().unwrap_or("0");
@@ -976,6 +998,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         justify: Justify::Start,
         align: AlignItems::Stretch,
         gap: 0,
+        grid_cols: 1,
         flex_grow: 0,
         transparent: false,
         pointer_none: false,
@@ -1417,6 +1440,8 @@ fn layout_block(
         }
     } else if style.display == Display::Flex {
         cy = layout_flex(ctx, node, &style, cx, cw, cy);
+    } else if style.display == Display::Grid {
+        cy = layout_grid(ctx, node, &style, cx, cw, cy);
     } else {
         cy = layout_children(ctx, node, &style, cx, cw, cy);
     }
@@ -1451,7 +1476,7 @@ fn layout_children(
             continue;
         }
         let is_block = matches!(child, html::Node::Element { .. })
-            && matches!(cstyle.display, Display::Block | Display::Flex);
+            && matches!(cstyle.display, Display::Block | Display::Flex | Display::Grid);
         if !is_block {
             collect_inline(ctx, child, &cstyle, &None, &mut buf);
             continue;
@@ -1468,6 +1493,88 @@ fn layout_children(
         y = layout_block(ctx, child, style, x, w, y, marker);
     }
     flush_inline(ctx, &mut buf, x, w, y)
+}
+
+// --- CSS grid ---------------------------------------------------------------
+
+static GRID_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Count the column tracks in a `grid-template-columns` value, expanding
+/// `repeat(N, ...)`. e.g. "1fr 1fr" -> 2, "repeat(3, minmax(0,1fr))" -> 3,
+/// "repeat(auto-fill, 200px)" -> a sensible default.
+fn count_grid_columns(val: &str) -> usize {
+    let v = val.trim();
+    if let Some(rest) = v.strip_prefix("repeat(") {
+        // repeat(N, track...) — N is the first arg.
+        let inner = rest.trim_end_matches(')');
+        let first = inner.split(',').next().unwrap_or("").trim();
+        if let Ok(n) = first.parse::<usize>() {
+            return n.max(1);
+        }
+        return 2; // auto-fill / auto-fit: assume 2 columns
+    }
+    // Count top-level track tokens (ignore commas inside minmax()/functions).
+    let mut depth = 0;
+    let mut count = 0;
+    let mut in_tok = false;
+    for c in v.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ' ' | '\t' if depth == 0 => in_tok = false,
+            _ if depth == 0 => {
+                if !in_tok {
+                    count += 1;
+                    in_tok = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    count.max(1)
+}
+
+/// Lay out a `display:grid` container: `grid_cols` equal-width columns, items
+/// flowing row-major, each row sized to its tallest item, `gap` between tracks.
+fn layout_grid(ctx: &mut Ctx, node: &html::Node, style: &Style, x: isize, w: isize, y: isize) -> isize {
+    if !GRID_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("GRID_OK");
+    }
+    let cols = style.grid_cols.max(1);
+    let gap = style.gap;
+    let col_w = ((w - gap * (cols as isize - 1)) / cols as isize).max(1);
+
+    // Element children are the grid items.
+    let items: Vec<&html::Node> = node
+        .children()
+        .iter()
+        .filter(|c| {
+            matches!(c, html::Node::Element { .. }) && resolve(ctx.sheet, c, style).display != Display::None
+        })
+        .collect();
+    if items.is_empty() {
+        return y;
+    }
+
+    let mut cy = y;
+    let mut col = 0usize;
+    let mut row_h = 0isize;
+    let mut row_start = cy;
+    for it in items {
+        if col == cols {
+            col = 0;
+            cy = row_start + row_h + gap;
+            row_start = cy;
+            row_h = 0;
+        }
+        let cx = x + col as isize * (col_w + gap);
+        // measure each item at its column width and place it
+        let (cells, links, spots, _, ch) = measure_item(ctx, it, style, col_w);
+        place(ctx, cells, links, spots, cx, row_start);
+        row_h = row_h.max(ch);
+        col += 1;
+    }
+    row_start + row_h
 }
 
 // --- flexbox ----------------------------------------------------------------
@@ -1702,6 +1809,149 @@ pub fn reload(win: &mut Window) {
     navigate(win, &path, false);
 }
 
+struct FontFace {
+    family: String,
+    weight: u16,
+    italic: bool,
+    url: String,
+}
+
+/// Parse `@font-face` blocks from raw CSS text (css::parse skips them).
+fn parse_font_faces(css: &str) -> Vec<FontFace> {
+    let mut out = Vec::new();
+    let lower = css.to_ascii_lowercase();
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find("@font-face") {
+        let start = search + rel;
+        let Some(open) = css[start..].find('{').map(|i| start + i) else { break };
+        let Some(close) = css[open..].find('}').map(|i| open + i) else { break };
+        let block = &css[open + 1..close];
+        search = close + 1;
+        let mut family = String::new();
+        let mut weight = 400u16;
+        let mut italic = false;
+        let mut url = String::new();
+        for decl in block.split(';') {
+            let Some(c) = decl.find(':') else { continue };
+            let prop = decl[..c].trim().to_ascii_lowercase();
+            let val = decl[c + 1..].trim();
+            match prop.as_str() {
+                "font-family" => family = val.trim_matches(|ch| ch == '"' || ch == '\'').to_string(),
+                "font-weight" => {
+                    weight = val.split_whitespace().next().and_then(|w| w.parse().ok()).unwrap_or(400)
+                }
+                "font-style" => italic = val.contains("italic") || val.contains("oblique"),
+                "src" => {
+                    // pick the first url(...) (our UA yields a single .ttf)
+                    if let Some(u) = val.find("url(") {
+                        let rest = &val[u + 4..];
+                        if let Some(end) = rest.find(')') {
+                            url = rest[..end].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !family.is_empty() && !url.is_empty() {
+            out.push(FontFace { family, weight, italic, url });
+        }
+    }
+    out
+}
+
+/// Fetch + register the page's web fonts, bounded (a handful of TTFs) to keep
+/// memory and fetch time in check. Prioritises one normal + one bold weight
+/// per family.
+fn register_font_faces(css: &str) {
+    let faces = parse_font_faces(css);
+    if faces.is_empty() {
+        return;
+    }
+    // Prioritise: normal style, weights near 400 then near 700; one per
+    // (family, weight-bucket, italic).
+    let mut chosen: Vec<&FontFace> = Vec::new();
+    let mut taken: Vec<(String, u8, bool)> = Vec::new();
+    let bucket = |w: u16| -> u8 { if w >= 600 { 1 } else { 0 } };
+    // pass 1: normal style; pass 2: italic — so normal wins the cap budget.
+    for want_italic in [false, true] {
+        for f in &faces {
+            if chosen.len() >= 6 {
+                break;
+            }
+            if f.italic != want_italic {
+                continue;
+            }
+            // We can only decode TrueType/OpenType (not WOFF2/Brotli); skip the
+            // rest so a woff2 @font-face doesn't claim a family's slot before the
+            // TTF one Google Fonts serves our generic UA.
+            let u = f.url.split('?').next().unwrap_or(&f.url).to_ascii_lowercase();
+            if !(u.ends_with(".ttf") || u.ends_with(".otf")) {
+                continue;
+            }
+            let key = (f.family.to_ascii_lowercase(), bucket(f.weight), f.italic);
+            if taken.contains(&key) {
+                continue;
+            }
+            taken.push(key);
+            chosen.push(f);
+        }
+    }
+    let mut loaded = 0;
+    for f in chosen {
+        let url = resolve_href(&f.url);
+        if let Some((200, _, ttf)) = http_get(&url) {
+            // sanity: a TTF/OTF starts with 0x00010000, "OTTO", "true", or "ttcf".
+            let magic_ok = ttf.len() > 4
+                && matches!(&ttf[..4], [0, 1, 0, 0] | b"OTTO" | b"true" | b"ttcf");
+            if magic_ok {
+                if crate::freetype::register_web_font(&f.family, f.weight, f.italic, ttf).is_some() {
+                    loaded += 1;
+                }
+            }
+        }
+    }
+    if loaded > 0 {
+        kprintln!("BROWSER: registered {loaded} web font(s)");
+    }
+}
+
+/// Collect runnable script sources from `doc` in document order: inline
+/// `<script>` bodies and same-origin (relative-src) external scripts. Skips
+/// cross-origin absolute-URL scripts (analytics beacons) and non-JS types.
+fn collect_scripts(doc: &html::Node) -> Vec<String> {
+    let mut nodes = Vec::new();
+    doc.find_all("script", &mut nodes);
+    let mut out = Vec::new();
+    for s in nodes {
+        if let Some(t) = s.attr("type") {
+            let t = t.to_ascii_lowercase();
+            if !t.is_empty() && !t.contains("javascript") && t != "module" {
+                continue; // application/ld+json, importmap, etc.
+            }
+        }
+        match s.attr("src") {
+            None => {
+                let mut src = String::new();
+                s.text(&mut src);
+                if !src.trim().is_empty() {
+                    out.push(src);
+                }
+            }
+            Some(src) => {
+                // Cross-origin absolute URLs (analytics) — skip.
+                if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("//") {
+                    continue;
+                }
+                if let Some((200, _, body)) = http_get(&resolve_href(src)) {
+                    out.push(String::from_utf8_lossy(&body).into_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     let path = resolve_href(path);
     let was_external = is_external(&path);
@@ -1753,7 +2003,25 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         render_message(win, &path, &format!("not html: {ctype} ({status})"));
         return;
     }
-    let doc = html::parse(&String::from_utf8_lossy(&body));
+    let mut doc = html::parse(&String::from_utf8_lossy(&body));
+
+    // JavaScript: collect inline + same-origin external <script> sources in
+    // document order, run them against the DOM, and continue layout with the
+    // (possibly heavily mutated) tree. Cross-origin scripts (analytics beacons)
+    // are skipped. This is what makes JS-rendered pages actually show content.
+    let scripts = collect_scripts(&doc);
+    if !scripts.is_empty() {
+        let res = crate::js::run(&doc, &scripts);
+        doc = res.tree;
+        if !res.errors.is_empty() {
+            kprintln!("BROWSER: js: {} issue(s); first: {}", res.errors.len(), res.errors[0]);
+        }
+        let mut body_text = String::new();
+        if let Some(b) = doc.find("body") {
+            b.text(&mut body_text);
+        }
+        kprintln!("BROWSER: ran {} script(s); body text now {} chars", scripts.len(), body_text.trim().len());
+    }
 
     // Stylesheets: linked (<link rel="stylesheet">) and inline (<style>). Both
     // contribute rules and CSS custom properties. `all_css` accumulates the raw
@@ -1786,6 +2054,14 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         all_css.push('\n');
     }
     set_css_vars(css::collect_vars(&all_css));
+
+    // Web fonts: parse @font-face rules from the fetched stylesheets, fetch the
+    // TTFs (Google Fonts serves plain TrueType to our generic User-Agent — no
+    // WOFF2/Brotli needed) and register them with FreeType so the page renders
+    // in its actual typefaces (Cormorant Garamond, Barlow Condensed, Lora).
+    crate::freetype::clear_web_fonts();
+    crate::glyph_cache::clear();
+    register_font_faces(&all_css);
 
     // Images: fetch + decode each unique PNG src, served by the persistent LRU
     // cache so navigating back doesn't re-fetch. https -> TLS, http -> proxy,
@@ -1845,13 +2121,36 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         fields: Vec::new(),
     };
     let end_y = layout_block(&mut ctx, body_node, &root, 0, view_w as isize, 0, None);
-    let doc_h = (end_y.max(1) as usize).min(MAX_DOC_H);
-    if end_y as usize > MAX_DOC_H {
-        kprintln!("BROWSER: document truncated at {MAX_DOC_H}px (was {end_y})");
+
+    // Free the previous page's buffer (often a couple MB) before allocating the
+    // new one, so back-to-back navigations don't double up on the 16 MB heap.
+    if let crate::wm::App::Browser(st) = &mut win.app {
+        st.page = Vec::new();
+    }
+    // Page-buffer height: the document, capped at MAX_DOC_H. A JS-rendered page
+    // can be 10000+ px tall, and the multi-MB contiguous buffer may not fit the
+    // (fragmented) 16 MB heap — so allocate with try_reserve and shrink doc_h on
+    // failure until it fits. fill_rect/blit clip to the buffer, so content below
+    // the chosen height is simply not painted (the user can't scroll past it).
+    let want_h = (end_y.max(1) as usize).min(MAX_DOC_H);
+    let mut doc_h = want_h;
+    let mut page: Vec<u32> = loop {
+        let mut v: Vec<u32> = Vec::new();
+        if v.try_reserve_exact(view_w * doc_h).is_ok() {
+            v.resize(view_w * doc_h, page_bg);
+            break v;
+        }
+        if doc_h <= 400 {
+            v.resize(view_w * doc_h, page_bg); // last-ditch tiny buffer
+            break v;
+        }
+        doc_h = doc_h * 2 / 3; // shrink and retry
+    };
+    if end_y as usize > doc_h {
+        kprintln!("BROWSER: document clipped to {doc_h}px (was {end_y})");
     }
 
     // Paint the whole document into the page buffer.
-    let mut page = vec![page_bg; view_w * doc_h];
     let mut text_runs: Vec<(isize, isize, isize, String)> = Vec::new();
     let pfb = unsafe { Framebuffer::new(page.as_mut_ptr(), view_w, doc_h, view_w * 4) };
     for item in &ctx.items {

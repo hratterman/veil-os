@@ -14,10 +14,15 @@ int veil_ft_new_face(FT_Library lib, const unsigned char* data, long size, FT_Fa
    *out_buf points into FreeType's own 8-bit alpha bitmap (valid until the next
    load on this face, so the caller must copy it immediately). */
 int veil_render_glyph(FT_Face face, unsigned long codepoint, unsigned int size_px,
+                      int no_hint,
                       const unsigned char** out_buf, int* w, int* rows, int* pitch,
                       int* left, int* top, int* advance) {
     if (FT_Set_Pixel_Sizes(face, 0, size_px)) return 1;
-    if (FT_Load_Char(face, codepoint, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) return 2;
+    /* The autofitter (forced by TARGET_LIGHT) can be pathologically slow or even
+       hang on complex web fonts; NO_HINTING skips it (the smooth rasterizer still
+       anti-aliases). Bundled UI fonts keep light hinting for crispness. */
+    int flags = FT_LOAD_RENDER | (no_hint ? FT_LOAD_NO_HINTING : FT_LOAD_TARGET_LIGHT);
+    if (FT_Load_Char(face, codepoint, flags)) return 2;
     FT_GlyphSlot g = face->glyph;
     *out_buf = g->bitmap.buffer;
     *w       = (int)g->bitmap.width;

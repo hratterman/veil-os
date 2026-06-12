@@ -519,6 +519,68 @@ table *values* are the ITU-T H.264 / ISO 11172-3 spec tables.
 sound path). Regressions green: gui_test, m29 (file manager), m35 MJPEG video,
 and the JPEG/WASM/FreeType/crypto boot self-tests.
 
+## Release kernel for hosted sessions (2026-06-11)
+
+Hosted visitor sessions now boot the optimized **release** kernel (~2 s to the
+desktop vs ~20 s debug; codecs decode an order of magnitude faster).
+`session_manager.py` `KERNEL` → `target/aarch64-unknown-none/release/veil`.
+
+The switch exposed a **release-only fw_cfg DMA bug**: the "QEMU" signature (and
+every fw_cfg directory/file read) is filled by the device via DMA, which the
+optimizer can't see — in release it assumed the caller's stack buffer was
+unchanged, so `from_dtb` returned None → no framebuffer, no `veil.relay`/
+`fastboot` flags. Fixed in `fwcfg::dma` with a `dsb sy` + `core::hint::black_box`
+on the buffer pointer after each transfer so reads actually reload from memory.
+Also added an `opt/veil.fastboot` flag (set per visitor spawn) that skips the
+~16 s debug-build codec self-tests; harmless on release but keeps any future
+debug deploy fast.
+
+## M38 — browser overhaul: from-scratch JS engine + web fonts + CSS grid (2026-06-11)
+
+Goal: make `https://henryratterman.com` actually render (it's JS-rendered — the
+static HTML is an empty skeleton; `content.js` holds the data and an inline
+`render()` builds the DOM).
+
+- **From-scratch JavaScript engine** (`src/js/`): lexer (`lexer.rs`, incl.
+  template literals with `${}` interpolation), recursive-descent parser
+  (`parser.rs` — full operator precedence, arrow functions, destructuring,
+  for/of, try/catch, ternary, spread), tree-walking interpreter (`interp.rs` —
+  scopes/closures, the Array/String/Object/Math methods, `this` binding) and a
+  DOM binding layer (`dom.rs` — an index-addressable arena: getElementById,
+  querySelector(All), createElement/appendChild, innerHTML/textContent setters
+  that re-parse, classList, style, dataset; document/window/console/localStorage/
+  matchMedia/history/location host objects; setTimeout/requestAnimationFrame
+  deferred + drained). The kernel has no libm, so `mathf.rs` does floor/ceil/
+  trunc/sqrt via AArch64 `frintm/frintp/frintz/fsqrt`. Runs the **real**
+  shared.js + content.js + inline render() unmodified: **JS_OK** boot self-test
+  injects "Henry Ratterman", the headshot src, and 12 project cards.
+- **Browser integration** (`browser.rs`): `collect_scripts` gathers inline +
+  same-origin `<script>` (skips cross-origin analytics), runs them via `js::run`
+  against the parsed tree, and lays out the mutated DOM. Required making
+  `<script>`/`<style>`/`<textarea>` **raw-text elements** in `html.rs` (their
+  content has `<`, `>`, template literals that must not be parsed as markup).
+- **Web fonts** (`freetype.rs` + `browser.rs`): btw.md said "WOFF2 = gzip TTF"
+  but WOFF2 is **Brotli + transformed tables** (a huge decoder) — instead, Google
+  Fonts serves **plain TTF** to our generic `VeilOS` User-Agent, so we just fetch
+  the TTF and feed FreeType (which already loads TTF). `register_font_faces`
+  parses `@font-face` rules from the fetched stylesheets, fetches the TTFs
+  (bounded; magic-checked; `.ttf`/`.otf` only so a self-hosted woff2 @font-face
+  doesn't claim a family's slot), and registers dynamic `FontId::Web(i)` faces.
+  `pick_ftid` prefers a registered web font (Cormorant Garamond / Barlow
+  Condensed / Lora) over the bundled fallback.
+- **CSS grid** (`browser.rs`): `display:grid` + `grid-template-columns`
+  (counts tracks, expands `repeat(N,…)`) + `gap`. `layout_grid` flows items
+  row-major into equal columns. **GRID_OK**.
+- **DOM-injected images** already work: the JS sets `img.src=headshot.jpg`, the
+  layout fetches + decodes it (JPEG via `png::decode_any`).
+
+Loopback proof `scripts/drive_m38_js.py` (JSTEST.HTM = the real scripts inlined):
+body text grows from ~empty to 36 KB, 933 layout items, 411 colours. Live
+acceptance `scripts/drive_m38_hr.py` renders henryratterman.com over direct TLS:
+HTML + shared.js + content.js + style.css + 6 web-font TTFs + headshot.jpg all
+fetched, scripts run (21 KB of injected text), web fonts registered, grid laid
+out. **Tokens:** JS_OK, GRID_OK.
+
 ## Bugfix — large-PNG OOM crash (2026-06-11)
 
 **Symptom:** opening a real-world-sized PNG (e.g. 1920x1080) in the image

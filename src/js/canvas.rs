@@ -108,6 +108,14 @@ impl Canvas {
         (self.px.clone(), self.w, self.h)
     }
 
+    /// Mutable access to the raw ARGB buffer (the WebGL rasteriser draws here).
+    pub fn px_mut(&mut self) -> &mut [u32] {
+        &mut self.px
+    }
+    pub fn px_ref(&self) -> &[u32] {
+        &self.px
+    }
+
     // --- state / style -----------------------------------------------------
 
     pub fn set_prop(&mut self, prop: &str, val: &str) {

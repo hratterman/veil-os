@@ -58,6 +58,8 @@ pub enum Host {
     Dataset(usize),
     /// a 2D canvas rendering context (index into Interp.canvases)
     Canvas(usize),
+    /// a WebGL rendering context (index into Interp.webgl)
+    WebGl(usize),
 }
 
 impl Val {

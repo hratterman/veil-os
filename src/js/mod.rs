@@ -15,6 +15,7 @@ mod lexer;
 mod mathf;
 mod parser;
 mod value;
+mod webgl;
 
 use crate::html::Node;
 use alloc::string::String;
@@ -474,6 +475,71 @@ pub fn webaudio_selftest() {
         crate::kprintln!("WEBAUDIO_OK: AudioContext -> OscillatorNode(440Hz) -> GainNode(0.5) -> destination rendered a 440 Hz tone to virtio-sound");
     } else {
         crate::kprintln!("WEBAUDIO_FAIL: {out}");
+    }
+}
+
+/// WebGL self-test (M42 step 3): compile a vertex+fragment shader, upload an
+/// interleaved position+color triangle, set an identity matrix uniform, and
+/// `drawArrays` — the from-scratch GLSL interpreter + software rasteriser paint
+/// a Gouraud-shaded triangle (red top, green bottom-left, blue bottom-right)
+/// into the canvas. Verifies the rendered pixels.
+pub fn webgl_selftest() {
+    let skeleton = "<html><body><canvas id=cv width=200 height=200></canvas></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        var gl = document.getElementById('cv').getContext('webgl');
+        gl.viewport(0, 0, 200, 200);
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        var vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, 'attribute vec2 a_pos; attribute vec3 a_color; uniform mat4 u_matrix; varying vec3 v_color; void main(){ gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0); v_color = a_color; }');
+        gl.compileShader(vs);
+        var fs = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fs, 'precision mediump float; varying vec3 v_color; void main(){ gl_FragColor = vec4(v_color, 1.0); }');
+        gl.compileShader(fs);
+        var prog = gl.createProgram();
+        gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+        gl.linkProgram(prog); gl.useProgram(prog);
+        var data = [ 0.0, 0.8, 1,0,0,  -0.8,-0.8, 0,1,0,   0.8,-0.8, 0,0,1 ];
+        var buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+        var posLoc = gl.getAttribLocation(prog, 'a_pos');
+        var colLoc = gl.getAttribLocation(prog, 'a_color');
+        gl.enableVertexAttribArray(posLoc);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 20, 0);
+        gl.enableVertexAttribArray(colLoc);
+        gl.vertexAttribPointer(colLoc, 3, gl.FLOAT, false, 20, 8);
+        var uLoc = gl.getUniformLocation(prog, 'u_matrix');
+        gl.uniformMatrix4fv(uLoc, false, [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    if !res.errors.is_empty() {
+        crate::kprintln!("WEBGL: {} issue(s); first: {}", res.errors.len(), truncate(&res.errors[0], 160));
+    }
+    let Some(cv) = res.canvases.first() else {
+        crate::kprintln!("WEBGL_FAIL: getContext('webgl') produced no framebuffer");
+        return;
+    };
+    let (w, _h) = (cv.w as usize, cv.h as usize);
+    let at = |x: usize, y: usize| -> (u32, u32, u32) {
+        let p = cv.px[y * w + x];
+        ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff)
+    };
+    let (tr, tg, tb) = at(100, 35);   // near the top vertex -> red
+    let (lr, lg, lb) = at(45, 165);   // near bottom-left   -> green
+    let (br, bg, bb) = at(155, 165);  // near bottom-right  -> blue
+    let (cr, cg, cb) = at(5, 5);      // a corner outside the triangle -> cleared black
+    crate::kprintln!("JS_WEBGL: top=({tr},{tg},{tb}) left=({lr},{lg},{lb}) right=({br},{bg},{bb}) corner=({cr},{cg},{cb})");
+    let red_ok = tr > 150 && tr > tg + 40 && tr > tb + 40;
+    let green_ok = lg > 150 && lg > lr + 40 && lg > lb + 40;
+    let blue_ok = bb > 150 && bb > br + 40 && bb > bg + 40;
+    let bg_ok = cr < 40 && cg < 40 && cb < 40;
+    if red_ok && green_ok && blue_ok && bg_ok {
+        crate::kprintln!("WEBGL_OK: from-scratch WebGL — GLSL shaders compiled, interleaved attributes + mat4 uniform, drawArrays rasterised a Gouraud triangle (R/G/B verts) on a cleared background");
+    } else {
+        crate::kprintln!("WEBGL_FAIL: red={red_ok} green={green_ok} blue={blue_ok} bg={bg_ok}");
     }
 }
 

@@ -66,6 +66,10 @@ pub struct Interp {
     /// element stores its index in a `__cvs` attribute so the browser can blit
     /// the drawn buffer where the canvas sits in layout.
     pub canvases: Vec<super::canvas::Canvas>,
+    /// WebGL rendering contexts created via `<canvas>.getContext('webgl')`. Each
+    /// owns GL state + a GLSL software rasteriser; it renders into the canvas at
+    /// `gl.canvas` (an index into `canvases`) so the result shows in layout.
+    pub webgl: Vec<super::webgl::GlContext>,
 }
 
 /// Cap on distinct cached functions before the whole table is dropped (bounds
@@ -97,6 +101,7 @@ impl Interp {
             jit_enabled: true,
             func_props: BTreeMap::new(),
             canvases: Vec::new(),
+            webgl: Vec::new(),
         };
         it.install_globals();
         it
@@ -954,6 +959,16 @@ impl Interp {
                 let mut o = Obj::new();
                 o.insert("__date".into(), Val::Num(0.0));
                 return Ok(Val::object(o));
+            }
+            // Typed arrays — modelled as plain numeric arrays. `new Float32Array(n)`
+            // makes a zero-filled length-n array; `new Float32Array([…])` copies.
+            "Float32Array" | "Float64Array" | "Int32Array" | "Uint32Array"
+            | "Int16Array" | "Uint16Array" | "Int8Array" | "Uint8Array" | "Uint8ClampedArray" => {
+                return Ok(match args.into_iter().next() {
+                    Some(Val::Array(a)) => Val::array(a.borrow().clone()),
+                    Some(Val::Num(n)) => Val::array(alloc::vec![Val::Num(0.0); n.max(0.0) as usize]),
+                    _ => Val::array(Vec::new()),
+                });
             }
             "Object" => return Ok(args.into_iter().next().unwrap_or_else(|| Val::object(Obj::new()))),
             "RegExp" => {
@@ -1859,6 +1874,19 @@ impl Interp {
                 }
                 Val::Native(Native::Method(Box::new(Val::Host(Host::Canvas(n))), Rc::from(prop)))
             }
+            Host::WebGl(g) => {
+                // WebGL enum constants + a few readable properties; everything
+                // else is a gl.* method.
+                if let Some(v) = webgl_const(prop) {
+                    return Val::Num(v);
+                }
+                match prop {
+                    "canvas" => self.webgl.get(g).map(|c| Val::Host(Host::Canvas(c.canvas))).unwrap_or(Val::Null),
+                    "drawingBufferWidth" => Val::Num(self.webgl.get(g).map(|c| c.w as f64).unwrap_or(0.0)),
+                    "drawingBufferHeight" => Val::Num(self.webgl.get(g).map(|c| c.h as f64).unwrap_or(0.0)),
+                    _ => Val::Native(Native::Method(Box::new(Val::Host(Host::WebGl(g))), Rc::from(prop))),
+                }
+            }
             Host::ClassList(_) | Host::Console | Host::History
             | Host::Style(_) | Host::Dataset(_) => {
                 if let Host::Style(idx) = h {
@@ -1918,6 +1946,7 @@ impl Interp {
             Val::Host(Host::History) => Ok(Some(Val::Undef)),
             Val::Host(Host::Location) => Ok(Some(Val::Undef)),
             Val::Host(Host::Canvas(n)) => Ok(Some(self.canvas_method(*n, name, args))),
+            Val::Host(Host::WebGl(g)) => Ok(Some(self.webgl_method(*g, name, args))),
             Val::Host(Host::ClassList(idx)) => Ok(Some(self.classlist_method(*idx, name, args))),
             Val::Host(Host::Style(_)) => Ok(Some(Val::Undef)),
             Val::Node(idx) => Ok(self.node_method(*idx, name, args)?),
@@ -2206,16 +2235,30 @@ impl Interp {
             }),
             "cloneNode" => Val::Node(idx),
             "getContext" => {
-                // 2D context only. Reuse the canvas if getContext was called
-                // before; otherwise allocate one sized from the width/height attrs.
+                let w = self.dom.nodes[idx].attr("width").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(300);
+                let h = self.dom.nodes[idx].attr("height").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(150);
+                // WebGL: allocate a framebuffer canvas + a GL context over it.
+                if s0.starts_with("webgl") || s0.starts_with("experimental-webgl") {
+                    let cv = match self.dom.nodes[idx].attr("__cvs").and_then(|v| v.parse::<usize>().ok()) {
+                        Some(n) if n < self.canvases.len() => n,
+                        _ => {
+                            let n = self.canvases.len();
+                            self.canvases.push(super::canvas::Canvas::new(w, h));
+                            self.dom.nodes[idx].set_attr("__cvs", &alloc::format!("{n}"));
+                            n
+                        }
+                    };
+                    let g = self.webgl.len();
+                    self.webgl.push(super::webgl::GlContext::new(cv, w, h));
+                    self.dom.nodes[idx].set_attr("__gl", &alloc::format!("{g}"));
+                    return Ok(Some(Val::Host(Host::WebGl(g))));
+                }
                 if !s0.starts_with("2d") {
                     return Ok(Some(Val::Null));
                 }
                 let n = match self.dom.nodes[idx].attr("__cvs").and_then(|v| v.parse::<usize>().ok()) {
                     Some(n) if n < self.canvases.len() => n,
                     _ => {
-                        let w = self.dom.nodes[idx].attr("width").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(300);
-                        let h = self.dom.nodes[idx].attr("height").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(150);
                         let n = self.canvases.len();
                         self.canvases.push(super::canvas::Canvas::new(w, h));
                         self.dom.nodes[idx].set_attr("__cvs", &alloc::format!("{n}"));
@@ -2322,6 +2365,203 @@ impl Interp {
             _ => {}
         }
         Val::Undef
+    }
+
+    /// WebGL 1.0 method dispatch on GL context index `g`. Shaders/programs are
+    /// plain JS objects; buffers/locations are integer handles into the context.
+    fn webgl_method(&mut self, g: usize, name: &str, args: &[Val]) -> Val {
+        let num = |i: usize| args.get(i).map(|v| v.as_num()).unwrap_or(0.0);
+        match name {
+            "createShader" => {
+                let mut o = Obj::new();
+                o.insert("__sh".into(), Val::Bool(true));
+                o.insert("type".into(), Val::Num(num(0)));
+                o.insert("src".into(), Val::str(""));
+                Val::object(o)
+            }
+            "shaderSource" => {
+                if let (Some(Val::Object(sh)), Some(src)) = (args.first(), args.get(1)) {
+                    sh.borrow_mut().insert("src".into(), Val::str(src.to_str()));
+                }
+                Val::Undef
+            }
+            "compileShader" | "linkProgram" | "validateProgram" => Val::Undef,
+            "getShaderParameter" | "getProgramParameter" => Val::Bool(true),
+            "getShaderInfoLog" | "getProgramInfoLog" => Val::str(""),
+            "createProgram" => {
+                let mut o = Obj::new();
+                o.insert("__prog".into(), Val::Bool(true));
+                o.insert("shaders".into(), Val::array(Vec::new()));
+                Val::object(o)
+            }
+            "attachShader" => {
+                if let (Some(Val::Object(p)), Some(sh)) = (args.first(), args.get(1)) {
+                    if let Some(Val::Array(list)) = p.borrow().get("shaders") {
+                        list.borrow_mut().push(sh.clone());
+                    }
+                }
+                Val::Undef
+            }
+            "useProgram" => {
+                // copy each attached shader's source into the GL context by type
+                let mut vsrc = None;
+                let mut fsrc = None;
+                if let Some(Val::Object(p)) = args.first() {
+                    if let Some(Val::Array(list)) = p.borrow().get("shaders") {
+                        for sh in list.borrow().iter() {
+                            if let Val::Object(o) = sh {
+                                let b = o.borrow();
+                                let ty = b.get("type").map(|v| v.as_num()).unwrap_or(0.0);
+                                let src = b.get("src").map(|v| v.to_str()).unwrap_or_default();
+                                if ty == 35633.0 { vsrc = Some(src); } else { fsrc = Some(src); }
+                            }
+                        }
+                    }
+                }
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    if let Some(s) = vsrc { gl.vert_src = s; }
+                    if let Some(s) = fsrc { gl.frag_src = s; }
+                }
+                Val::Undef
+            }
+            "createBuffer" => {
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    gl.buffers.push(super::webgl::Buffer { data: Vec::new() });
+                    return Val::Num((gl.buffers.len() - 1) as f64);
+                }
+                Val::Num(0.0)
+            }
+            "bindBuffer" => {
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    gl.bound_array = num(1) as usize;
+                }
+                Val::Undef
+            }
+            "bufferData" => {
+                // bufferData(target, data, usage) — data is an array of numbers
+                // (plain Array or our typed-array-as-Array).
+                let data: Vec<f32> = match args.get(1) {
+                    Some(Val::Array(a)) => a.borrow().iter().map(|v| v.as_num() as f32).collect(),
+                    _ => Vec::new(),
+                };
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    let b = gl.bound_array;
+                    if let Some(buf) = gl.buffers.get_mut(b) { buf.data = data; }
+                }
+                Val::Undef
+            }
+            "getAttribLocation" => {
+                let nm = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                Val::Num(self.webgl.get_mut(g).map(|gl| gl.attrib_location(&nm) as f64).unwrap_or(-1.0))
+            }
+            "enableVertexAttribArray" => {
+                let loc = num(0) as usize;
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    gl.attribs.entry(loc).or_insert(super::webgl::AttribPtr { buffer: 0, size: 0, stride: 0, offset: 0, enabled: false }).enabled = true;
+                }
+                Val::Undef
+            }
+            "disableVertexAttribArray" => {
+                let loc = num(0) as usize;
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    if let Some(ap) = gl.attribs.get_mut(&loc) { ap.enabled = false; }
+                }
+                Val::Undef
+            }
+            "vertexAttribPointer" => {
+                // (loc, size, type, normalized, stride_bytes, offset_bytes)
+                let loc = num(0) as usize;
+                let size = num(1) as usize;
+                let stride = (num(4) as usize) / 4; // bytes -> floats
+                let offset = (num(5) as usize) / 4;
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    let buffer = gl.bound_array;
+                    let enabled = gl.attribs.get(&loc).map(|a| a.enabled).unwrap_or(true);
+                    gl.attribs.insert(loc, super::webgl::AttribPtr { buffer, size, stride, offset, enabled });
+                }
+                Val::Undef
+            }
+            "getUniformLocation" => {
+                let nm = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                Val::Num(self.webgl.get_mut(g).map(|gl| gl.uniform_location(&nm) as f64).unwrap_or(-1.0))
+            }
+            "uniformMatrix4fv" => {
+                let loc = num(0) as usize;
+                let m: Vec<f32> = match args.get(2) {
+                    Some(Val::Array(a)) => a.borrow().iter().map(|v| v.as_num() as f32).collect(),
+                    _ => Vec::new(),
+                };
+                if m.len() >= 16 {
+                    let mut arr = [0.0f32; 16];
+                    arr.copy_from_slice(&m[..16]);
+                    if let Some(gl) = self.webgl.get_mut(g) {
+                        if let Some(nm) = gl.uniform_locs.get(loc).cloned() {
+                            gl.uniforms.insert(nm, super::webgl::Glsl::M4(arr));
+                        }
+                    }
+                }
+                Val::Undef
+            }
+            "uniform4f" | "uniform3f" | "uniform2f" | "uniform1f" => {
+                let n = name.as_bytes()[7] - b'0';
+                let comps: Vec<f32> = (0..n).map(|i| num(1 + i as usize) as f32).collect();
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    let loc = num(0) as usize;
+                    if let Some(nm) = gl.uniform_locs.get(loc).cloned() {
+                        gl.uniforms.insert(nm, super::webgl::Glsl::vec(&comps));
+                    }
+                }
+                Val::Undef
+            }
+            "uniform1i" => {
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    let loc = num(0) as usize;
+                    if let Some(nm) = gl.uniform_locs.get(loc).cloned() {
+                        gl.uniforms.insert(nm, super::webgl::Glsl::F(num(1) as f32));
+                    }
+                }
+                Val::Undef
+            }
+            "clearColor" => {
+                if let Some(gl) = self.webgl.get_mut(g) {
+                    gl.clear = [num(0) as f32, num(1) as f32, num(2) as f32, num(3) as f32];
+                }
+                Val::Undef
+            }
+            "clear" => {
+                let cv = self.webgl.get(g).map(|gl| gl.canvas);
+                if let (Some(cv), Some(gl)) = (cv, self.webgl.get(g)) {
+                    let clear = gl.clear;
+                    let _ = clear;
+                    let g_ctx = &self.webgl[g];
+                    let px = self.canvases[cv].px_mut();
+                    g_ctx.clear(px);
+                }
+                Val::Undef
+            }
+            "drawArrays" => {
+                let count = num(2) as usize;
+                let cv = self.webgl.get(g).map(|gl| gl.canvas);
+                if let Some(cv) = cv {
+                    if cv < self.canvases.len() {
+                        let g_ctx = &self.webgl[g];
+                        let px = self.canvases[cv].px_mut();
+                        g_ctx.draw_arrays(px, count);
+                    }
+                }
+                Val::Undef
+            }
+            "drawElements" => Val::Undef,
+            "createTexture" | "createFramebuffer" | "createRenderbuffer" => {
+                let mut o = Obj::new();
+                o.insert("__tex".into(), Val::Bool(true));
+                Val::object(o)
+            }
+            "getParameter" => Val::Num(0.0),
+            "getExtension" => Val::Null,
+            // viewport / enable / blend / depth / texture state — accepted, no-op
+            _ => Val::Undef,
+        }
     }
 
     fn array_method(&mut self, a: Rc<RefCell<Vec<Val>>>, name: &str, args: &[Val]) -> Result<Option<Val>, Val> {
@@ -3206,6 +3446,30 @@ fn norm_idx(v: Option<&Val>, default: i64, len: i64) -> i64 {
         }
         _ => default,
     }
+}
+
+/// WebGL 1.0 enum constants (the subset our software GL accepts/uses).
+fn webgl_const(name: &str) -> Option<f64> {
+    Some(match name {
+        "VERTEX_SHADER" => 35633.0, "FRAGMENT_SHADER" => 35632.0,
+        "ARRAY_BUFFER" => 34962.0, "ELEMENT_ARRAY_BUFFER" => 34963.0,
+        "STATIC_DRAW" => 35044.0, "DYNAMIC_DRAW" => 35048.0, "STREAM_DRAW" => 35040.0,
+        "FLOAT" => 5126.0, "UNSIGNED_BYTE" => 5121.0, "UNSIGNED_SHORT" => 5123.0, "UNSIGNED_INT" => 5125.0, "INT" => 5124.0, "SHORT" => 5122.0, "BYTE" => 5120.0,
+        "POINTS" => 0.0, "LINES" => 1.0, "LINE_LOOP" => 2.0, "LINE_STRIP" => 3.0,
+        "TRIANGLES" => 4.0, "TRIANGLE_STRIP" => 5.0, "TRIANGLE_FAN" => 6.0,
+        "DEPTH_BUFFER_BIT" => 256.0, "STENCIL_BUFFER_BIT" => 1024.0, "COLOR_BUFFER_BIT" => 16384.0,
+        "DEPTH_TEST" => 2929.0, "BLEND" => 3042.0, "CULL_FACE" => 2884.0, "SCISSOR_TEST" => 3089.0, "DITHER" => 3024.0,
+        "ZERO" => 0.0, "ONE" => 1.0, "SRC_ALPHA" => 770.0, "ONE_MINUS_SRC_ALPHA" => 771.0, "SRC_COLOR" => 768.0, "DST_ALPHA" => 772.0,
+        "NEVER" => 512.0, "LESS" => 513.0, "EQUAL" => 514.0, "LEQUAL" => 515.0, "GREATER" => 516.0, "GEQUAL" => 518.0, "ALWAYS" => 519.0,
+        "BACK" => 1029.0, "FRONT" => 1028.0, "CW" => 2304.0, "CCW" => 2305.0,
+        "COMPILE_STATUS" => 35713.0, "LINK_STATUS" => 35714.0, "VALIDATE_STATUS" => 35715.0,
+        "TEXTURE_2D" => 3553.0, "TEXTURE0" => 33984.0, "TEXTURE1" => 33985.0, "RGBA" => 6408.0, "RGB" => 6407.0,
+        "NEAREST" => 9728.0, "LINEAR" => 9729.0, "CLAMP_TO_EDGE" => 33071.0, "REPEAT" => 10497.0,
+        "TEXTURE_MAG_FILTER" => 10240.0, "TEXTURE_MIN_FILTER" => 10241.0, "TEXTURE_WRAP_S" => 10242.0, "TEXTURE_WRAP_T" => 10243.0,
+        "FRAMEBUFFER" => 36160.0, "RENDERBUFFER" => 36161.0, "COLOR_ATTACHMENT0" => 36064.0, "DEPTH_ATTACHMENT" => 36096.0,
+        "ARRAY_BUFFER_BINDING" => 34964.0, "VERSION" => 7938.0, "MAX_TEXTURE_SIZE" => 3379.0,
+        _ => return None,
+    })
 }
 
 fn math_method(name: &str, args: &[Val]) -> Val {

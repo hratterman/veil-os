@@ -12,9 +12,29 @@ pub enum Tok {
     /// Template literal split into string chunks and pre-tokenized expressions.
     Tmpl(Vec<TplPart>),
     Ident(String),
+    /// Regex literal: (pattern, flags). e.g. /ab+c/gi.
+    Regex(String, String),
     /// Operator/punctuation, e.g. "==", "=>", "...", "+".
     Punct(&'static str),
     Eof,
+}
+
+/// A `/` starts a regex literal (rather than division) when the previous token
+/// is not a value — i.e. at expression start, after an operator/punctuator, or
+/// after a keyword like `return`/`typeof`. After a value (ident, number, string,
+/// `)`, `]`), `/` is the division operator.
+fn regex_allowed(prev: Option<&Tok>) -> bool {
+    match prev {
+        None => true,
+        Some(Tok::Num(_)) | Some(Tok::Str(_)) | Some(Tok::Tmpl(_)) | Some(Tok::Regex(..)) => false,
+        Some(Tok::Ident(s)) => matches!(
+            s.as_str(),
+            "return" | "typeof" | "instanceof" | "in" | "of" | "do" | "else" | "void"
+                | "delete" | "new" | "case" | "throw" | "yield" | "await"
+        ),
+        Some(Tok::Punct(p)) => !matches!(*p, ")" | "]" | "}"),
+        Some(Tok::Eof) => true,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +92,16 @@ impl<'a> Lexer<'a> {
                 }
                 self.i += 2;
                 continue;
+            }
+            // regex literal (decided by the preceding token; falls through to
+            // the `/` division operator if no closing slash is found)
+            if c == b'/' && regex_allowed(out.last()) {
+                let save = self.i;
+                if let Some((pat, flags)) = self.regex() {
+                    out.push(Tok::Regex(pat, flags));
+                    continue;
+                }
+                self.i = save;
             }
             // template literal
             if c == b'`' {
@@ -139,6 +169,52 @@ impl<'a> Lexer<'a> {
         }
         self.i += 1; // closing quote
         s
+    }
+
+    /// Scan a regex literal starting at the opening `/`. Returns (pattern, flags)
+    /// or None if no closing `/` is found on the line (so the caller falls back
+    /// to treating `/` as division). Honours `\` escapes and `[...]` classes
+    /// (where `/` is literal).
+    fn regex(&mut self) -> Option<(String, String)> {
+        debug_assert_eq!(self.b[self.i], b'/');
+        let mut j = self.i + 1;
+        let mut pat = String::new();
+        let mut in_class = false;
+        while j < self.b.len() {
+            let c = self.b[j];
+            if c == b'\n' {
+                return None; // unterminated on this line -> not a regex
+            }
+            if c == b'\\' {
+                // keep the escape verbatim (it's part of the pattern)
+                if j + 1 < self.b.len() {
+                    pat.push('\\');
+                    pat.push(self.b[j + 1] as char);
+                    j += 2;
+                    continue;
+                }
+                return None;
+            }
+            if c == b'[' {
+                in_class = true;
+            } else if c == b']' {
+                in_class = false;
+            } else if c == b'/' && !in_class {
+                // end of pattern
+                j += 1;
+                let mut flags = String::new();
+                while j < self.b.len() && self.b[j].is_ascii_alphabetic() {
+                    flags.push(self.b[j] as char);
+                    j += 1;
+                }
+                self.i = j;
+                return Some((pat, flags));
+            }
+            // copy the byte (regex patterns are ASCII-dominant; copy raw)
+            pat.push(c as char);
+            j += 1;
+        }
+        None
     }
 
     fn template(&mut self) -> Tok {

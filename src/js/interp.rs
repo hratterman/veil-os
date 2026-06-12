@@ -123,6 +123,22 @@ impl Interp {
         b.vars.insert("NaN".into(), Val::Num(f64::NAN));
         b.vars.insert("Infinity".into(), Val::Num(f64::INFINITY));
         b.vars.insert("undefined".into(), Val::Undef);
+        // performance.now() — a high-res timer some libraries probe for.
+        {
+            let mut p = Obj::new();
+            p.insert("now".into(), Val::Native(Native::Global(Rc::from("performance.now"))));
+            b.vars.insert("performance".into(), Val::object(p));
+        }
+        // navigator — userAgent / language sniffed by many libraries.
+        {
+            let mut nav = Obj::new();
+            nav.insert("userAgent".into(), Val::str("Mozilla/5.0 (Veil OS) VeilBrowser/1.0"));
+            nav.insert("language".into(), Val::str("en-US"));
+            nav.insert("languages".into(), Val::array(alloc::vec![Val::str("en-US"), Val::str("en")]));
+            nav.insert("onLine".into(), Val::Bool(true));
+            nav.insert("platform".into(), Val::str("Veil"));
+            b.vars.insert("navigator".into(), Val::object(nav));
+        }
     }
 
     /// Run a script's source against the current DOM. Errors are recorded, not
@@ -145,7 +161,9 @@ impl Interp {
     /// during the scripts, bounded so a self-rescheduling loop can't hang.
     pub fn drain_deferred(&mut self) {
         let mut rounds = 0;
-        while !self.deferred.is_empty() && rounds < 50 {
+        // Bounded so a self-rescheduling callback (rAF/microtask) can't hang the
+        // render. 200 rounds is enough for libraries that flush work in waves.
+        while !self.deferred.is_empty() && rounds < 200 {
             let batch = core::mem::take(&mut self.deferred);
             for (f, args) in batch {
                 let _ = self.call(f, Val::Undef, args);
@@ -539,6 +557,22 @@ impl Interp {
                 self.assign_to(target, v.clone(), scope)?;
                 Ok(v)
             }
+            Expr::Seq(parts) => {
+                let mut last = Val::Undef;
+                for p in parts {
+                    last = self.eval(p, scope)?;
+                }
+                Ok(last)
+            }
+            Expr::Regex(pat, flags) => {
+                let mut o = Obj::new();
+                o.insert("__regex".into(), Val::Bool(true));
+                o.insert("source".into(), Val::str(pat.clone()));
+                o.insert("flags".into(), Val::str(flags.clone()));
+                o.insert("global".into(), Val::Bool(flags.contains('g')));
+                o.insert("lastIndex".into(), Val::Num(0.0));
+                Ok(Val::object(o))
+            }
             Expr::Member(obj, prop, opt) => {
                 let o = self.eval(obj, scope)?;
                 if *opt && matches!(o, Val::Undef | Val::Null) {
@@ -918,6 +952,56 @@ impl Interp {
                 let mut o = Obj::new();
                 o.insert("source".into(), args.first().cloned().unwrap_or(Val::str("")));
                 o.insert("__regex".into(), Val::Bool(true));
+                return Ok(Val::object(o));
+            }
+            // DOM events: new Event(type, init) / new CustomEvent(type, init).
+            "Event" | "CustomEvent" => {
+                let mut o = Obj::new();
+                o.insert("type".into(), args.first().cloned().unwrap_or(Val::str("")));
+                o.insert("bubbles".into(), Val::Bool(false));
+                o.insert("cancelable".into(), Val::Bool(false));
+                o.insert("defaultPrevented".into(), Val::Bool(false));
+                if let Some(Val::Object(init)) = args.get(1) {
+                    let ib = init.borrow();
+                    if let Some(b) = ib.get("bubbles") { o.insert("bubbles".into(), b.clone()); }
+                    if let Some(d) = ib.get("detail") { o.insert("detail".into(), d.clone()); }
+                }
+                o.insert("preventDefault".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                o.insert("stopPropagation".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                return Ok(Val::object(o));
+            }
+            // MutationObserver(cb): records the callback; observe/disconnect/takeRecords.
+            "MutationObserver" => {
+                let mut o = Obj::new();
+                o.insert("__mutobs".into(), args.first().cloned().unwrap_or(Val::Undef));
+                o.insert("observe".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                o.insert("disconnect".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                o.insert("takeRecords".into(), Val::array(Vec::new()));
+                return Ok(Val::object(o));
+            }
+            // MessageChannel: two ports with postMessage; React's scheduler probes
+            // for it. We return ports whose postMessage defers onmessage so the
+            // scheduler's work loop runs through the deferred queue.
+            "MessageChannel" => {
+                let mk_port = || {
+                    let mut p = Obj::new();
+                    p.insert("postMessage".into(), Val::Native(Native::Global(Rc::from("__port_post"))));
+                    p.insert("onmessage".into(), Val::Null);
+                    p.insert("close".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                    Val::object(p)
+                };
+                let mut o = Obj::new();
+                o.insert("port1".into(), mk_port());
+                o.insert("port2".into(), mk_port());
+                return Ok(Val::object(o));
+            }
+            "AbortController" => {
+                let mut sig = Obj::new();
+                sig.insert("aborted".into(), Val::Bool(false));
+                sig.insert("addEventListener".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                let mut o = Obj::new();
+                o.insert("signal".into(), Val::object(sig));
+                o.insert("abort".into(), Val::Native(Native::Global(Rc::from("noop"))));
                 return Ok(Val::object(o));
             }
             _ => {}
@@ -1546,6 +1630,12 @@ impl Interp {
                 }
             }
             Val::Host(Host::Location) => { /* navigation ignored */ }
+            // Assigning a property to window/self/globalThis defines a real
+            // global — this is how UMD bundles (React, etc.) expose themselves
+            // (`global.React = {}`). The global object IS the window.
+            Val::Host(Host::Window) => {
+                self.global.borrow_mut().vars.insert(prop.into(), v);
+            }
             _ => {}
         }
     }
@@ -1558,7 +1648,13 @@ impl Interp {
             "id" => Val::str(n.attr("id").unwrap_or("").to_string()),
             "className" => Val::str(n.attr("class").unwrap_or("").to_string()),
             "tagName" => Val::str(n.tag.to_ascii_uppercase()),
-            "nodeName" => Val::str(n.tag.to_ascii_uppercase()),
+            "nodeName" => Val::str(if n.is_text() { String::from("#text") } else { n.tag.to_ascii_uppercase() }),
+            "nodeType" => Val::Num(self.dom.node_type(idx) as f64),
+            "nodeValue" | "data" if n.is_text() => Val::str(n.text.clone()),
+            "nodeValue" => Val::Null,
+            "ownerDocument" => Val::Host(Host::Document),
+            "namespaceURI" => Val::str("http://www.w3.org/1999/xhtml"),
+            "isConnected" => Val::Bool(true),
             "innerHTML" => Val::str(self.dom.inner_html(idx)),
             "outerHTML" => Val::str(self.dom.inner_html(idx)),
             "textContent" | "innerText" => Val::str(self.dom.text_content(idx)),
@@ -1611,6 +1707,7 @@ impl Interp {
         match prop {
             "innerHTML" | "outerHTML" => self.dom.set_inner_html(idx, &v.to_str()),
             "textContent" | "innerText" => self.dom.set_text_content(idx, &v.to_str()),
+            "nodeValue" | "data" if self.dom.nodes[idx].is_text() => self.dom.nodes[idx].text = v.to_str(),
             "className" => self.dom.nodes[idx].set_attr("class", &v.to_str()),
             "id" => self.dom.nodes[idx].set_attr("id", &v.to_str()),
             "src" => self.dom.nodes[idx].set_attr("src", &v.to_str()),
@@ -1658,7 +1755,14 @@ impl Interp {
                 "scrollY" | "scrollX" | "pageYOffset" => Val::Num(0.0),
                 // window.indexedDB resolves to the polyfilled global.
                 "indexedDB" => self.global_val("indexedDB").unwrap_or(Val::Undef),
-                _ => Val::Native(Native::Method(Box::new(Val::Host(Host::Window)), Rc::from(prop))),
+                // Reading window.<x> for any global that was defined (e.g. a UMD
+                // bundle's `window.React = {}`) returns that global. Method names
+                // (addEventListener, scrollTo…) are dispatched via builtin_method
+                // before this read, so returning the global here is safe.
+                _ => match self.global.borrow().vars.get(prop) {
+                    Some(v) => v.clone(),
+                    None => Val::Native(Native::Method(Box::new(Val::Host(Host::Window)), Rc::from(prop))),
+                },
             },
             Host::Math => match prop {
                 "PI" => Val::Num(core::f64::consts::PI),
@@ -1790,14 +1894,29 @@ impl Interp {
                 Ok(Val::array(self.dom.get_by_tag(&a0).map(Val::Node).collect()))
             }
             "createElement" => Ok(Val::Node(self.dom.create_element(&a0))),
+            // createElementNS(ns, tag) — ignore the namespace, use the tag.
+            "createElementNS" => {
+                let tag = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                Ok(Val::Node(self.dom.create_element(&tag)))
+            }
             "createTextNode" => Ok(Val::Node(self.dom.create_text(&a0))),
+            "createComment" => {
+                let idx = self.dom.create_text(&a0);
+                self.dom.nodes[idx].tag = String::from("#comment");
+                Ok(Val::Node(idx))
+            }
+            "createDocumentFragment" => Ok(Val::Node(self.dom.create_fragment())),
             "addEventListener" => {
                 if let Some(h) = args.get(1) {
                     self.listeners.push(Listener { node: self.dom.root, event: a0, handler: h.clone() });
                 }
                 Ok(Val::Undef)
             }
-            "removeEventListener" | "write" | "dispatchEvent" => Ok(Val::Undef),
+            "dispatchEvent" => {
+                self.dispatch_to_node(self.dom.root, args.first().unwrap_or(&Val::Undef))?;
+                Ok(Val::Bool(true))
+            }
+            "removeEventListener" | "write" | "createEvent" => Ok(Val::Undef),
             _ => Ok(Val::Undef),
         }
     }
@@ -1832,6 +1951,28 @@ impl Interp {
                 o.insert("getPropertyValue".into(), Val::Native(Native::Global(Rc::from("noop"))));
                 Ok(Val::object(o))
             }
+            "dispatchEvent" => {
+                self.dispatch_to_node(self.dom.root, args.first().unwrap_or(&Val::Undef))?;
+                Ok(Val::Bool(true))
+            }
+            // postMessage(data): deliver to window 'message' listeners on next tick.
+            "postMessage" => {
+                let data = args.first().cloned().unwrap_or(Val::Undef);
+                let mut ev = Obj::new();
+                ev.insert("type".into(), Val::str("message"));
+                ev.insert("data".into(), data);
+                let evv = Val::object(ev);
+                let handlers: Vec<Val> = self
+                    .listeners
+                    .iter()
+                    .filter(|l| l.node == self.dom.root && l.event == "message")
+                    .map(|l| l.handler.clone())
+                    .collect();
+                for h in handlers {
+                    self.deferred.push((h, alloc::vec![evv.clone()]));
+                }
+                Ok(Val::Undef)
+            }
             "scrollTo" | "scroll" | "scrollBy" | "removeEventListener" | "alert" | "focus" | "open" => {
                 Ok(Val::Undef)
             }
@@ -1860,6 +2001,38 @@ impl Interp {
         }
     }
 
+    /// Fire registered listeners for an event, bubbling from `start` up through
+    /// its ancestors to the document root. `event` is the Event object (its
+    /// `type` selects matching listeners).
+    fn dispatch_to_node(&mut self, start: usize, event: &Val) -> Result<(), Val> {
+        let ty = match event {
+            Val::Object(o) => o.borrow().get("type").map(|v| v.to_str()).unwrap_or_default(),
+            other => other.to_str(),
+        };
+        // Build the bubble path: target, parents…, root.
+        let mut path = alloc::vec![start];
+        let mut cur = start;
+        while let Some(p) = self.dom.nodes[cur].parent {
+            path.push(p);
+            cur = p;
+        }
+        if !path.contains(&self.dom.root) {
+            path.push(self.dom.root);
+        }
+        for node in path {
+            let handlers: Vec<Val> = self
+                .listeners
+                .iter()
+                .filter(|l| l.node == node && l.event == ty)
+                .map(|l| l.handler.clone())
+                .collect();
+            for h in handlers {
+                self.call(h, Val::Node(node), alloc::vec![event.clone()])?;
+            }
+        }
+        Ok(())
+    }
+
     fn node_method(&mut self, idx: usize, name: &str, args: &[Val]) -> Result<Option<Val>, Val> {
         let a0 = args.first().cloned().unwrap_or(Val::Undef);
         let s0 = a0.to_str();
@@ -1883,15 +2056,31 @@ impl Interp {
             }
             "insertBefore" => {
                 if let Val::Node(c) = a0 {
-                    self.dom.append_child(idx, c);
+                    let reference = match args.get(1) {
+                        Some(Val::Node(r)) => Some(*r),
+                        _ => None,
+                    };
+                    self.dom.insert_before(idx, c, reference);
                 }
-                Val::Undef
+                a0
             }
             "removeChild" => {
                 if let Val::Node(c) = a0 {
-                    self.dom.nodes[idx].children.retain(|&x| x != c);
+                    self.dom.remove_child(idx, c);
                 }
-                Val::Undef
+                a0
+            }
+            "replaceChild" => {
+                // replaceChild(newChild, oldChild)
+                if let (Val::Node(nw), Some(Val::Node(old))) = (a0.clone(), args.get(1)) {
+                    self.dom.insert_before(idx, nw, Some(*old));
+                    self.dom.remove_child(idx, *old);
+                }
+                args.get(1).cloned().unwrap_or(Val::Undef)
+            }
+            "dispatchEvent" => {
+                self.dispatch_to_node(idx, &a0)?;
+                Val::Bool(true)
             }
             "remove" => {
                 if let Some(p) = self.dom.nodes[idx].parent {
@@ -2317,6 +2506,33 @@ impl Interp {
                     self.deferred.push((f.clone(), Vec::new()));
                 }
                 Val::Undef
+            }
+
+            // ---- time (React's scheduler reads these for deadlines) ----
+            // A constant clock is fine: the scheduler never decides to yield, so
+            // the synchronous work loop runs to completion in one drain.
+            "Date.now" | "performance.now" => Val::Num(0.0),
+
+            // ---- Object.is / Symbol.for (used pervasively by React) ----
+            "Object.is" => {
+                let b = args.get(1).cloned().unwrap_or(Val::Undef);
+                Val::Bool(match (&a0, &b) {
+                    (Val::Num(x), Val::Num(y)) => {
+                        if x.is_nan() && y.is_nan() {
+                            true
+                        } else if *x == 0.0 && *y == 0.0 {
+                            // Object.is distinguishes +0 and -0 by sign bit.
+                            x.is_sign_negative() == y.is_sign_negative()
+                        } else {
+                            x == y
+                        }
+                    }
+                    _ => strict_eq(&a0, &b),
+                })
+            }
+            // Symbol.for(key) returns a stable, ===-comparable token for a key.
+            "Symbol.for" | "Symbol.iterator" | "Symbol.asyncIterator" => {
+                Val::str(alloc::format!("@@{}", a0.to_str()))
             }
 
             // ---- Object statics ----
@@ -2855,7 +3071,25 @@ fn strict_eq(a: &Val, b: &Val) -> bool {
         (Val::Str(x), Val::Str(y)) => x == y,
         (Val::Bool(x), Val::Bool(y)) => x == y,
         (Val::Node(x), Val::Node(y)) => x == y,
+        // Singleton host objects compare by identity: window===window,
+        // document===document, etc. (each Host kind is a single object).
+        (Val::Host(x), Val::Host(y)) => core::mem::discriminant(x) == core::mem::discriminant(y) && host_same(x, y),
+        // Same Rc allocation -> same object (arrays/objects/functions).
+        (Val::Array(x), Val::Array(y)) => Rc::ptr_eq(x, y),
+        (Val::Object(x), Val::Object(y)) => Rc::ptr_eq(x, y),
         _ => false,
+    }
+}
+
+/// Two host values are the same object when they're the same kind and, for the
+/// kinds that carry an owner index, the same index.
+fn host_same(x: &Host, y: &Host) -> bool {
+    match (x, y) {
+        (Host::Style(a), Host::Style(b))
+        | (Host::ClassList(a), Host::ClassList(b))
+        | (Host::Dataset(a), Host::Dataset(b))
+        | (Host::Canvas(a), Host::Canvas(b)) => a == b,
+        _ => true, // Document/Window/Console/Math/Storage/History/Location singletons
     }
 }
 

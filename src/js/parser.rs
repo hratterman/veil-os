@@ -158,10 +158,17 @@ impl Parser {
             return Stmt::Block(stmts);
         }
         if self.eat_kw("break") {
+            // optional label: `break outer;` — consume and ignore the label
+            if let Tok::Ident(n) = self.peek().clone() {
+                if !is_keyword(&n) { self.bump(); }
+            }
             self.eat_punct(";");
             return Stmt::Break;
         }
         if self.eat_kw("continue") {
+            if let Tok::Ident(n) = self.peek().clone() {
+                if !is_keyword(&n) { self.bump(); }
+            }
             self.eat_punct(";");
             return Stmt::Continue;
         }
@@ -175,6 +182,17 @@ impl Parser {
         }
         if self.eat_kw("switch") {
             return self.switch_stmt();
+        }
+        // Labeled statement: `label: stmt` (e.g. minified `a:for(...){...}`).
+        // We don't model named break/continue targets, so the label is dropped
+        // and `break`/`continue` apply to the innermost loop — fine for the
+        // structured loops minifiers emit. The point is to not desync parsing.
+        if let Tok::Ident(n) = self.peek().clone() {
+            if !is_keyword(&n) && matches!(self.peek2(), Tok::Punct(":")) {
+                self.bump(); // label
+                self.bump(); // :
+                return self.stmt();
+            }
         }
         let e = self.expr();
         self.eat_punct(";");
@@ -593,12 +611,18 @@ impl Parser {
     // ---- expressions -------------------------------------------------------
 
     pub fn expr(&mut self) -> Expr {
-        let mut e = self.assign();
-        // comma/sequence: keep the last (rarely matters)
-        while self.eat_punct(",") {
-            e = self.assign();
+        let first = self.assign();
+        // comma/sequence operator: evaluate each operand left-to-right (for
+        // their side effects) and yield the last. UMD bundles rely on this
+        // (`(global = global || self, factory(global.X = {}))`).
+        if !self.is_punct(",") {
+            return first;
         }
-        e
+        let mut seq = alloc::vec![first];
+        while self.eat_punct(",") {
+            seq.push(self.assign());
+        }
+        Expr::Seq(seq)
     }
 
     fn assign(&mut self) -> Expr {
@@ -864,6 +888,10 @@ impl Parser {
                     }
                 }
                 Expr::Tmpl(elems)
+            }
+            Tok::Regex(pat, flags) => {
+                self.bump();
+                Expr::Regex(pat, flags)
             }
             Tok::Punct("(") => {
                 self.bump();

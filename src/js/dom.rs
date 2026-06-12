@@ -104,13 +104,68 @@ impl Dom {
         idx
     }
 
+    pub fn create_fragment(&mut self) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(DomNode::elem("#fragment"));
+        idx
+    }
+
     pub fn append_child(&mut self, parent: usize, child: usize) {
+        // A document fragment dissolves: its children are moved, not the node.
+        if self.nodes[child].tag == "#fragment" {
+            let kids = core::mem::take(&mut self.nodes[child].children);
+            for c in kids {
+                self.nodes[c].parent = None;
+                self.append_child(parent, c);
+            }
+            return;
+        }
         // detach from old parent
         if let Some(op) = self.nodes[child].parent {
             self.nodes[op].children.retain(|&c| c != child);
         }
         self.nodes[child].parent = Some(parent);
         self.nodes[parent].children.push(child);
+    }
+
+    /// Insert `child` before `reference` in `parent`'s child list. If
+    /// `reference` is None or not a child, append at the end.
+    pub fn insert_before(&mut self, parent: usize, child: usize, reference: Option<usize>) {
+        if self.nodes[child].tag == "#fragment" {
+            let kids = core::mem::take(&mut self.nodes[child].children);
+            for c in kids {
+                self.nodes[c].parent = None;
+                self.insert_before(parent, c, reference);
+            }
+            return;
+        }
+        if let Some(op) = self.nodes[child].parent {
+            self.nodes[op].children.retain(|&c| c != child);
+        }
+        self.nodes[child].parent = Some(parent);
+        let pos = reference
+            .and_then(|r| self.nodes[parent].children.iter().position(|&c| c == r));
+        match pos {
+            Some(p) => self.nodes[parent].children.insert(p, child),
+            None => self.nodes[parent].children.push(child),
+        }
+    }
+
+    pub fn remove_child(&mut self, parent: usize, child: usize) {
+        self.nodes[parent].children.retain(|&x| x != child);
+        if self.nodes[child].parent == Some(parent) {
+            self.nodes[child].parent = None;
+        }
+    }
+
+    /// DOM nodeType: 1 element, 3 text, 11 document-fragment.
+    pub fn node_type(&self, idx: usize) -> u32 {
+        match self.nodes[idx].tag.as_str() {
+            "#text" => 3,
+            "#fragment" => 11,
+            "#comment" => 8,
+            _ => 1,
+        }
     }
 
     // --- lookups ------------------------------------------------------------
@@ -132,6 +187,32 @@ impl Dom {
     pub fn query_all(&self, sel: &str) -> Vec<usize> {
         let sel = sel.trim();
         let mut out = Vec::new();
+        // Comma list: union of each selector's matches.
+        if sel.contains(',') {
+            for part in sel.split(',') {
+                for m in self.query_all(part.trim()) {
+                    if !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+            return out;
+        }
+        // Descendant combinator "A B C": a node matches the rightmost compound
+        // and has ancestors matching the earlier compounds in order.
+        let parts: Vec<&str> = sel.split_whitespace().collect();
+        if parts.len() > 1 {
+            let last = parts[parts.len() - 1];
+            for (i, n) in self.nodes.iter().enumerate() {
+                if n.is_text() || !self.matches(i, n, last) {
+                    continue;
+                }
+                if self.ancestors_match(i, &parts[..parts.len() - 1]) {
+                    out.push(i);
+                }
+            }
+            return out;
+        }
         for (i, n) in self.nodes.iter().enumerate() {
             if n.is_text() {
                 continue;
@@ -141,6 +222,23 @@ impl Dom {
             }
         }
         out
+    }
+
+    /// Walking up from `idx`, do the ancestor compounds match in order (each
+    /// somewhere above, right-to-left)?
+    fn ancestors_match(&self, idx: usize, compounds: &[&str]) -> bool {
+        let mut remaining = compounds.len();
+        let mut cur = self.nodes[idx].parent;
+        while let Some(p) = cur {
+            if remaining > 0 && self.matches(p, &self.nodes[p], compounds[remaining - 1]) {
+                remaining -= 1;
+                if remaining == 0 {
+                    return true;
+                }
+            }
+            cur = self.nodes[p].parent;
+        }
+        remaining == 0
     }
 
     fn matches(&self, _idx: usize, n: &DomNode, sel: &str) -> bool {

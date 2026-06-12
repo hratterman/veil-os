@@ -356,6 +356,91 @@ pub fn indexeddb_selftest() {
     }
 }
 
+/// DOM API self-test (M42 step 1): exercise the full imperative DOM surface a
+/// framework needs — createElement/createTextNode/createDocumentFragment, the
+/// tree mutators (appendChild/insertBefore ordering/removeChild/replaceChild),
+/// node properties (nodeType/nodeValue/children), classList, attributes,
+/// querySelector(All), addEventListener + dispatchEvent with a CustomEvent — plus
+/// the engine fixes this step landed (comma-sequence side effects, regex
+/// literals, labeled statements, Object.is/Symbol.for). Writes a summary into a
+/// DOM node and reads it back. Emits DOMAPI_OK.
+pub fn dom_api_selftest() {
+    let skeleton = "<html><body><div id=app></div><div id=out></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        var app = document.getElementById('app');
+        // createElement + textContent + appendChild
+        var h = document.createElement('h1');
+        h.textContent = 'Title';
+        app.appendChild(h);
+        // createDocumentFragment + insertBefore ordering
+        var frag = document.createDocumentFragment();
+        var a = document.createElement('span'); a.textContent = 'A';
+        var b = document.createElement('span'); b.textContent = 'B';
+        var c = document.createElement('span'); c.textContent = 'C';
+        frag.appendChild(a); frag.appendChild(c);
+        app.appendChild(frag);          // app: h1, A, C
+        app.insertBefore(b, c);         // app: h1, A, B, C
+        var order = '';
+        for (var i = 0; i < app.children.length; i++) { order += app.children[i].textContent; }
+        // nodeType
+        var nt = h.nodeType + ',' + document.createTextNode('x').nodeType + ',' + frag.nodeType;
+        // classList
+        h.classList.add('big'); h.classList.add('bold'); h.classList.toggle('bold');
+        var cls = h.className + '|' + h.classList.contains('big');
+        // attributes
+        h.setAttribute('data-id', '42');
+        var attr = h.getAttribute('data-id') + ',' + h.hasAttribute('data-id');
+        h.removeAttribute('data-id');
+        attr += ',' + h.hasAttribute('data-id');
+        // querySelector / querySelectorAll
+        var qs = (document.querySelector('#app h1') ? 'h1' : '?') + ',' + document.querySelectorAll('span').length;
+        // events: addEventListener + dispatchEvent(CustomEvent)
+        var got = 'none';
+        app.addEventListener('ping', function(e) { got = e.type + ':' + (e.detail ? e.detail.n : '?'); });
+        app.dispatchEvent(new CustomEvent('ping', { detail: { n: 7 } }));
+        // engine fixes: comma-sequence side effect, regex literal, labeled loop
+        var seqZ; var seqR = (seqZ = 5, seqZ + 1); var seqOut = (seqR === 6 && seqZ === 5) ? 'seqok' : 'seqbad';
+        var re = /ab+c/i; var reOk = (re.source === 'ab+c' && re.flags === 'i') ? 'reok' : 'rebad';
+        var ln = 0; outer: for (var x = 0; x < 4; x++) { ln++; continue outer; }
+        var objis = Object.is(NaN, NaN) + ',' + Object.is(-0, 0);
+        var out = [
+          'order=' + order, 'nodeType=' + nt, 'class=' + cls, 'attr=' + attr,
+          'qs=' + qs, 'event=' + got, seqOut, reOk, 'label=' + ln, 'objis=' + objis
+        ].join(' | ');
+        document.getElementById('out').textContent = out;
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    let out = node_text_by_id(&res.tree, "out");
+    crate::kprintln!("JS_DOMAPI: {out}");
+    if !res.errors.is_empty() {
+        crate::kprintln!("JS_DOMAPI: {} issue(s); first: {}", res.errors.len(), truncate(&res.errors[0], 160));
+    }
+    let checks = [
+        "order=TitleABC",        // insertBefore put B between A and C
+        "nodeType=1,3,11",       // element, text, fragment
+        "class=big|true",        // toggle removed 'bold', 'big' remains
+        "attr=42,true,false",    // get, has, then removed
+        "qs=h1,3",               // descendant selector + 3 spans
+        "event=ping:7",          // CustomEvent dispatched with detail
+        "seqok",                 // comma-sequence side effect persisted
+        "reok",                  // regex literal lexed with source+flags
+        "label=4",               // labeled loop ran 4 iterations
+        "objis=true,false",      // Object.is(NaN,NaN)=true, Object.is(-0,0)=false
+    ];
+    let pass = checks.iter().all(|c| out.contains(c));
+    if pass {
+        crate::kprintln!("DOMAPI_OK: full DOM API (create/fragment/insertBefore/nodeType/classList/attrs/querySelector/dispatchEvent) + comma-seq/regex/labels/Object.is");
+    } else {
+        let missing: Vec<&str> = checks.iter().copied().filter(|c| !out.contains(c)).collect();
+        crate::kprintln!("DOMAPI_FAIL: missing {:?}", missing);
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n { String::from(s) } else { String::from(&s[..n]) }
+}
+
 fn find_by_id<'a>(n: &'a Node, id: &str) -> Option<&'a Node> {
     if n.attr("id") == Some(id) {
         return Some(n);

@@ -25,6 +25,10 @@ pub enum Expr {
     Binary(&'static str, Box<Expr>, Box<Expr>),
     Logical(&'static str, Box<Expr>, Box<Expr>),
     Assign(&'static str, Box<Expr>, Box<Expr>),
+    /// Comma/sequence operator: evaluate each left-to-right, yield the last.
+    Seq(Vec<Expr>),
+    /// Regex literal /pattern/flags.
+    Regex(String, String),
     Cond(Box<Expr>, Box<Expr>, Box<Expr>),
     Member(Box<Expr>, String, bool), // obj.prop, optional?
     Index(Box<Expr>, Box<Expr>),

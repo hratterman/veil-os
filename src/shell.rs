@@ -1,24 +1,30 @@
-//! M35 real shell: commands that operate on the FAT16 disk — ls/cat/cp/mv/rm,
-//! echo with `>` redirection, two-stage pipes (`cat f | grep x`), pwd/cd, and
-//! `run <app>` to launch a GUI app. The window/REPL plumbing (history, tab
-//! completion, rendering) lives in wm.rs; this module is the command engine.
+//! M41 real shell: a bash-compatible subset run as a tree-walking interpreter.
+//!
+//! Tokenizer -> recursive-descent parser (AST) -> executor. Supports: variable
+//! expansion (`$VAR`, `${VAR}`, `${VAR:-def}`, `$?`, `$#`, `$@`, `$1..`), command
+//! substitution `$(...)` / backticks, arithmetic `$((...))` + `let`, single/double
+//! quoting + escapes, glob `*?[...]` against the FAT16 root, pipes, redirections
+//! (`>`, `>>`, `<`, `2>`, `2>&1`), `&&`/`||`/`;`, `if/elif/else/fi`,
+//! `for..in..do..done`, `while/until..do..done`, `case..esac`, functions
+//! (`name() { }`), and builtins (`cd pwd echo printf export unset read source .
+//! exit true false test [ [[ let : set shift type which`). The leaf file
+//! commands (ls/cat/cp/mv/rm/grep/head/tail/sort/wc/find/date/df) operate on the
+//! FAT16 disk. Background `&` and signals are cooperative (commands run
+//! synchronously in the desktop task), documented in PROGRESS.
 
 use crate::fs;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 
-const HELP: &str = "veil shell commands:\n  \
-ls [-l]           list files (with sizes)\n  \
-cat <file>        print a file\n  \
-cp <src> <dst>    copy a file\n  \
-mv <src> <dst>    rename/move a file\n  \
-rm <file>         delete a file\n  \
-echo <s> [> f]    print text or write it to a file\n  \
-grep <pat>        filter piped lines\n  \
-pwd / cd          working directory (root-only FS)\n  \
-run <app>         launch browser/viewer/lisp/files/...\n  \
-clear / help\n";
+const HELP: &str = "veil shell (bash subset):\n  \
+files: ls cat cp mv rm find  |  text: grep head tail sort wc echo printf\n  \
+vars: VAR=val  export VAR=val  $VAR ${VAR} $(cmd) $((expr))  unset\n  \
+control: if/elif/else/fi  for x in ..; do ..; done  while/until  case..esac\n  \
+funcs: name() { ..; }   tests: test/[ -f -d -z = -eq ..   redirect: > >> < 2>\n  \
+builtins: cd pwd read source(.) let exit true false type which  run <app>\n";
 
 /// What a command line produced: text to print and an optional app to launch.
 pub struct Outcome {
@@ -27,137 +33,1733 @@ pub struct Outcome {
     pub clear: bool,
 }
 
-/// Run a full command line (supports `|` pipes and `>` redirection).
-pub fn run(line: &str) -> Outcome {
-    let line = line.trim();
-    if line.is_empty() {
-        return Outcome { out: String::new(), launch: None, clear: false };
-    }
-    if line == "clear" {
-        return Outcome { out: String::new(), launch: None, clear: true };
-    }
-    let mut out = String::new();
-    let mut launch = None;
-    // Sequence by ';' (always run), then chain by && / || within each segment.
-    for seg in line.split(';') {
-        let seg = seg.trim();
-        if seg.is_empty() {
-            continue;
-        }
-        let mut last_ok = true;
-        for (op, cmd) in split_andor(seg) {
-            let do_it = match op {
-                "&&" => last_ok,
-                "||" => !last_ok,
-                _ => true,
-            };
-            if !do_it {
-                continue;
-            }
-            let (o, l, ok) = run_pipeline(cmd.trim());
-            out.push_str(&o);
-            launch = launch.or(l);
-            last_ok = ok;
-        }
-    }
-    Outcome { out, launch, clear: false }
+// --- persistent shell state ---------------------------------------------------
+
+struct ShellState {
+    vars: BTreeMap<String, String>,
+    funcs: BTreeMap<String, Node>,
+    status: i32,
+    params: Vec<String>, // positional $1.. ($0 is "vsh")
+    launch: Option<String>,
+    clear: bool,
+    exited: bool,
 }
 
-/// Split "a && b || c" into [("", "a"), ("&&", "b"), ("||", "c")].
-fn split_andor(s: &str) -> Vec<(&str, &str)> {
-    let mut res = Vec::new();
-    let (mut start, mut prev_op, mut i) = (0usize, "", 0usize);
-    let b = s.as_bytes();
-    while i + 1 < b.len() {
-        if &s[i..i + 2] == "&&" || &s[i..i + 2] == "||" {
-            res.push((prev_op, s[start..i].trim()));
-            prev_op = &s[i..i + 2];
-            i += 2;
-            start = i;
+static mut STATE: Option<ShellState> = None;
+
+fn state() -> &'static mut ShellState {
+    unsafe {
+        let s = &mut *core::ptr::addr_of_mut!(STATE);
+        if s.is_none() {
+            let mut vars = BTreeMap::new();
+            vars.insert("USER".into(), "guest".into());
+            vars.insert("SHELL".into(), "/bin/vsh".into());
+            vars.insert("HOME".into(), "/".into());
+            vars.insert("PWD".into(), "/".into());
+            vars.insert("PATH".into(), "/bin".into());
+            *s = Some(ShellState {
+                vars,
+                funcs: BTreeMap::new(),
+                status: 0,
+                params: Vec::new(),
+                launch: None,
+                clear: false,
+                exited: false,
+            });
+        }
+        s.as_mut().unwrap()
+    }
+}
+
+/// Run a full command line / script fragment.
+pub fn run(line: &str) -> Outcome {
+    let st = state();
+    st.launch = None;
+    st.clear = false;
+    st.exited = false;
+    let toks = tokenize(line);
+    let mut p = Parser { toks: &toks, pos: 0 };
+    let mut out = String::new();
+    while !p.at_end() {
+        p.skip_seps();
+        if p.at_end() {
+            break;
+        }
+        match p.parse_and_or() {
+            Some(node) => {
+                let (o, status) = exec(&node, st, None);
+                out.push_str(&o);
+                st.status = status;
+            }
+            None => {
+                // Unparseable token: skip it to avoid a hang.
+                p.pos += 1;
+            }
+        }
+        if st.exited {
+            break;
+        }
+    }
+    Outcome { out, launch: st.launch.take(), clear: st.clear }
+}
+
+// --- tokenizer ----------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    Op(&'static str), // | || && ; & ( ) < > >> 2> 2>&1 ;;
+    Newline,
+}
+
+fn tokenize(src: &str) -> Vec<Tok> {
+    let b: Vec<char> = src.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    let n = b.len();
+    while i < n {
+        let c = b[i];
+        if c == ' ' || c == '\t' || c == '\r' {
+            i += 1;
+            continue;
+        }
+        if c == '\n' || c == ';' {
+            if c == ';' && i + 1 < n && b[i + 1] == ';' {
+                toks.push(Tok::Op(";;"));
+                i += 2;
+            } else {
+                toks.push(if c == '\n' { Tok::Newline } else { Tok::Op(";") });
+                i += 1;
+            }
+            continue;
+        }
+        if c == '#' {
+            // comment to end of line
+            while i < n && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // operators
+        if c == '|' {
+            if i + 1 < n && b[i + 1] == '|' {
+                toks.push(Tok::Op("||"));
+                i += 2;
+            } else {
+                toks.push(Tok::Op("|"));
+                i += 1;
+            }
+            continue;
+        }
+        if c == '&' {
+            if i + 1 < n && b[i + 1] == '&' {
+                toks.push(Tok::Op("&&"));
+                i += 2;
+            } else {
+                toks.push(Tok::Op("&"));
+                i += 1;
+            }
+            continue;
+        }
+        if c == '>' {
+            if i + 1 < n && b[i + 1] == '>' {
+                toks.push(Tok::Op(">>"));
+                i += 2;
+            } else {
+                toks.push(Tok::Op(">"));
+                i += 1;
+            }
+            continue;
+        }
+        if c == '<' {
+            toks.push(Tok::Op("<"));
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            toks.push(Tok::Op("("));
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            toks.push(Tok::Op(")"));
+            i += 1;
+            continue;
+        }
+        // `2>` / `2>&1`
+        if c == '2' && i + 1 < n && b[i + 1] == '>' {
+            if i + 3 < n && b[i + 2] == '&' && b[i + 3] == '1' {
+                toks.push(Tok::Op("2>&1"));
+                i += 4;
+            } else {
+                toks.push(Tok::Op("2>"));
+                i += 2;
+            }
+            continue;
+        }
+        // a word: accumulate until a separator/operator, honoring quotes and $(...)
+        let mut w = String::new();
+        while i < n {
+            let c = b[i];
+            if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' {
+                break;
+            }
+            if matches!(c, '|' | '&' | '>' | '<') {
+                break;
+            }
+            if c == '(' || c == ')' {
+                // ')' / '(' end a word unless inside it's part of $(...) handled below
+                break;
+            }
+            if c == '\'' {
+                w.push(c);
+                i += 1;
+                while i < n && b[i] != '\'' {
+                    w.push(b[i]);
+                    i += 1;
+                }
+                if i < n {
+                    w.push('\'');
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '"' {
+                w.push(c);
+                i += 1;
+                while i < n && b[i] != '"' {
+                    if b[i] == '\\' && i + 1 < n {
+                        w.push(b[i]);
+                        w.push(b[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    w.push(b[i]);
+                    i += 1;
+                }
+                if i < n {
+                    w.push('"');
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '`' {
+                w.push(c);
+                i += 1;
+                while i < n && b[i] != '`' {
+                    w.push(b[i]);
+                    i += 1;
+                }
+                if i < n {
+                    w.push('`');
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\\' && i + 1 < n {
+                w.push(c);
+                w.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '$' && i + 1 < n && b[i + 1] == '(' {
+                // $( ... ) or $(( ... )) — copy balanced
+                let depth0 = w.len();
+                let _ = depth0;
+                w.push('$');
+                w.push('(');
+                i += 2;
+                let mut depth = 1;
+                while i < n && depth > 0 {
+                    if b[i] == '(' {
+                        depth += 1;
+                    } else if b[i] == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            w.push(')');
+                            i += 1;
+                            break;
+                        }
+                    }
+                    w.push(b[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '$' && i + 1 < n && b[i + 1] == '{' {
+                w.push('$');
+                w.push('{');
+                i += 2;
+                while i < n && b[i] != '}' {
+                    w.push(b[i]);
+                    i += 1;
+                }
+                if i < n {
+                    w.push('}');
+                    i += 1;
+                }
+                continue;
+            }
+            w.push(c);
+            i += 1;
+        }
+        if !w.is_empty() {
+            toks.push(Tok::Word(w));
+        } else if i < n && (b[i] == '(' || b[i] == ')') {
+            // emit the paren operator we stopped on (handled at top of loop next)
+        }
+    }
+    toks
+}
+
+// --- parser -------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum Redir {
+    Out(String),    // >
+    Append(String), // >>
+    In(String),     // <
+    ErrOut(String), // 2>
+    ErrToOut,       // 2>&1
+}
+
+#[derive(Clone, Debug)]
+enum Node {
+    Simple { assigns: Vec<(String, String)>, words: Vec<String>, redirs: Vec<Redir> },
+    Pipeline(Vec<Node>),
+    AndOr(Vec<(u8, Node)>), // 0=first, 1=&&, 2=||
+    List(Vec<Node>),
+    If { cond: alloc::boxed::Box<Node>, then: alloc::boxed::Box<Node>, elifs: Vec<(Node, Node)>, els: Option<alloc::boxed::Box<Node>> },
+    For { var: String, words: Vec<String>, body: alloc::boxed::Box<Node> },
+    While { cond: alloc::boxed::Box<Node>, body: alloc::boxed::Box<Node>, until: bool },
+    Case { word: String, arms: Vec<(Vec<String>, Node)> },
+    FuncDef { name: String, body: alloc::boxed::Box<Node> },
+    Group(alloc::boxed::Box<Node>),
+}
+
+struct Parser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn at_end(&self) -> bool {
+        self.pos >= self.toks.len()
+    }
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+    fn skip_seps(&mut self) {
+        while matches!(self.peek(), Some(Tok::Newline) | Some(Tok::Op(";")) | Some(Tok::Op("&"))) {
+            self.pos += 1;
+        }
+    }
+    fn peek_word(&self) -> Option<&str> {
+        match self.peek() {
+            Some(Tok::Word(w)) => Some(w.as_str()),
+            _ => None,
+        }
+    }
+    /// Is the next token a reserved word that terminates a command list?
+    fn at_terminator(&self) -> bool {
+        matches!(
+            self.peek_word(),
+            Some("then" | "else" | "elif" | "fi" | "do" | "done" | "esac" | "}")
+        ) || matches!(self.peek(), Some(Tok::Op(")")))
+    }
+
+    /// Parse a list of and-or pipelines until a terminator reserved word.
+    fn parse_list(&mut self) -> Node {
+        let mut items = Vec::new();
+        loop {
+            self.skip_seps();
+            if self.at_end() || self.at_terminator() {
+                break;
+            }
+            match self.parse_and_or() {
+                Some(n) => items.push(n),
+                None => break,
+            }
+        }
+        if items.len() == 1 {
+            items.pop().unwrap()
         } else {
+            Node::List(items)
+        }
+    }
+
+    fn parse_and_or(&mut self) -> Option<Node> {
+        let first = self.parse_pipeline()?;
+        let mut chain = vec![(0u8, first)];
+        loop {
+            match self.peek() {
+                Some(Tok::Op("&&")) => {
+                    self.pos += 1;
+                    self.skip_newlines();
+                    if let Some(p) = self.parse_pipeline() {
+                        chain.push((1, p));
+                    }
+                }
+                Some(Tok::Op("||")) => {
+                    self.pos += 1;
+                    self.skip_newlines();
+                    if let Some(p) = self.parse_pipeline() {
+                        chain.push((2, p));
+                    }
+                }
+                _ => break,
+            }
+        }
+        if chain.len() == 1 {
+            Some(chain.pop().unwrap().1)
+        } else {
+            Some(Node::AndOr(chain))
+        }
+    }
+
+    fn skip_newlines(&mut self) {
+        while matches!(self.peek(), Some(Tok::Newline)) {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_pipeline(&mut self) -> Option<Node> {
+        let mut stages = vec![self.parse_command()?];
+        while matches!(self.peek(), Some(Tok::Op("|"))) {
+            self.pos += 1;
+            self.skip_newlines();
+            stages.push(self.parse_command()?);
+        }
+        if stages.len() == 1 {
+            Some(stages.pop().unwrap())
+        } else {
+            Some(Node::Pipeline(stages))
+        }
+    }
+
+    fn parse_command(&mut self) -> Option<Node> {
+        match self.peek_word() {
+            Some("if") => return Some(self.parse_if()),
+            Some("for") => return Some(self.parse_for()),
+            Some("while") => return Some(self.parse_while(false)),
+            Some("until") => return Some(self.parse_while(true)),
+            Some("case") => return Some(self.parse_case()),
+            Some("function") => return self.parse_func_kw(),
+            _ => {}
+        }
+        if matches!(self.peek(), Some(Tok::Op("("))) {
+            self.pos += 1;
+            let body = self.parse_list();
+            if matches!(self.peek(), Some(Tok::Op(")"))) {
+                self.pos += 1;
+            }
+            return Some(Node::Group(alloc::boxed::Box::new(body)));
+        }
+        // function definition: name ( )
+        if let Some(w) = self.peek_word() {
+            if is_name(w)
+                && matches!(self.toks.get(self.pos + 1), Some(Tok::Op("(")))
+                && matches!(self.toks.get(self.pos + 2), Some(Tok::Op(")")))
+            {
+                let name = w.to_string();
+                self.pos += 3;
+                self.skip_newlines();
+                // body is a brace group
+                let body = self.parse_command()?;
+                return Some(Node::FuncDef { name, body: alloc::boxed::Box::new(body) });
+            }
+            if w == "{" {
+                self.pos += 1;
+                let body = self.parse_list();
+                if self.peek_word() == Some("}") {
+                    self.pos += 1;
+                }
+                return Some(Node::Group(alloc::boxed::Box::new(body)));
+            }
+        }
+        self.parse_simple()
+    }
+
+    fn parse_simple(&mut self) -> Option<Node> {
+        let mut assigns = Vec::new();
+        let mut words = Vec::new();
+        let mut redirs = Vec::new();
+        // leading VAR=value assignments
+        while let Some(w) = self.peek_word() {
+            if words.is_empty() && is_assignment(w) {
+                let (k, v) = w.split_once('=').unwrap();
+                assigns.push((k.to_string(), v.to_string()));
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        loop {
+            match self.peek() {
+                Some(Tok::Word(w)) => {
+                    words.push(w.clone());
+                    self.pos += 1;
+                }
+                Some(Tok::Op(">")) => {
+                    self.pos += 1;
+                    if let Some(t) = self.take_word() {
+                        redirs.push(Redir::Out(t));
+                    }
+                }
+                Some(Tok::Op(">>")) => {
+                    self.pos += 1;
+                    if let Some(t) = self.take_word() {
+                        redirs.push(Redir::Append(t));
+                    }
+                }
+                Some(Tok::Op("<")) => {
+                    self.pos += 1;
+                    if let Some(t) = self.take_word() {
+                        redirs.push(Redir::In(t));
+                    }
+                }
+                Some(Tok::Op("2>")) => {
+                    self.pos += 1;
+                    if let Some(t) = self.take_word() {
+                        redirs.push(Redir::ErrOut(t));
+                    }
+                }
+                Some(Tok::Op("2>&1")) => {
+                    self.pos += 1;
+                    redirs.push(Redir::ErrToOut);
+                }
+                _ => break,
+            }
+        }
+        if assigns.is_empty() && words.is_empty() && redirs.is_empty() {
+            return None;
+        }
+        Some(Node::Simple { assigns, words, redirs })
+    }
+
+    fn take_word(&mut self) -> Option<String> {
+        if let Some(Tok::Word(w)) = self.peek() {
+            let w = w.clone();
+            self.pos += 1;
+            Some(w)
+        } else {
+            None
+        }
+    }
+
+    fn expect_word(&mut self, kw: &str) {
+        if self.peek_word() == Some(kw) {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_if(&mut self) -> Node {
+        self.pos += 1; // if
+        let cond = self.parse_list();
+        self.expect_word("then");
+        let then = self.parse_list();
+        let mut elifs = Vec::new();
+        let mut els = None;
+        loop {
+            match self.peek_word() {
+                Some("elif") => {
+                    self.pos += 1;
+                    let c = self.parse_list();
+                    self.expect_word("then");
+                    let b = self.parse_list();
+                    elifs.push((c, b));
+                }
+                Some("else") => {
+                    self.pos += 1;
+                    els = Some(alloc::boxed::Box::new(self.parse_list()));
+                }
+                _ => break,
+            }
+        }
+        self.expect_word("fi");
+        Node::If { cond: alloc::boxed::Box::new(cond), then: alloc::boxed::Box::new(then), elifs, els }
+    }
+
+    fn parse_for(&mut self) -> Node {
+        self.pos += 1; // for
+        let var = self.take_word().unwrap_or_default();
+        let mut words = Vec::new();
+        if self.peek_word() == Some("in") {
+            self.pos += 1;
+            while let Some(Tok::Word(w)) = self.peek() {
+                words.push(w.clone());
+                self.pos += 1;
+            }
+        } else {
+            words.push("\"$@\"".to_string());
+        }
+        self.skip_seps();
+        self.expect_word("do");
+        let body = self.parse_list();
+        self.expect_word("done");
+        Node::For { var, words, body: alloc::boxed::Box::new(body) }
+    }
+
+    fn parse_while(&mut self, until: bool) -> Node {
+        self.pos += 1; // while/until
+        let cond = self.parse_list();
+        self.expect_word("do");
+        let body = self.parse_list();
+        self.expect_word("done");
+        Node::While { cond: alloc::boxed::Box::new(cond), body: alloc::boxed::Box::new(body), until }
+    }
+
+    fn parse_case(&mut self) -> Node {
+        self.pos += 1; // case
+        let word = self.take_word().unwrap_or_default();
+        self.expect_word("in");
+        let mut arms = Vec::new();
+        loop {
+            self.skip_seps();
+            if self.peek_word() == Some("esac") || self.at_end() {
+                break;
+            }
+            // optional leading '('
+            if matches!(self.peek(), Some(Tok::Op("("))) {
+                self.pos += 1;
+            }
+            // patterns separated by '|'
+            let mut pats = Vec::new();
+            loop {
+                if let Some(w) = self.take_word() {
+                    pats.push(w);
+                }
+                if matches!(self.peek(), Some(Tok::Op("|"))) {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if matches!(self.peek(), Some(Tok::Op(")"))) {
+                self.pos += 1;
+            }
+            let body = self.parse_list();
+            arms.push((pats, body));
+            if matches!(self.peek(), Some(Tok::Op(";;"))) {
+                self.pos += 1;
+            }
+        }
+        self.expect_word("esac");
+        Node::Case { word, arms }
+    }
+
+    fn parse_func_kw(&mut self) -> Option<Node> {
+        self.pos += 1; // function
+        let name = self.take_word()?;
+        if matches!(self.peek(), Some(Tok::Op("("))) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(Tok::Op(")"))) {
+                self.pos += 1;
+            }
+        }
+        self.skip_newlines();
+        let body = self.parse_command()?;
+        Some(Node::FuncDef { name, body: alloc::boxed::Box::new(body) })
+    }
+}
+
+fn is_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_assignment(s: &str) -> bool {
+    if let Some(eq) = s.find('=') {
+        eq > 0 && is_name(&s[..eq])
+    } else {
+        false
+    }
+}
+
+// --- executor -----------------------------------------------------------------
+
+const LOOP_CAP: usize = 100_000;
+
+fn exec(node: &Node, st: &mut ShellState, stdin: Option<String>) -> (String, i32) {
+    if st.exited {
+        return (String::new(), st.status);
+    }
+    match node {
+        Node::Simple { assigns, words, redirs } => exec_simple(assigns, words, redirs, st, stdin),
+        Node::Pipeline(stages) => {
+            let mut prev: Option<String> = stdin;
+            let mut status = 0;
+            for (i, s) in stages.iter().enumerate() {
+                let (out, code) = exec(s, st, prev.take());
+                status = code;
+                if i + 1 < stages.len() {
+                    prev = Some(out);
+                } else {
+                    return (out, status);
+                }
+            }
+            (String::new(), status)
+        }
+        Node::AndOr(chain) => {
+            let mut out = String::new();
+            let mut status = 0;
+            for (i, (conj, n)) in chain.iter().enumerate() {
+                let run = match conj {
+                    0 => true,
+                    1 => status == 0, // &&
+                    _ => status != 0, // ||
+                };
+                if i == 0 || run {
+                    let (o, c) = exec(n, st, None);
+                    out.push_str(&o);
+                    status = c;
+                }
+            }
+            (out, status)
+        }
+        Node::List(items) => {
+            let mut out = String::new();
+            let mut status = 0;
+            for n in items {
+                let (o, c) = exec(n, st, None);
+                out.push_str(&o);
+                status = c;
+                if st.exited {
+                    break;
+                }
+            }
+            (out, status)
+        }
+        Node::Group(inner) => exec(inner, st, stdin),
+        Node::If { cond, then, elifs, els } => {
+            let (mut out, c) = exec(cond, st, None);
+            if c == 0 {
+                let (o, s) = exec(then, st, None);
+                out.push_str(&o);
+                return (out, s);
+            }
+            for (ec, eb) in elifs {
+                let (o, cc) = exec(ec, st, None);
+                out.push_str(&o);
+                if cc == 0 {
+                    let (o2, s) = exec(eb, st, None);
+                    out.push_str(&o2);
+                    return (out, s);
+                }
+            }
+            if let Some(e) = els {
+                let (o, s) = exec(e, st, None);
+                out.push_str(&o);
+                return (out, s);
+            }
+            (out, 0)
+        }
+        Node::For { var, words, body } => {
+            let mut out = String::new();
+            let mut status = 0;
+            let mut items: Vec<String> = Vec::new();
+            for w in words {
+                items.extend(expand_word(w, st));
+            }
+            for item in items {
+                st.vars.insert(var.clone(), item);
+                let (o, s) = exec(body, st, None);
+                out.push_str(&o);
+                status = s;
+                if st.exited {
+                    break;
+                }
+            }
+            (out, status)
+        }
+        Node::While { cond, body, until } => {
+            let mut out = String::new();
+            let mut status = 0;
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                if guard > LOOP_CAP {
+                    out.push_str("while: loop limit reached\n");
+                    break;
+                }
+                let (co, cc) = exec(cond, st, None);
+                out.push_str(&co);
+                let go = if *until { cc != 0 } else { cc == 0 };
+                if !go {
+                    break;
+                }
+                let (o, s) = exec(body, st, None);
+                out.push_str(&o);
+                status = s;
+                if st.exited {
+                    break;
+                }
+            }
+            (out, status)
+        }
+        Node::Case { word, arms } => {
+            let target = expand_word(word, st).into_iter().next().unwrap_or_default();
+            for (pats, body) in arms {
+                for p in pats {
+                    let pe = expand_word(p, st).into_iter().next().unwrap_or_else(|| p.clone());
+                    if glob_match(&pe, &target) {
+                        return exec(body, st, None);
+                    }
+                }
+            }
+            (String::new(), 0)
+        }
+        Node::FuncDef { name, body } => {
+            st.funcs.insert(name.clone(), (**body).clone());
+            (String::new(), 0)
+        }
+    }
+}
+
+fn exec_simple(
+    assigns: &[(String, String)],
+    words: &[String],
+    redirs: &[Redir],
+    st: &mut ShellState,
+    stdin: Option<String>,
+) -> (String, i32) {
+    // Expand all words into the final argv.
+    let mut argv: Vec<String> = Vec::new();
+    for w in words {
+        argv.extend(expand_word(w, st));
+    }
+    // Pure-assignment command (no words): set variables, status 0.
+    if argv.is_empty() {
+        for (k, v) in assigns {
+            let val = expand_str(v, st);
+            st.vars.insert(k.clone(), val);
+        }
+        return (String::new(), 0);
+    }
+    // Temporary assignment prefix (VAR=val cmd) — applied to the shell vars
+    // (no separate environment fork in this model).
+    for (k, v) in assigns {
+        let val = expand_str(v, st);
+        st.vars.insert(k.clone(), val);
+    }
+
+    // Input redirection / piped stdin.
+    let mut input = stdin;
+    let mut out_redir: Option<(String, bool)> = None; // (file, append)
+    for r in redirs {
+        match r {
+            Redir::In(f) => {
+                let f = expand_word(f, st).into_iter().next().unwrap_or_default();
+                input = Some(fs::read_file(&f).map(|d| String::from_utf8_lossy(&d).into_owned()).unwrap_or_default());
+            }
+            Redir::Out(f) => out_redir = Some((expand_word(f, st).into_iter().next().unwrap_or_default(), false)),
+            Redir::Append(f) => out_redir = Some((expand_word(f, st).into_iter().next().unwrap_or_default(), true)),
+            Redir::ErrOut(_) | Redir::ErrToOut => {} // stderr merged with stdout in this model
+        }
+    }
+
+    let (out, status) = dispatch(&argv, st, input);
+
+    if let Some((file, append)) = out_redir {
+        let res = if append {
+            let mut prev = fs::read_file(&file).unwrap_or_default();
+            prev.extend_from_slice(out.as_bytes());
+            fs::write_file(&file, &prev)
+        } else {
+            fs::write_file(&file, out.as_bytes())
+        };
+        return match res {
+            Ok(()) => (String::new(), status),
+            Err(()) => (format!("{file}: write failed\n"), 1),
+        };
+    }
+    (out, status)
+}
+
+/// Run one expanded command (builtin, function, or leaf file command).
+fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (String, i32) {
+    let name = argv[0].as_str();
+    let rest: Vec<String> = argv[1..].to_vec();
+    let args_joined = rest.join(" ");
+
+    // user-defined function?
+    if let Some(body) = st.funcs.get(name).cloned() {
+        let saved = core::mem::replace(&mut st.params, rest.clone());
+        let (o, s) = exec(&body, st, stdin);
+        st.params = saved;
+        return (o, s);
+    }
+
+    match name {
+        "clear" => {
+            st.clear = true;
+            (String::new(), 0)
+        }
+        "exit" => {
+            st.exited = true;
+            (String::new(), rest.first().and_then(|s| s.parse().ok()).unwrap_or(0))
+        }
+        "true" | ":" => (String::new(), 0),
+        "false" => (String::new(), 1),
+        "echo" => echo(&rest),
+        "printf" => (printf(&rest), 0),
+        "pwd" => (format!("{}\n", st.vars.get("PWD").cloned().unwrap_or_else(|| "/".into())), 0),
+        "cd" => (cd(&args_joined), 0),
+        "export" => {
+            for a in &rest {
+                if let Some((k, v)) = a.split_once('=') {
+                    st.vars.insert(k.to_string(), v.to_string());
+                }
+            }
+            (String::new(), 0)
+        }
+        "unset" => {
+            for a in &rest {
+                st.vars.remove(a);
+            }
+            (String::new(), 0)
+        }
+        "set" => (String::new(), 0),
+        "shift" => {
+            if !st.params.is_empty() {
+                st.params.remove(0);
+            }
+            (String::new(), 0)
+        }
+        "read" => {
+            // read VAR -- consume the first line of stdin
+            let line = stdin.as_deref().unwrap_or("").lines().next().unwrap_or("").to_string();
+            if let Some(v) = rest.first() {
+                st.vars.insert(v.clone(), line);
+            }
+            (String::new(), 0)
+        }
+        "let" => {
+            let mut status = 1;
+            for a in &rest {
+                if let Some((k, e)) = a.split_once('=') {
+                    let v = arith(e, st);
+                    st.vars.insert(k.to_string(), v.to_string());
+                    status = if v != 0 { 0 } else { 1 };
+                } else {
+                    let v = arith(a, st);
+                    status = if v != 0 { 0 } else { 1 };
+                }
+            }
+            (String::new(), status)
+        }
+        "test" | "[" | "[[" => {
+            let mut a = rest.clone();
+            if name != "test" {
+                // drop trailing ] / ]]
+                if a.last().map(|s| s == "]" || s == "]]").unwrap_or(false) {
+                    a.pop();
+                }
+            }
+            (String::new(), if test_eval(&a, st) { 0 } else { 1 })
+        }
+        "type" | "which" => {
+            let q = rest.first().map(String::as_str).unwrap_or("");
+            if st.funcs.contains_key(q) {
+                (format!("{q} is a function\n"), 0)
+            } else if is_builtin(q) {
+                (format!("{q} is a shell builtin\n"), 0)
+            } else if fs::read_file(&format!("{}.BIN", q.to_ascii_uppercase())).is_some() {
+                (format!("{q} is /bin/{q}\n"), 0)
+            } else {
+                (format!("{q}: not found\n"), 1)
+            }
+        }
+        "source" | "." => {
+            let f = rest.first().cloned().unwrap_or_default();
+            match fs::read_file(&f) {
+                Some(d) => {
+                    let body = String::from_utf8_lossy(&d).into_owned();
+                    let toks = tokenize(&body);
+                    let mut p = Parser { toks: &toks, pos: 0 };
+                    let mut out = String::new();
+                    let mut status = 0;
+                    while !p.at_end() {
+                        p.skip_seps();
+                        if p.at_end() {
+                            break;
+                        }
+                        if let Some(n) = p.parse_and_or() {
+                            let (o, s) = exec(&n, st, None);
+                            out.push_str(&o);
+                            status = s;
+                        } else {
+                            p.pos += 1;
+                        }
+                        if st.exited {
+                            break;
+                        }
+                    }
+                    (out, status)
+                }
+                None => (format!("{f}: no such file\n"), 1),
+            }
+        }
+        "sh" | "bash" => {
+            // run a script file
+            if let Some(f) = rest.first() {
+                let mut a = alloc::vec!["source".to_string()];
+                a.push(f.clone());
+                return dispatch(&a, st, stdin);
+            }
+            (String::new(), 0)
+        }
+        "run" => {
+            if let Some(app) = rest.first() {
+                st.launch = Some(app.to_ascii_lowercase());
+                (format!("launching {app}...\n"), 0)
+            } else {
+                ("run: missing app\n".to_string(), 1)
+            }
+        }
+        "env" => (st.vars.iter().map(|(k, v)| format!("{k}={v}\n")).collect(), 0),
+        "help" => (HELP.to_string(), 0),
+        // --- leaf file/text commands ---
+        "ls" => leaf(ls(&args_joined)),
+        "cat" => leaf(cat_multi(&rest, stdin.as_deref())),
+        "cp" => leaf(cp(&args_joined)),
+        "mv" => leaf(mv(&args_joined)),
+        "rm" => leaf(rm(&args_joined)),
+        "mkdir" => ("mkdir: FAT16 root-only (no subdirectories)\n".to_string(), 1),
+        "touch" => {
+            for f in &rest {
+                if fs::read_file(f).is_none() {
+                    let _ = fs::write_file(f, b"");
+                }
+            }
+            (String::new(), 0)
+        }
+        "grep" => leaf(grep(&args_joined, stdin.as_deref())),
+        "head" => leaf(head(&args_joined, stdin.as_deref())),
+        "tail" => leaf(tail(&args_joined, stdin.as_deref())),
+        "sort" => leaf(sort(&args_joined, stdin.as_deref())),
+        "uniq" => (uniq(&input_text(&args_joined, stdin.as_deref())), 0),
+        "wc" => leaf(wc(&args_joined, stdin.as_deref())),
+        "find" => leaf(find(&args_joined)),
+        "date" => (date(), 0),
+        "df" => (df(), 0),
+        "chmod" => (String::new(), 0),
+        "seq" => (seq(&rest), 0),
+        "basename" => (format!("{}\n", rest.first().map(|s| s.rsplit('/').next().unwrap_or(s)).unwrap_or("")), 0),
+        "sleep" => (String::new(), 0),
+        "jobs" => (String::new(), 0),
+        "" => (String::new(), 0),
+        other => (format!("{other}: command not found\n"), 127),
+    }
+}
+
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "echo" | "printf" | "cd" | "pwd" | "export" | "unset" | "set" | "shift" | "read" | "let"
+            | "test" | "[" | "[[" | "type" | "which" | "source" | "." | "exit" | "true" | "false"
+            | ":" | "help" | "env" | "run" | "sh" | "bash" | "clear"
+    )
+}
+
+fn leaf(out: String) -> (String, i32) {
+    let ok = !is_error(&out);
+    (out, if ok { 0 } else { 1 })
+}
+
+fn echo(args: &[String]) -> (String, i32) {
+    let mut a = args;
+    let mut newline = true;
+    let mut interpret = false;
+    while let Some(first) = a.first() {
+        match first.as_str() {
+            "-n" => {
+                newline = false;
+                a = &a[1..];
+            }
+            "-e" => {
+                interpret = true;
+                a = &a[1..];
+            }
+            _ => break,
+        }
+    }
+    let mut s = a.join(" ");
+    if interpret {
+        s = s.replace("\\n", "\n").replace("\\t", "\t");
+    }
+    if newline {
+        s.push('\n');
+    }
+    (s, 0)
+}
+
+fn printf(args: &[String]) -> String {
+    let Some(fmt) = args.first() else { return String::new() };
+    let mut out = String::new();
+    let mut ai = 1;
+    let fmt = fmt.replace("\\n", "\n").replace("\\t", "\t");
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 1 < chars.len() {
+            let spec = chars[i + 1];
+            match spec {
+                's' => {
+                    out.push_str(args.get(ai).map(String::as_str).unwrap_or(""));
+                    ai += 1;
+                }
+                'd' | 'i' => {
+                    let n: i64 = args.get(ai).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    out.push_str(&n.to_string());
+                    ai += 1;
+                }
+                '%' => out.push('%'),
+                _ => {
+                    out.push('%');
+                    out.push(spec);
+                }
+            }
+            i += 2;
+        } else {
+            out.push(chars[i]);
             i += 1;
         }
     }
-    res.push((prev_op, s[start..].trim()));
-    res
+    out
 }
 
-/// Run a pipeline `cmd1 | cmd2 | ...`; returns (output, launch, success).
-fn run_pipeline(pipeline: &str) -> (String, Option<String>, bool) {
-    let stages: Vec<&str> = pipeline.split('|').map(str::trim).collect();
-    let mut stdin: Option<String> = None;
-    let mut launch = None;
+fn cat_multi(files: &[String], stdin: Option<&str>) -> String {
+    if files.is_empty() {
+        return stdin.map(|s| {
+            let mut s = s.to_string();
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s
+        }).unwrap_or_default();
+    }
     let mut out = String::new();
-    let mut ok = true;
-    for (i, stage) in stages.iter().enumerate() {
-        let r = run_stage(stage, stdin.take());
-        launch = launch.or(r.launch);
-        ok = r.ok;
-        if i + 1 < stages.len() {
-            stdin = Some(r.out);
-        } else {
-            out = r.out;
+    for f in files {
+        out.push_str(&cat(f));
+    }
+    out
+}
+
+fn uniq(text: &str) -> String {
+    let mut out = String::new();
+    let mut last: Option<&str> = None;
+    for l in text.lines() {
+        if Some(l) != last {
+            out.push_str(l);
+            out.push('\n');
+            last = Some(l);
         }
     }
-    (out, launch, ok)
+    out
 }
 
-struct StageOut {
-    out: String,
-    launch: Option<String>,
-    ok: bool,
-}
-
-fn run_stage(stage: &str, stdin: Option<String>) -> StageOut {
-    // Output redirection: `cmd ... > file`.
-    let (cmd, redirect) = match stage.split_once('>') {
-        Some((c, f)) => (c.trim(), Some(f.trim().to_string())),
-        None => (stage, None),
+fn seq(args: &[String]) -> String {
+    let nums: Vec<i64> = args.iter().filter_map(|s| s.parse().ok()).collect();
+    let (start, end, step) = match nums.len() {
+        1 => (1, nums[0], 1),
+        2 => (nums[0], nums[1], 1),
+        3 => (nums[0], nums[2], nums[1]),
+        _ => return String::new(),
     };
-    let (name, args) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
-    let args = args.trim();
-    let mut launch = None;
-    let out = match name {
-        "ls" => ls(args),
-        "cat" => cat(args),
-        "cp" => cp(args),
-        "mv" => mv(args),
-        "rm" => rm(args),
-        "mkdir" => "mkdir: this disk is FAT16 root-only (no subdirectories)\n".to_string(),
-        "echo" => format!("{args}\n"),
-        "pwd" => "/\n".to_string(),
-        "cd" => cd(args),
-        "grep" => grep(args, stdin.as_deref()),
-        "head" => head(args, stdin.as_deref()),
-        "tail" => tail(args, stdin.as_deref()),
-        "wc" => wc(args, stdin.as_deref()),
-        "sort" => sort(args, stdin.as_deref()),
-        "find" => find(args),
-        "date" => date(),
-        "df" => df(),
-        "env" => env_list(),
-        "export" => env_set(args),
-        "chmod" => String::new(), // permissions are faked; never error
-        "run" => {
-            launch = Some(args.to_ascii_lowercase());
-            format!("launching {args}...\n")
+    let mut out = String::new();
+    if step == 0 {
+        return out;
+    }
+    let mut i = start;
+    let mut guard = 0;
+    while (step > 0 && i <= end) || (step < 0 && i >= end) {
+        out.push_str(&i.to_string());
+        out.push('\n');
+        i += step;
+        guard += 1;
+        if guard > LOOP_CAP {
+            break;
         }
-        "help" => HELP.to_string(),
-        "" => String::new(),
-        other => format!("{other}: command not found\n"),
+    }
+    out
+}
+
+// --- expansion ----------------------------------------------------------------
+
+/// Expand one raw word into fields (after var/command/arith expansion, quote
+/// removal, word splitting on unquoted whitespace, and globbing).
+fn expand_word(raw: &str, st: &mut ShellState) -> Vec<String> {
+    // Produce a string with markers for "no-split" (quoted) regions by tracking
+    // splittability per char. Simpler approach: build the expanded string and a
+    // parallel "quoted" bitmap, then split on unquoted whitespace.
+    let (s, quoted) = expand_marked(raw, st);
+    // word-split on unquoted whitespace
+    let chars: Vec<char> = s.chars().collect();
+    let mut fields: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    for (i, &c) in chars.iter().enumerate() {
+        let q = quoted.get(i).copied().unwrap_or(false);
+        if !q && (c == ' ' || c == '\t' || c == '\n') {
+            if started {
+                fields.push(core::mem::take(&mut cur));
+                started = false;
+            }
+        } else {
+            cur.push(c);
+            started = true;
+        }
+    }
+    if started {
+        fields.push(cur);
+    }
+    // glob each unquoted field; if it has glob chars, expand against the disk
+    let mut out = Vec::new();
+    for f in fields {
+        if f.contains('*') || f.contains('?') || f.contains('[') {
+            let matches = glob_expand(&f);
+            if matches.is_empty() {
+                out.push(f);
+            } else {
+                out.extend(matches);
+            }
+        } else {
+            out.push(f);
+        }
+    }
+    if out.is_empty() && raw.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Expand a raw word producing (text, per-char quoted flag).
+fn expand_marked(raw: &str, st: &mut ShellState) -> (String, Vec<bool>) {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    let mut quoted: Vec<bool> = Vec::new();
+    let mut i = 0;
+    let n = chars.len();
+    let mut push = |out: &mut String, quoted: &mut Vec<bool>, s: &str, q: bool| {
+        for ch in s.chars() {
+            out.push(ch);
+            quoted.push(q);
+        }
     };
-    if let Some(f) = redirect {
-        return match fs::write_file(&f, out.as_bytes()) {
-            Ok(()) => StageOut { out: String::new(), launch, ok: true },
-            Err(()) => StageOut { out: format!("{f}: write failed (disk full / bad name?)\n"), launch, ok: false },
+    while i < n {
+        let c = chars[i];
+        if c == '\'' {
+            i += 1;
+            while i < n && chars[i] != '\'' {
+                push(&mut out, &mut quoted, &chars[i].to_string(), true);
+                i += 1;
+            }
+            i += 1; // closing '
+            continue;
+        }
+        if c == '"' {
+            i += 1;
+            while i < n && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < n && matches!(chars[i + 1], '"' | '\\' | '$' | '`') {
+                    push(&mut out, &mut quoted, &chars[i + 1].to_string(), true);
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '$' {
+                    let (val, ni) = expand_dollar(&chars, i, st);
+                    push(&mut out, &mut quoted, &val, true);
+                    i = ni;
+                    continue;
+                }
+                if chars[i] == '`' {
+                    let (val, ni) = expand_backtick(&chars, i, st);
+                    push(&mut out, &mut quoted, &val, true);
+                    i = ni;
+                    continue;
+                }
+                push(&mut out, &mut quoted, &chars[i].to_string(), true);
+                i += 1;
+            }
+            i += 1; // closing "
+            continue;
+        }
+        if c == '\\' && i + 1 < n {
+            push(&mut out, &mut quoted, &chars[i + 1].to_string(), true);
+            i += 2;
+            continue;
+        }
+        if c == '$' {
+            let (val, ni) = expand_dollar(&chars, i, st);
+            push(&mut out, &mut quoted, &val, false);
+            i = ni;
+            continue;
+        }
+        if c == '`' {
+            let (val, ni) = expand_backtick(&chars, i, st);
+            push(&mut out, &mut quoted, &val, false);
+            i = ni;
+            continue;
+        }
+        if c == '~' && (i == 0) && (i + 1 >= n || chars[i + 1] == '/') {
+            push(&mut out, &mut quoted, "/", false);
+            i += 1;
+            continue;
+        }
+        push(&mut out, &mut quoted, &c.to_string(), false);
+        i += 1;
+    }
+    (out, quoted)
+}
+
+/// Expand a string fully (no field-splitting), e.g. an assignment RHS.
+fn expand_str(raw: &str, st: &mut ShellState) -> String {
+    expand_marked(raw, st).0
+}
+
+/// Expand a `$...` starting at index `i`; returns (value, next_index).
+fn expand_dollar(chars: &[char], i: usize, st: &mut ShellState) -> (String, usize) {
+    let n = chars.len();
+    // i points at '$'
+    if i + 1 >= n {
+        return ("$".to_string(), i + 1);
+    }
+    let c = chars[i + 1];
+    if c == '(' {
+        // $(( arith )) or $( cmd )
+        if i + 2 < n && chars[i + 2] == '(' {
+            // arithmetic
+            let mut depth = 0;
+            let mut j = i + 1;
+            let start = i + 3;
+            while j < n {
+                if chars[j] == '(' {
+                    depth += 1;
+                } else if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            // j is at the outer ')'; arithmetic content is start..j-1 (strip inner ')')
+            let endexpr = j.saturating_sub(1);
+            let expr: String = chars[start..endexpr.min(n)].iter().collect();
+            let v = arith(&expr, st);
+            let next = (j + 1).min(n);
+            return (v.to_string(), next);
+        }
+        // command substitution $( ... )
+        let mut depth = 1;
+        let mut j = i + 2;
+        let start = j;
+        while j < n && depth > 0 {
+            if chars[j] == '(' {
+                depth += 1;
+            } else if chars[j] == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        let cmd: String = chars[start..j.min(n)].iter().collect();
+        let out = run_capture(&cmd, st);
+        return (out, (j + 1).min(n));
+    }
+    if c == '{' {
+        let mut j = i + 2;
+        while j < n && chars[j] != '}' {
+            j += 1;
+        }
+        let inner: String = chars[i + 2..j.min(n)].iter().collect();
+        let val = expand_braced_var(&inner, st);
+        return (val, (j + 1).min(n));
+    }
+    if c == '?' {
+        return (st.status.to_string(), i + 2);
+    }
+    if c == '#' {
+        return (st.params.len().to_string(), i + 2);
+    }
+    if c == '@' || c == '*' {
+        return (st.params.join(" "), i + 2);
+    }
+    if c == '$' {
+        return ("vsh".to_string(), i + 2); // $$ pid placeholder
+    }
+    if c.is_ascii_digit() {
+        let idx = c.to_digit(10).unwrap() as usize;
+        let val = if idx == 0 { "vsh".to_string() } else { st.params.get(idx - 1).cloned().unwrap_or_default() };
+        return (val, i + 2);
+    }
+    if c.is_ascii_alphabetic() || c == '_' {
+        let mut j = i + 1;
+        while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        let name: String = chars[i + 1..j].iter().collect();
+        return (st.vars.get(&name).cloned().unwrap_or_default(), j);
+    }
+    ("$".to_string(), i + 1)
+}
+
+fn expand_backtick(chars: &[char], i: usize, st: &mut ShellState) -> (String, usize) {
+    let n = chars.len();
+    let mut j = i + 1;
+    while j < n && chars[j] != '`' {
+        j += 1;
+    }
+    let cmd: String = chars[i + 1..j.min(n)].iter().collect();
+    let out = run_capture(&cmd, st);
+    (out, (j + 1).min(n))
+}
+
+/// `${VAR}`, `${VAR:-default}`, `${VAR:=default}`, `${#VAR}`.
+fn expand_braced_var(inner: &str, st: &mut ShellState) -> String {
+    if let Some(name) = inner.strip_prefix('#') {
+        return st.vars.get(name).map(|v| v.len()).unwrap_or(0).to_string();
+    }
+    if let Some((name, def)) = inner.split_once(":-") {
+        let cur = lookup(name, st);
+        return if cur.is_empty() { expand_str(def, st) } else { cur };
+    }
+    if let Some((name, def)) = inner.split_once(":=") {
+        let cur = lookup(name, st);
+        if cur.is_empty() {
+            let v = expand_str(def, st);
+            st.vars.insert(name.to_string(), v.clone());
+            return v;
+        }
+        return cur;
+    }
+    lookup(inner, st)
+}
+
+fn lookup(name: &str, st: &ShellState) -> String {
+    match name {
+        "?" => st.status.to_string(),
+        "#" => st.params.len().to_string(),
+        "@" | "*" => st.params.join(" "),
+        _ => {
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx == 0 {
+                    return "vsh".to_string();
+                }
+                return st.params.get(idx - 1).cloned().unwrap_or_default();
+            }
+            st.vars.get(name).cloned().unwrap_or_default()
+        }
+    }
+}
+
+/// Run a command line and capture its stdout (trailing newlines trimmed).
+fn run_capture(cmd: &str, st: &mut ShellState) -> String {
+    let toks = tokenize(cmd);
+    let mut p = Parser { toks: &toks, pos: 0 };
+    let mut out = String::new();
+    while !p.at_end() {
+        p.skip_seps();
+        if p.at_end() {
+            break;
+        }
+        if let Some(n) = p.parse_and_or() {
+            let (o, s) = exec(&n, st, None);
+            out.push_str(&o);
+            st.status = s;
+        } else {
+            p.pos += 1;
+        }
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+// --- arithmetic ---------------------------------------------------------------
+
+fn arith(expr: &str, st: &mut ShellState) -> i64 {
+    let s = expand_str(expr, st);
+    let toks = arith_tokens(&s, st);
+    let mut pos = 0;
+    arith_expr(&toks, &mut pos)
+}
+
+#[derive(Clone)]
+enum ATok {
+    Num(i64),
+    Op(char),
+    Op2([char; 2]),
+    Open,
+    Close,
+}
+
+fn arith_tokens(s: &str, st: &ShellState) -> Vec<ATok> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let n = chars.len();
+    while i < n {
+        let c = chars[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut num = 0i64;
+            while i < n && chars[i].is_ascii_digit() {
+                num = num * 10 + chars[i].to_digit(10).unwrap() as i64;
+                i += 1;
+            }
+            out.push(ATok::Num(num));
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let mut name = String::new();
+            while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                name.push(chars[i]);
+                i += 1;
+            }
+            let v = st.vars.get(&name).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+            out.push(ATok::Num(v));
+            continue;
+        }
+        if c == '(' {
+            out.push(ATok::Open);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            out.push(ATok::Close);
+            i += 1;
+            continue;
+        }
+        // two-char comparators
+        if i + 1 < n && matches!((c, chars[i + 1]), ('=', '=') | ('!', '=') | ('<', '=') | ('>', '=') | ('&', '&') | ('|', '|')) {
+            out.push(ATok::Op2([c, chars[i + 1]]));
+            i += 2;
+            continue;
+        }
+        out.push(ATok::Op(c));
+        i += 1;
+    }
+    out
+}
+
+fn arith_expr(t: &[ATok], pos: &mut usize) -> i64 {
+    arith_cmp(t, pos)
+}
+
+fn arith_cmp(t: &[ATok], pos: &mut usize) -> i64 {
+    let mut acc = arith_add(t, pos);
+    while let Some(tok) = t.get(*pos) {
+        match tok {
+            ATok::Op2(['=', '=']) => { *pos += 1; let r = arith_add(t, pos); acc = (acc == r) as i64; }
+            ATok::Op2(['!', '=']) => { *pos += 1; let r = arith_add(t, pos); acc = (acc != r) as i64; }
+            ATok::Op2(['<', '=']) => { *pos += 1; let r = arith_add(t, pos); acc = (acc <= r) as i64; }
+            ATok::Op2(['>', '=']) => { *pos += 1; let r = arith_add(t, pos); acc = (acc >= r) as i64; }
+            ATok::Op2(['&', '&']) => { *pos += 1; let r = arith_add(t, pos); acc = ((acc != 0) && (r != 0)) as i64; }
+            ATok::Op2(['|', '|']) => { *pos += 1; let r = arith_add(t, pos); acc = ((acc != 0) || (r != 0)) as i64; }
+            ATok::Op('<') => { *pos += 1; let r = arith_add(t, pos); acc = (acc < r) as i64; }
+            ATok::Op('>') => { *pos += 1; let r = arith_add(t, pos); acc = (acc > r) as i64; }
+            _ => break,
+        }
+    }
+    acc
+}
+
+fn arith_add(t: &[ATok], pos: &mut usize) -> i64 {
+    let mut acc = arith_mul(t, pos);
+    while let Some(ATok::Op(op @ ('+' | '-'))) = t.get(*pos) {
+        let op = *op;
+        *pos += 1;
+        let r = arith_mul(t, pos);
+        acc = if op == '+' { acc + r } else { acc - r };
+    }
+    acc
+}
+
+fn arith_mul(t: &[ATok], pos: &mut usize) -> i64 {
+    let mut acc = arith_unary(t, pos);
+    while let Some(ATok::Op(op @ ('*' | '/' | '%'))) = t.get(*pos) {
+        let op = *op;
+        *pos += 1;
+        let r = arith_unary(t, pos);
+        acc = match op {
+            '*' => acc * r,
+            '/' => if r != 0 { acc / r } else { 0 },
+            _ => if r != 0 { acc % r } else { 0 },
         };
     }
-    let ok = !is_error(&out);
-    StageOut { out, launch, ok }
+    acc
 }
 
-/// Heuristic exit status from a command's output (for && / ||). Matches only
-/// our own "cmd: ... error" message shapes, not arbitrary file contents.
+fn arith_unary(t: &[ATok], pos: &mut usize) -> i64 {
+    match t.get(*pos) {
+        Some(ATok::Op('-')) => { *pos += 1; -arith_unary(t, pos) }
+        Some(ATok::Op('+')) => { *pos += 1; arith_unary(t, pos) }
+        Some(ATok::Op('!')) => { *pos += 1; (arith_unary(t, pos) == 0) as i64 }
+        Some(ATok::Num(n)) => { let v = *n; *pos += 1; v }
+        Some(ATok::Open) => {
+            *pos += 1;
+            let v = arith_cmp(t, pos);
+            if matches!(t.get(*pos), Some(ATok::Close)) {
+                *pos += 1;
+            }
+            v
+        }
+        _ => 0,
+    }
+}
+
+// --- test / [ ] ---------------------------------------------------------------
+
+fn test_eval(args: &[String], st: &ShellState) -> bool {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    test_or(&a)
+}
+
+fn test_or(a: &[&str]) -> bool {
+    // split on -o
+    if let Some(p) = a.iter().position(|&x| x == "-o") {
+        return test_and(&a[..p]) || test_or(&a[p + 1..]);
+    }
+    test_and(a)
+}
+
+fn test_and(a: &[&str]) -> bool {
+    if let Some(p) = a.iter().position(|&x| x == "-a") {
+        return test_prim(&a[..p]) && test_and(&a[p + 1..]);
+    }
+    test_prim(a)
+}
+
+fn test_prim(a: &[&str]) -> bool {
+    match a.len() {
+        0 => false,
+        1 => !a[0].is_empty(),
+        2 => {
+            let neg = a[0] == "!";
+            if neg {
+                return !test_prim(&a[1..]);
+            }
+            match a[0] {
+                "-e" => fs::read_file(a[1]).is_some() || file_exists(a[1]),
+                "-f" => file_exists(a[1]),
+                "-d" => a[1] == "/" || a[1] == ".",
+                "-s" => fs::read_file(a[1]).map(|d| !d.is_empty()).unwrap_or(false),
+                "-z" => a[1].is_empty(),
+                "-n" => !a[1].is_empty(),
+                _ => false,
+            }
+        }
+        3 => {
+            let (l, op, r) = (a[0], a[1], a[2]);
+            match op {
+                "=" | "==" => glob_match(r, l) || l == r,
+                "!=" => l != r,
+                "-eq" => num(l) == num(r),
+                "-ne" => num(l) != num(r),
+                "-lt" => num(l) < num(r),
+                "-le" => num(l) <= num(r),
+                "-gt" => num(l) > num(r),
+                "-ge" => num(l) >= num(r),
+                _ => false,
+            }
+        }
+        _ => {
+            if a[0] == "!" {
+                return !test_prim(&a[1..]);
+            }
+            // chained: evaluate first 3 then ignore (best effort)
+            test_prim(&a[..3])
+        }
+    }
+}
+
+fn num(s: &str) -> i64 {
+    s.trim().parse().unwrap_or(0)
+}
+
+fn file_exists(name: &str) -> bool {
+    let up = name.trim_start_matches('/').to_ascii_uppercase();
+    fs::list_root().unwrap_or_default().iter().any(|(n, _)| n.eq_ignore_ascii_case(&up))
+        || fs::read_file(name).is_some()
+}
+
+// --- glob ---------------------------------------------------------------------
+
+/// Match a glob pattern against a literal string (case-insensitive for FAT16).
+fn glob_match(pat: &str, s: &str) -> bool {
+    glob_rec(&pat.chars().collect::<Vec<_>>(), &s.chars().collect::<Vec<_>>())
+}
+
+fn glob_rec(p: &[char], s: &[char]) -> bool {
+    if p.is_empty() {
+        return s.is_empty();
+    }
+    match p[0] {
+        '*' => {
+            for k in 0..=s.len() {
+                if glob_rec(&p[1..], &s[k..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => !s.is_empty() && glob_rec(&p[1..], &s[1..]),
+        '[' => {
+            // [abc] / [a-z]
+            if let Some(close) = p.iter().position(|&c| c == ']') {
+                if s.is_empty() {
+                    return false;
+                }
+                let set = &p[1..close];
+                if char_in_set(set, s[0]) {
+                    return glob_rec(&p[close + 1..], &s[1..]);
+                }
+            }
+            false
+        }
+        c => !s.is_empty() && eqc(c, s[0]) && glob_rec(&p[1..], &s[1..]),
+    }
+}
+
+fn eqc(a: char, b: char) -> bool {
+    a.eq_ignore_ascii_case(&b)
+}
+
+fn char_in_set(set: &[char], c: char) -> bool {
+    let mut i = 0;
+    while i < set.len() {
+        if i + 2 < set.len() && set[i + 1] == '-' {
+            if c >= set[i] && c <= set[i + 2] {
+                return true;
+            }
+            i += 3;
+        } else {
+            if eqc(set[i], c) {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Expand a glob field against the FAT16 root listing (sorted).
+fn glob_expand(field: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::list_root().unwrap_or_default().into_iter().map(|(n, _)| n).collect();
+    names.sort();
+    names.into_iter().filter(|n| glob_match(field, n)).collect()
+}
+
+// --- leaf file/text commands (kept from the M35 shell) ------------------------
+
 fn is_error(out: &str) -> bool {
     out.lines().any(|l| {
         l.contains(": no such")
@@ -190,7 +1792,7 @@ fn cat(args: &str) -> String {
     if args.is_empty() {
         return "cat: missing file\n".to_string();
     }
-    match fs::read_file(args) {
+    match fs::read_file(args.trim()) {
         Some(data) => {
             let mut s = String::from_utf8_lossy(&data).into_owned();
             if !s.ends_with('\n') {
@@ -198,7 +1800,7 @@ fn cat(args: &str) -> String {
             }
             s
         }
-        None => format!("cat: {args}: no such file\n"),
+        None => format!("cat: {}: no such file\n", args.trim()),
     }
 }
 
@@ -235,20 +1837,22 @@ fn rm(args: &str) -> String {
     if args.is_empty() {
         return "rm: missing file\n".to_string();
     }
-    match fs::delete(args) {
-        Ok(()) => String::new(),
-        Err(()) => format!("rm: {args}: no such file\n"),
+    let mut out = String::new();
+    for f in args.split_whitespace().filter(|a| !a.starts_with('-')) {
+        if fs::delete(f).is_err() {
+            out.push_str(&format!("rm: {f}: no such file\n"));
+        }
     }
+    out
 }
 
 fn cd(args: &str) -> String {
     match args.trim() {
-        "" | "/" | "." => String::new(),
+        "" | "/" | "." | "~" => String::new(),
         other => format!("cd: {other}: root-only filesystem\n"),
     }
 }
 
-/// Resolve a command's input: piped stdin if present, else the named file.
 fn input_text(arg: &str, stdin: Option<&str>) -> String {
     if let Some(s) = stdin {
         return s.to_string();
@@ -263,13 +1867,54 @@ fn input_text(arg: &str, stdin: Option<&str>) -> String {
 }
 
 fn grep(args: &str, stdin: Option<&str>) -> String {
-    let (pat, file) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    // flags: -i -v -n -c
+    let mut ci = false;
+    let mut inv = false;
+    let mut numbered = false;
+    let mut count = false;
+    let mut rest = args;
+    loop {
+        let r = rest.trim_start();
+        if let Some(f) = r.strip_prefix('-') {
+            let flag: String = f.chars().take_while(|c| !c.is_whitespace()).collect();
+            for ch in flag.chars() {
+                match ch {
+                    'i' => ci = true,
+                    'v' => inv = true,
+                    'n' => numbered = true,
+                    'c' => count = true,
+                    _ => {}
+                }
+            }
+            rest = &r[1 + flag.len()..];
+        } else {
+            break;
+        }
+    }
+    let (pat, file) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
+    let pat = pat.trim();
     let text = input_text(file, stdin);
-    text.lines().filter(|l| l.contains(pat.trim())).map(|l| format!("{l}\n")).collect()
+    let matches = |l: &str| {
+        let hit = if ci { l.to_ascii_lowercase().contains(&pat.to_ascii_lowercase()) } else { l.contains(pat) };
+        hit != inv
+    };
+    if count {
+        return format!("{}\n", text.lines().filter(|l| matches(l)).count());
+    }
+    let mut out = String::new();
+    for (i, l) in text.lines().enumerate() {
+        if matches(l) {
+            if numbered {
+                out.push_str(&format!("{}:{l}\n", i + 1));
+            } else {
+                out.push_str(&format!("{l}\n"));
+            }
+        }
+    }
+    out
 }
 
 fn nlines(args: &str) -> (usize, &str) {
-    // parse "-n N rest" / "rest"
     let a = args.trim();
     if let Some(r) = a.strip_prefix("-n") {
         let r = r.trim_start();
@@ -294,15 +1939,26 @@ fn tail(args: &str, stdin: Option<&str>) -> String {
 }
 
 fn sort(args: &str, stdin: Option<&str>) -> String {
-    let text = input_text(args, stdin);
+    let reverse = args.split_whitespace().any(|a| a == "-r");
+    let numeric = args.split_whitespace().any(|a| a == "-n");
+    let file = args.split_whitespace().filter(|a| !a.starts_with('-')).last().unwrap_or("");
+    let text = input_text(file, stdin);
     let mut lines: Vec<&str> = text.lines().collect();
-    lines.sort();
+    if numeric {
+        lines.sort_by_key(|l| l.trim().parse::<i64>().unwrap_or(0));
+    } else {
+        lines.sort();
+    }
+    if reverse {
+        lines.reverse();
+    }
     lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
 fn wc(args: &str, stdin: Option<&str>) -> String {
     let flag = args.split_whitespace().next().filter(|a| a.starts_with('-')).unwrap_or("");
-    let s = input_text(args, stdin);
+    let file = args.split_whitespace().filter(|a| !a.starts_with('-')).last().unwrap_or("");
+    let s = input_text(file, stdin);
     let (l, w, c) = (s.lines().count(), s.split_whitespace().count(), s.len());
     match flag {
         "-l" => format!("{l}\n"),
@@ -313,19 +1969,10 @@ fn wc(args: &str, stdin: Option<&str>) -> String {
 }
 
 fn find(args: &str) -> String {
-    // find <path> -name <pattern>   (glob: * matches any suffix)
     let pat = args.split_once("-name").map(|(_, p)| p.trim()).unwrap_or("*");
-    let stem = pat.trim_matches('*').to_ascii_uppercase();
     let mut out = String::new();
     for (name, _) in fs::list_root().unwrap_or_default() {
-        let m = if pat.starts_with('*') && pat.ends_with('*') {
-            name.contains(&stem)
-        } else if let Some(ext) = pat.strip_prefix('*') {
-            name.ends_with(&ext.to_ascii_uppercase())
-        } else {
-            name.eq_ignore_ascii_case(pat)
-        };
-        if m || pat == "*" {
+        if glob_match(pat, &name) || pat == "*" {
             out.push_str(&format!("/{name}\n"));
         }
     }
@@ -333,8 +1980,6 @@ fn find(args: &str) -> String {
 }
 
 fn date() -> String {
-    let secs = fs::read_file("TZ.TXT"); // unused placeholder to keep fs import
-    let _ = secs;
     let unix = crate::timer::wall_ticks50().map(|t| t / 50);
     match unix {
         Some(s) => format!("{}\n", civil(s as i64)),
@@ -342,8 +1987,7 @@ fn date() -> String {
     }
 }
 
-/// Convert a Unix timestamp to "YYYY-MM-DD HH:MM:SS UTC" (Hinnant's algorithm).
-fn civil(t: i64) -> alloc::string::String {
+fn civil(t: i64) -> String {
     let days = t.div_euclid(86400);
     let secs = t.rem_euclid(86400);
     let z = days + 719468;
@@ -365,31 +2009,45 @@ fn df() -> String {
     format!("Filesystem  Used  Files\nFAT16       {} bytes  {}\n", used, files.len())
 }
 
-// A tiny in-memory environment (PATH-style), persisted only for the session.
-static mut ENV: Option<Vec<(String, String)>> = None;
-fn env_vars() -> &'static mut Vec<(String, String)> {
-    unsafe {
-        let e = &mut *core::ptr::addr_of_mut!(ENV);
-        if e.is_none() {
-            *e = Some(alloc::vec![("USER".to_string(), "guest".to_string()), ("SHELL".to_string(), "/bin/vsh".to_string())]);
-        }
-        e.as_mut().unwrap()
+/// Boot self-test: exercise the interpreter's control flow, expansion,
+/// arithmetic, functions and pipes (no filesystem needed). Emits SHELL_OK.
+pub fn selftest() {
+    let script = "\
+x=5\n\
+y=3\n\
+arith=$((x * y + 1))\n\
+greet() { echo \"hi $1\"; }\n\
+acc=\"\"\n\
+for i in 1 2 3; do acc=\"$acc$i\"; done\n\
+if [ \"$arith\" -eq 16 ]; then cls=big; else cls=small; fi\n\
+n=0\n\
+while [ $n -lt 3 ]; do n=$((n + 1)); done\n\
+case $cls in\n\
+  big) tag=BIG ;;\n\
+  *) tag=other ;;\n\
+esac\n\
+sub=$(echo nested | grep nest)\n\
+echo \"arith=$arith acc=$acc cls=$cls n=$n tag=$tag $(greet veil) sub=$sub\"\n";
+    let out = run(script).out;
+    crate::kprintln!("SHELL_SELFTEST: {}", out.trim());
+    let ok = out.contains("arith=16")
+        && out.contains("acc=123")
+        && out.contains("cls=big")
+        && out.contains("n=3")
+        && out.contains("tag=BIG")
+        && out.contains("hi veil")
+        && out.contains("sub=nested");
+    if ok {
+        crate::kprintln!("SHELL_OK: vars/arith/for/while/if/case/functions/pipes/cmd-subst all work");
+    } else {
+        crate::kprintln!("SHELL_FAIL: {}", out.trim());
     }
-}
-fn env_list() -> String {
-    env_vars().iter().map(|(k, v)| format!("{k}={v}\n")).collect()
-}
-fn env_set(args: &str) -> String {
-    if let Some((k, v)) = args.split_once('=') {
-        let (k, v) = (k.trim().to_string(), v.trim().to_string());
-        let e = env_vars();
-        if let Some(slot) = e.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = v;
-        } else {
-            e.push((k, v));
-        }
+    // Tidy the test's leftovers out of the interactive shell's state.
+    let st = state();
+    for k in ["x", "y", "arith", "acc", "i", "cls", "n", "tag", "sub"] {
+        st.vars.remove(k);
     }
-    String::new()
+    st.funcs.remove("greet");
 }
 
 /// Filenames on disk, for tab completion.

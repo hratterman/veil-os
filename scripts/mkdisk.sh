@@ -34,6 +34,25 @@ printf 'Hello from the Veil filesystem! This file was written by macOS.\n' > "$M
 printf '// demo.rs - Veil OS\nfn main() {\n    let msg = "hello, world";\n    for i in 0..10 {\n        print(i, msg); // loop\n    }\n}\n' > "$MNT/DEMO.RS"
 # M19b: local timezone, integer UTC offset in hours (EDT = -4 in summer).
 printf -- '-4\n' > "$MNT/TZ.TXT"
+# M41 step 9: a non-trivial shell script (iterate files, pipe-transform, write
+# output) for the real-shell proof. Run with `sh test.sh`.
+cat > "$MNT/TEST.SH" <<'VEILSH'
+# Build three files, then iterate them, sort the merged contents, and write out.
+echo apple > a.txt
+echo banana > b.txt
+echo cherry > c.txt
+count=0
+for f in a.txt b.txt c.txt; do
+  count=$((count + 1))
+  cat $f
+done | sort -r > out.txt
+echo "files=$count"
+echo "sorted:"
+cat out.txt
+n=$(wc -l < out.txt)
+echo "lines=$n"
+if [ $n -eq 3 ]; then echo RESULT_OK; else echo RESULT_BAD; fi
+VEILSH
 for bin in hello ls cat echo spin; do
     cp "user/target/aarch64-unknown-none/release/$bin.bin" \
        "$MNT/$(echo "$bin" | tr a-z A-Z).BIN"

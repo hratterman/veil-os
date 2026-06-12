@@ -128,6 +128,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::canvas_selftest(); // M41: from-scratch <canvas> 2D rendering context
         js::indexeddb_selftest(); // M41: IndexedDB polyfill round-trip
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
+        shell::selftest(); // M41: bash-subset shell interpreter
     }
     milestone9();
     milestone10(&fdt);

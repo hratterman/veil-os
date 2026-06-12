@@ -11,7 +11,7 @@ from guilib import Driver, check, finish, taskbar_xy
 # Browser window at (510,30), BORDER 2, TITLE_H 22 -> content origin (512,54),
 # then a 20px address bar; the page starts at y=74.
 CONTENT_X, CONTENT_Y = 512, 54
-PAGE_Y = CONTENT_Y + 20
+PAGE_Y = CONTENT_Y + 42
 
 
 def boxes(s, kind):
@@ -56,7 +56,7 @@ def main():
 
     # 1) Editable address bar: click it, type a path, Enter -> navigate.
     m = len(d.serial())
-    d.click(650, CONTENT_Y + 10)  # the address bar
+    d.click(650, CONTENT_Y + 32)  # the address bar
     type_str(d, "/news.htm")
     press(d, "ret")
     check("address bar navigates to typed path",
@@ -64,7 +64,7 @@ def main():
 
     # 2) On-page input field: open the form page, click the field, type.
     m = len(d.serial())
-    d.click(650, CONTENT_Y + 10)
+    d.click(650, CONTENT_Y + 32)
     type_str(d, "/formtest.htm")
     press(d, "ret")
     check("form page rendered", d.wait_serial("BROWSER: rendered /formtest.htm", 20, m))

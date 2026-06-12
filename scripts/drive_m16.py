@@ -24,7 +24,7 @@ from guilib import Driver, check, check_px, finish, taskbar_xy
 WIN_X, WIN_Y = 510, 30
 CONTENT_X = WIN_X + 2
 CONTENT_Y = WIN_Y + 2 + 22
-PAGE_Y = CONTENT_Y + 20          # first document row on screen
+PAGE_Y = CONTENT_Y + 42          # first document row on screen
 VIEW_W, VIEW_H = 480, 620 - 20   # visible document area
 
 BODY_BG = (0x14, 0x18, 0x1C)     # style.css body background-color

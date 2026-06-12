@@ -64,9 +64,15 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-pub const TOPBAR: usize = 20;
+/// Current page zoom (percent), threaded into layout's font-size computation
+/// without plumbing it through every `resolve` call. Set at navigate time.
+static ZOOM: AtomicU16 = AtomicU16::new(100);
+
+pub const TOPBAR: usize = 20; // address-bar row height
+pub const TABBAR_H: usize = 22; // tab-strip row height (above the address bar)
+pub const CHROME: usize = TABBAR_H + TOPBAR; // total chrome; page content starts here
 const MAX_DOC_H: usize = 3000;
 const FETCH_TIMEOUT: u64 = 500; // 10 s at the 50 Hz tick
 const BAR_BG: u32 = 0xffc8_ccd4;
@@ -82,7 +88,12 @@ pub struct BrowserState {
     links: Vec<LinkBox>,
     scroll: usize,
     page_bg: u32,
-    history: Vec<String>, // previously-visited paths (newest last), max 20
+    // M39 tabs: each tab carries its own path + scroll + back/forward stacks +
+    // title. The active tab's *rendered* state lives in the fields above; `tabs`
+    // is the lightweight per-tab metadata (re-rendered on switch).
+    tabs: Vec<Tab>,
+    active: usize,
+    zoom: u16, // page zoom, percent (50..250)
     img_cache: Vec<(String, png::Image)>, // decoded images by URL, LRU, cap 10
     // M35 text input: an editable address bar and on-page form fields.
     editing: bool,           // address bar focused for editing
@@ -145,6 +156,23 @@ struct LinkBox {
     href: String,
 }
 
+/// Per-tab navigable state. The active tab's rendered page lives in the
+/// BrowserState fields; this is the lightweight metadata for every tab.
+#[derive(Clone)]
+struct Tab {
+    path: String,
+    scroll: usize,
+    back: Vec<String>, // visited paths, newest last
+    fwd: Vec<String>,  // popped-via-back paths, for forward
+    title: String,
+}
+
+impl Tab {
+    fn new(path: &str) -> Tab {
+        Tab { path: String::from(path), scroll: 0, back: Vec::new(), fwd: Vec::new(), title: String::from(path) }
+    }
+}
+
 impl BrowserState {
     pub fn new() -> BrowserState {
         BrowserState {
@@ -155,7 +183,9 @@ impl BrowserState {
             links: Vec::new(),
             scroll: 0,
             page_bg: 0xffff_ffff,
-            history: Vec::new(),
+            tabs: alloc::vec![Tab::new("/")],
+            active: 0,
+            zoom: 100,
             img_cache: Vec::new(),
             editing: false,
             edit_buf: String::new(),
@@ -205,7 +235,8 @@ fn paint_fields(win: &mut Window) {
 /// the click was consumed by the chrome.
 pub fn chrome_click(win: &mut Window, rx: isize, ry: isize) -> bool {
     let crate::wm::App::Browser(st) = &mut win.app else { return false };
-    if ry < TOPBAR as isize && rx >= 18 {
+    // The URL field is in the address-bar row, right of the back/forward buttons.
+    if ry >= TABBAR_H as isize && (ry as usize) < CHROME && rx >= 36 {
         st.editing = true;
         st.focus = None;
         st.edit_buf = String::new(); // focus clears, like select-all + type
@@ -1085,9 +1116,10 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
     s.anc = inherited.anc.clone();
     s.anc.push((Some(String::from(tag)), class.map(String::from)));
     // Resolve the FreeType face + pixel size from the (inherited) typography.
+    let zoom = ZOOM.load(Ordering::Relaxed).max(50) as usize;
     s.font = Font {
         id: pick_ftid(s.font_fam, s.font_weight, s.font_italic),
-        px: ((s.scale * 16) as u16).max(13),
+        px: ((s.scale * 16 * zoom / 100).max(10) as u16).min(200),
     };
     s
 }
@@ -1788,10 +1820,21 @@ fn layout_flex(ctx: &mut Ctx, node: &html::Node, style: &Style, x: isize, w: isi
 /// window's content width, render it into the page buffer, and repaint.
 static HISTORY_DONE: AtomicBool = AtomicBool::new(false);
 
-/// Navigate back to the previously-visited path, if any.
+/// Navigate back in the active tab's history, pushing the current page onto
+/// the forward stack.
 pub fn back(win: &mut Window) -> bool {
     let prev = match &mut win.app {
-        crate::wm::App::Browser(st) => st.history.pop(),
+        crate::wm::App::Browser(st) => {
+            let a = st.active;
+            let cur = st.path.clone();
+            match st.tabs[a].back.pop() {
+                Some(p) => {
+                    st.tabs[a].fwd.push(cur);
+                    Some(p)
+                }
+                None => None,
+            }
+        }
         _ => return false,
     };
     let Some(p) = prev else { return false };
@@ -1803,10 +1846,192 @@ pub fn back(win: &mut Window) -> bool {
     true
 }
 
+/// Navigate forward (re-do a back), pushing the current page onto the back stack.
+pub fn forward(win: &mut Window) -> bool {
+    let next = match &mut win.app {
+        crate::wm::App::Browser(st) => {
+            let a = st.active;
+            let cur = st.path.clone();
+            match st.tabs[a].fwd.pop() {
+                Some(p) => {
+                    st.tabs[a].back.push(cur);
+                    Some(p)
+                }
+                None => None,
+            }
+        }
+        _ => return false,
+    };
+    let Some(p) = next else { return false };
+    kprintln!("BROWSER: forward to {p}");
+    navigate(win, &p, false);
+    true
+}
+
 /// Reload the current page (F5).
 pub fn reload(win: &mut Window) {
     let path = if let crate::wm::App::Browser(st) = &win.app { st.path.clone() } else { return };
     navigate(win, &path, false);
+}
+
+/// A short label for the tab strip from a path/URL.
+fn tab_title(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    let p = p.strip_prefix("https://").or_else(|| p.strip_prefix("http://")).unwrap_or(p);
+    let name = p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p);
+    let name = name.split('?').next().unwrap_or(name);
+    if name.is_empty() {
+        String::from("new tab")
+    } else {
+        name.chars().take(18).collect()
+    }
+}
+
+// --- M39 tabs + zoom --------------------------------------------------------
+
+/// Open `path` in a new tab and switch to it.
+pub fn new_tab(win: &mut Window, path: &str) {
+    {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        // Save the current tab's scroll before leaving it.
+        let a = st.active;
+        st.tabs[a].scroll = st.scroll;
+        st.tabs.push(Tab::new(path));
+        st.active = st.tabs.len() - 1;
+        st.scroll = 0;
+    }
+    kprintln!("BROWSER: new tab -> {path}");
+    navigate(win, path, false);
+}
+
+/// Close the active tab (Ctrl+W).
+pub fn close_tab(win: &mut Window) {
+    let a = if let crate::wm::App::Browser(st) = &win.app { st.active } else { return };
+    close_tab_index(win, a);
+}
+
+/// Close tab `i`; switch to a neighbour. Keeps at least one tab (the last one
+/// resets to the home page rather than closing the window).
+pub fn close_tab_index(win: &mut Window, i: usize) {
+    let target = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        if i >= st.tabs.len() {
+            return;
+        }
+        if st.tabs.len() <= 1 {
+            st.tabs[0] = Tab::new("/");
+            st.active = 0;
+            st.scroll = 0;
+            String::from("/")
+        } else {
+            st.tabs.remove(i);
+            if st.active >= st.tabs.len() {
+                st.active = st.tabs.len() - 1;
+            } else if i < st.active {
+                st.active -= 1;
+            }
+            st.scroll = st.tabs[st.active].scroll;
+            st.tabs[st.active].path.clone()
+        }
+    };
+    kprintln!("BROWSER: closed tab {i}, now on {target}");
+    navigate(win, &target, false);
+}
+
+const TAB_MAX_W: usize = 150;
+const NEWTAB_W: usize = 22;
+
+/// Geometry of the tab strip: per-tab (x, width) cells + the new-tab button.
+fn tab_layout(ntabs: usize, cw: usize) -> (Vec<(usize, usize)>, (usize, usize)) {
+    let avail = cw.saturating_sub(NEWTAB_W + 6);
+    let tw = (avail / ntabs.max(1)).clamp(40, TAB_MAX_W);
+    let cells: Vec<(usize, usize)> = (0..ntabs).map(|i| (i * tw, tw)).collect();
+    let nt_x = (ntabs * tw).min(cw.saturating_sub(NEWTAB_W));
+    (cells, (nt_x, NEWTAB_W))
+}
+
+/// Route a click in the chrome (tab strip + back/forward buttons). Returns true
+/// if consumed. (rx, ry) are content-relative.
+pub fn topbar_click(win: &mut Window, rx: isize, ry: isize) -> bool {
+    if rx < 0 || ry < 0 {
+        return false;
+    }
+    let (rx, ry) = (rx as usize, ry as usize);
+    if ry < TABBAR_H {
+        let (ntabs, cw) = match &win.app {
+            crate::wm::App::Browser(st) => (st.tabs.len(), win.cw),
+            _ => return false,
+        };
+        let (cells, (nt_x, nt_w)) = tab_layout(ntabs, cw);
+        if rx >= nt_x && rx < nt_x + nt_w {
+            new_tab(win, "/");
+            return true;
+        }
+        for (i, &(tx, tw)) in cells.iter().enumerate() {
+            if rx >= tx && rx < tx + tw {
+                if rx >= tx + tw - 16 {
+                    close_tab_index(win, i);
+                } else {
+                    switch_tab(win, i);
+                }
+                return true;
+            }
+        }
+        return true; // empty strip area
+    }
+    if ry >= TABBAR_H && ry < CHROME {
+        if rx < 18 {
+            back(win);
+            return true;
+        }
+        if rx < 36 {
+            forward(win);
+            return true;
+        }
+    }
+    false
+}
+
+/// Switch to tab `i`, re-rendering its page.
+pub fn switch_tab(win: &mut Window, i: usize) {
+    let target = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        if i >= st.tabs.len() || i == st.active {
+            return;
+        }
+        let a = st.active;
+        st.tabs[a].scroll = st.scroll; // remember where we were
+        st.active = i;
+        st.scroll = st.tabs[i].scroll;
+        st.tabs[i].path.clone()
+    };
+    kprintln!("BROWSER: switch to tab {i} ({target})");
+    navigate(win, &target, false);
+    // Restore the saved scroll after the re-render.
+    if let crate::wm::App::Browser(st) = &mut win.app {
+        let s = st.tabs[st.active].scroll.min(st.doc_h.saturating_sub(1));
+        st.scroll = s;
+    }
+    paint_view(win);
+}
+
+/// Change zoom by `delta` percent (0 = reset to 100), then re-render.
+pub fn zoom(win: &mut Window, delta: i32) {
+    let path = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        st.zoom = if delta == 0 {
+            100
+        } else {
+            (st.zoom as i32 + delta).clamp(50, 250) as u16
+        };
+        st.path.clone()
+    };
+    kprintln!("BROWSER: zoom {}%", zoom_pct(win));
+    navigate(win, &path, false);
+}
+
+fn zoom_pct(win: &Window) -> u16 {
+    if let crate::wm::App::Browser(st) = &win.app { st.zoom } else { 100 }
 }
 
 struct FontFace {
@@ -1959,18 +2184,23 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     // Set the base so this page's relative stylesheets/images/links resolve
     // against its own host (external) or stay loopback-relative (local).
     set_page_base(if was_external { Some(path.clone()) } else { None });
+    if let crate::wm::App::Browser(st) = &win.app {
+        ZOOM.store(st.zoom, Ordering::Relaxed);
+    }
     kprintln!("BROWSER: navigating to {path}");
     // A user navigation (link click / typed URL) pushes the current page onto
     // the history stack so the back button can return to it.
     if by_click {
         if let crate::wm::App::Browser(st) = &mut win.app {
             let old = st.path.clone();
-            if st.history.last() != Some(&old) {
-                st.history.push(old);
-                if st.history.len() > 20 {
-                    st.history.remove(0);
+            let a = st.active;
+            if st.tabs[a].back.last() != Some(&old) {
+                st.tabs[a].back.push(old);
+                if st.tabs[a].back.len() > 30 {
+                    st.tabs[a].back.remove(0);
                 }
             }
+            st.tabs[a].fwd.clear(); // a fresh navigation invalidates forward
         }
     }
     // Fetch, following up to a few 3xx redirects (Location may be relative).
@@ -2202,7 +2432,13 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     );
 
     let crate::wm::App::Browser(st) = &mut win.app else { return };
-    st.path = path;
+    st.path = path.clone();
+    // Sync the active tab's path + a short title for the tab strip.
+    let a = st.active;
+    if a < st.tabs.len() {
+        st.tabs[a].path = path.clone();
+        st.tabs[a].title = tab_title(&path);
+    }
     st.page = page;
     st.page_w = view_w;
     st.doc_h = doc_h;
@@ -2274,12 +2510,12 @@ fn render_message(win: &mut Window, path: &str, msg: &str) {
 /// Repaint the canvas: visible page rows below a URL bar.
 pub fn paint_view(win: &mut Window) {
     let (cw, ch) = (win.cw, win.ch);
+    let view_h = ch - CHROME;
     let bar = {
         let crate::wm::App::Browser(st) = &mut win.app else { return };
-        let view_h = ch - TOPBAR;
         for row in 0..view_h {
             let sy = st.scroll + row;
-            let dst = &mut win.canvas[(TOPBAR + row) * cw..(TOPBAR + row) * cw + cw];
+            let dst = &mut win.canvas[(CHROME + row) * cw..(CHROME + row) * cw + cw];
             if sy < st.doc_h && st.page_w == cw {
                 dst.copy_from_slice(&st.page[sy * cw..sy * cw + cw]);
             } else {
@@ -2292,46 +2528,67 @@ pub fn paint_view(win: &mut Window) {
         } else {
             100
         };
+        let z = if st.zoom != 100 { format!("  {}%z", st.zoom) } else { String::new() };
         // While editing, show the edit buffer with a block cursor.
         if st.editing {
             format!("{}_", st.edit_buf)
         } else if st.path.starts_with("http://") || st.path.starts_with("https://") {
-            // External pages already carry a full URL; local paths get our IP.
-            format!("{}  [{pct}%]", st.path)
+            format!("{}  [{pct}%]{z}", st.path)
         } else {
-            format!("http://{}{}  [{pct}%]", net::fmt_ip(&ip), st.path)
+            format!("http://{}{}  [{pct}%]{z}", net::fmt_ip(&ip), st.path)
         }
     };
-    // Scrollbar: a 2px gutter on the right edge with a proportional thumb.
-    let (doc_h, scroll) = {
+    let (doc_h, scroll, ntabs, active, can_back, can_fwd, titles) = {
         let crate::wm::App::Browser(st) = &win.app else { return };
-        (st.doc_h, st.scroll)
+        let a = st.active;
+        (
+            st.doc_h, st.scroll, st.tabs.len(), a,
+            !st.tabs[a].back.is_empty(), !st.tabs[a].fwd.is_empty(),
+            st.tabs.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+        )
     };
-    let view_h = ch - TOPBAR;
     let fb = win.canvas_fb();
+    // Scrollbar.
     if doc_h > view_h {
-        // Thin (4px) rounded scrollbar: #444 track, #888 thumb.
-        fb.fill_round_rect(cw - 5, TOPBAR + 1, 4, view_h - 2, 2, 0xff44_4444);
+        fb.fill_round_rect(cw - 5, CHROME + 1, 4, view_h - 2, 2, 0xff44_4444);
         let thumb_h = (view_h * view_h / doc_h).max(16).min(view_h);
-        let thumb_y = TOPBAR + scroll * (view_h - thumb_h) / (doc_h - view_h);
+        let thumb_y = CHROME + scroll * (view_h - thumb_h) / (doc_h - view_h);
         fb.fill_round_rect(cw - 5, thumb_y, 4, thumb_h, 2, 0xff88_8888);
     }
-    fb.fill_rect(0, 0, cw, TOPBAR, BAR_BG);
-    // Back button: a `<` in its own 18px zone, then the address bar.
-    let has_history = matches!(&win.app, crate::wm::App::Browser(st) if !st.history.is_empty());
-    fb.fill_rect(0, 0, 18, TOPBAR, if has_history { 0xff90_a8c0 } else { 0xffb0_b4bc });
-    fb.draw_string(5, 2, "<", BAR_TEXT, None);
-    fb.draw_string(22, 2, &bar, BAR_TEXT, None);
+    // Tab strip (top row).
+    fb.fill_rect(0, 0, cw, TABBAR_H, 0xff20_2428);
+    let (cells, (nt_x, nt_w)) = tab_layout(ntabs, cw);
+    for (i, &(tx, tw)) in cells.iter().enumerate() {
+        let bg = if i == active { 0xffc8_ccd4 } else { 0xff34_3a40 };
+        let fg = if i == active { 0xff20_2830 } else { 0xffc0_c4cc };
+        fb.fill_rect(tx + 1, 2, tw.saturating_sub(2), TABBAR_H - 2, bg);
+        let maxc = (tw.saturating_sub(24)) / 8;
+        let title: String = titles[i].chars().take(maxc).collect();
+        fb.draw_string(tx + 6, 4, &title, fg, None);
+        // close 'x'
+        fb.draw_string(tx + tw - 14, 4, "x", fg, None);
+    }
+    // New-tab '+' button.
+    fb.fill_rect(nt_x + 1, 2, nt_w.saturating_sub(2), TABBAR_H - 2, 0xff34_3a40);
+    fb.draw_string(nt_x + 7, 4, "+", 0xffc0_c4cc, None);
+
+    // Address-bar row (below the tab strip): back '<', forward '>', then URL.
+    fb.fill_rect(0, TABBAR_H, cw, TOPBAR, BAR_BG);
+    fb.fill_rect(0, TABBAR_H, 18, TOPBAR, if can_back { 0xff90_a8c0 } else { 0xffb0_b4bc });
+    fb.draw_string(5, TABBAR_H + 2, "<", BAR_TEXT, None);
+    fb.fill_rect(18, TABBAR_H, 18, TOPBAR, if can_fwd { 0xff90_a8c0 } else { 0xffb0_b4bc });
+    fb.draw_string(23, TABBAR_H + 2, ">", BAR_TEXT, None);
+    fb.draw_string(40, TABBAR_H + 2, &bar, BAR_TEXT, None);
 
     // M36 find-in-page: highlight matches in view + a find bar at the bottom.
     if let crate::wm::App::Browser(st) = &win.app {
         if st.find_open {
-            let view_h = ch - TOPBAR;
+            let view_h = ch - CHROME;
             for (mi, &ri) in st.find_matches.iter().enumerate() {
                 let (rx, ry, rw, _) = &st.text_runs[ri];
                 let py = *ry as usize;
                 if py >= st.scroll && py + 18 < st.scroll + view_h {
-                    let cy = TOPBAR + (py - st.scroll);
+                    let cy = CHROME + (py - st.scroll);
                     let (col, a) = if mi == st.find_idx { (0xffff_a000, 150) } else { (0xffff_e000, 90) };
                     fb.blend_rect((*rx).max(0) as usize, cy, (*rw).max(6) as usize, 18, col, a);
                 }
@@ -2431,10 +2688,10 @@ pub fn find_is_open(win: &Window) -> bool {
 /// Returns true if a field took focus.
 pub fn focus_field(win: &mut Window, rx: isize, ry: isize) -> bool {
     let crate::wm::App::Browser(st) = &mut win.app else { return false };
-    if ry < TOPBAR as isize {
+    if (ry as usize) < CHROME {
         return false;
     }
-    let (dx, dy) = (rx, ry - TOPBAR as isize + st.scroll as isize);
+    let (dx, dy) = (rx, ry - CHROME as isize + st.scroll as isize);
     if let Some(i) = st
         .fields
         .iter()
@@ -2451,10 +2708,10 @@ pub fn focus_field(win: &mut Window, rx: isize, ry: isize) -> bool {
 /// Canvas-relative click -> link href, if one was hit.
 pub fn link_at(win: &Window, rx: isize, ry: isize) -> Option<String> {
     let crate::wm::App::Browser(st) = &win.app else { return None };
-    if ry < TOPBAR as isize {
+    if (ry as usize) < CHROME {
         return None;
     }
-    let (dx, dy) = (rx, ry - TOPBAR as isize + st.scroll as isize);
+    let (dx, dy) = (rx, ry - CHROME as isize + st.scroll as isize);
     st.links
         .iter()
         .find(|l| dx >= l.x && dx < l.x + l.w && dy >= l.y && dy < l.y + l.h)
@@ -2466,7 +2723,7 @@ static SCROLL_DONE: AtomicBool = AtomicBool::new(false);
 /// Scroll to an absolute offset (clamped to the document), repaint, and emit
 /// SCROLL_OK the first time a taller-than-window page moves off its top.
 fn scroll_to(win: &mut Window, target: isize) -> bool {
-    let view_h = win.ch - TOPBAR;
+    let view_h = win.ch - CHROME;
     let (new, tall) = {
         let crate::wm::App::Browser(st) = &mut win.app else { return false };
         let max = st.doc_h.saturating_sub(view_h);
@@ -2580,7 +2837,7 @@ pub fn key(win: &mut Window, code: u16) -> bool {
         return back(win); // address bar isn't a text field -> Backspace = back
     }
     let line = 16isize; // one text line
-    let half = (win.ch - TOPBAR) as isize / 2;
+    let half = (win.ch - CHROME) as isize / 2;
     let s = cur_scroll(win);
     let target = match code {
         KEY_UP => s - line,

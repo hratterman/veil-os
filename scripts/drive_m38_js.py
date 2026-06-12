@@ -11,7 +11,7 @@ import time
 from guilib import Driver, check, finish, taskbar_xy
 
 CONTENT_Y = 52
-PAGE_X, PAGE_Y = 14, 74
+PAGE_X, PAGE_Y = 14, 96
 
 
 def type_str(d, s):
@@ -42,7 +42,7 @@ def main():
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
 
     m = len(d.serial())
-    d.click(650, CONTENT_Y + 10)  # address bar
+    d.click(650, CONTENT_Y + 32)  # address bar
     type_str(d, "/jstest.htm")
     press(d, "ret")
     check("JS page rendered", d.wait_serial("BROWSER: rendered /jstest.htm", 25, m))

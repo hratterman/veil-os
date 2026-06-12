@@ -37,7 +37,7 @@ def main():
     check("index rendered", d.wait_serial("BROWSER: rendered / -", 40))
 
     m = len(d.serial())
-    d.click(650, 62)  # address bar
+    d.click(650, 84)  # address bar
     type_str(d, "https://henryratterman.com")
     press(d, "ret")
     # The live fetch + TLS + scripts + 6 web-font TTFs + a 4780px layout with

@@ -949,7 +949,17 @@ impl Wm {
             self.cycle_windows();
             return;
         }
-        // Global window shortcuts.
+        // Ctrl+W closes the browser's active tab (not the window) when a browser
+        // is focused; otherwise it (and Alt+F4) closes the window.
+        if self.ctrl && code == keymap::KEY_W {
+            if let Some(win) = self.windows.last_mut() {
+                if matches!(win.app, App::Browser(_)) {
+                    browser::close_tab(win);
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
         if (self.ctrl && code == keymap::KEY_W) || (self.alt && code == keymap::KEY_F4) {
             if let Some(w) = self.windows.pop() {
                 kprintln!("WM: closed '{}' (shortcut)", w.title);
@@ -978,6 +988,25 @@ impl Wm {
                     if let Some(win) = self.windows.last_mut() {
                         if matches!(win.app, App::Browser(_)) {
                             browser::find_toggle(win);
+                            self.dirty = true;
+                        }
+                    }
+                    return;
+                }
+                keymap::KEY_T => {
+                    if let Some(win) = self.windows.last_mut() {
+                        if matches!(win.app, App::Browser(_)) {
+                            browser::new_tab(win, "/");
+                            self.dirty = true;
+                        }
+                    }
+                    return;
+                }
+                keymap::KEY_EQUAL | keymap::KEY_MINUS | keymap::KEY_0 => {
+                    if let Some(win) = self.windows.last_mut() {
+                        if matches!(win.app, App::Browser(_)) {
+                            let d = if code == keymap::KEY_EQUAL { 10 } else if code == keymap::KEY_MINUS { -10 } else { 0 };
+                            browser::zoom(win, d);
                             self.dirty = true;
                         }
                     }
@@ -1547,7 +1576,7 @@ impl Wm {
             let win = &self.windows[idx];
             return match &win.app {
                 App::Browser(_) => {
-                    if ry >= browser::TOPBAR as isize && browser::link_at(win, rx, ry).is_some() {
+                    if ry >= browser::CHROME as isize && browser::link_at(win, rx, ry).is_some() {
                         CursorShape::Hand
                     } else {
                         CursorShape::IBeam
@@ -1703,6 +1732,7 @@ impl Wm {
             }
             Some((idx, Hit::Content(rx, ry))) => {
                 let top = self.raise(idx);
+                let ctrl = self.ctrl;
                 let win = &mut self.windows[top];
                 match win.app {
                     App::Paint(_) => {
@@ -1710,15 +1740,20 @@ impl Wm {
                         self.dirty = true;
                     }
                     App::Browser(_) => {
-                        if ry < browser::TOPBAR as isize && rx < 18 {
-                            browser::back(win); // the `<` back button
+                        if browser::topbar_click(win, rx, ry) {
+                            // tab strip / back / forward buttons
                         } else if browser::chrome_click(win, rx, ry) {
                             // address bar focused for editing
                         } else if browser::focus_field(win, rx, ry) {
                             // an on-page input field took focus
                         } else if let Some(href) = browser::link_at(win, rx, ry) {
-                            kprintln!("BROWSER: clicked link -> {href}");
-                            browser::navigate(win, &href, true);
+                            if ctrl {
+                                kprintln!("BROWSER: ctrl+click -> new tab {href}");
+                                browser::new_tab(win, &href);
+                            } else {
+                                kprintln!("BROWSER: clicked link -> {href}");
+                                browser::navigate(win, &href, true);
+                            }
                         }
                         self.dirty = true;
                     }

@@ -1,6 +1,6 @@
 import sys, re, time
 from guilib import Driver, check, finish, taskbar_xy
-CONTENT_X=512; PAGE_Y=54+20
+CONTENT_X=512; PAGE_Y=54+42
 def boxes(s,kind):
     return [(m[0],int(m[1]),int(m[2]),int(m[3]),int(m[4])) for m in re.findall(rf"BROWSER: {kind} '([^']+)' at \((-?\d+), (-?\d+)\) (\d+)x(\d+)", s)]
 def main():

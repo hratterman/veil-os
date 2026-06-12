@@ -16,7 +16,7 @@ import sys
 from guilib import Driver, check, finish, taskbar_xy
 
 CONTENT_X = 512
-PAGE_Y = 54 + 20
+PAGE_Y = 54 + 42
 
 
 def boxes(s, kind):

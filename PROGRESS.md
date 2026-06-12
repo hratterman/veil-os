@@ -576,10 +576,41 @@ static HTML is an empty skeleton; `content.js` holds the data and an inline
 
 Loopback proof `scripts/drive_m38_js.py` (JSTEST.HTM = the real scripts inlined):
 body text grows from ~empty to 36 KB, 933 layout items, 411 colours. Live
-acceptance `scripts/drive_m38_hr.py` renders henryratterman.com over direct TLS:
-HTML + shared.js + content.js + style.css + 6 web-font TTFs + headshot.jpg all
-fetched, scripts run (21 KB of injected text), web fonts registered, grid laid
-out. **Tokens:** JS_OK, GRID_OK.
+acceptance `scripts/drive_m38_hr.py` over `scripts/m38_test.sh` (release) renders
+henryratterman.com over direct TLS: HTML + shared.js + content.js + style.css +
+6 web-font TTFs + headshot.jpg all fetched, scripts run (21 KB of injected text),
+web fonts registered, grid laid out, 255 colours. **Tokens:** JS_OK, GRID_OK.
+
+Two hangs found + fixed during bring-up: (1) web-font glyphs rendered with
+`FT_LOAD_TARGET_LIGHT` ran the autofitter, pathologically slow on Cormorant —
+switched web fonts to `FT_LOAD_NO_HINTING` (smooth rasteriser still
+anti-aliases). (2) the multi-MB page buffer OOM-**panicked** the browser on a
+10000+px JS-rendered page over a fragmented 16 MB heap — now free the old page
+first and allocate with `try_reserve`, shrinking `doc_h` until a contiguous
+block fits (fill_rect/blit clip).
+
+## M39 — browser UX: tabs, back/forward, zoom (2026-06-11)
+
+- **Tabs** (`browser.rs`): `BrowserState` gained `tabs: Vec<Tab>` + `active`.
+  Each `Tab` carries its own path/scroll/back/forward/title; the active tab's
+  rendered page lives in the existing fields and switching re-renders (no 5 MB
+  page buffer per tab). A tab strip (22 px) sits above the address bar — click a
+  tab to switch, its `x` to close, `+` for a new tab. Ctrl+T new tab, Ctrl+W
+  closes the active tab (not the window). `tab_layout` shares geometry between
+  paint and click routing.
+- **Back/forward**: per-tab back + forward stacks; a navigation pushes the old
+  path to back and clears forward; the address-bar row gained a `>` forward
+  button beside `<`. HISTORY_OK.
+- **Zoom**: Ctrl+= / Ctrl+- / Ctrl+0 adjust a per-tab zoom (50–250 %) threaded
+  into layout's font-size computation via a `ZOOM` static; re-renders the page.
+- **Ctrl+click a link opens it in a new tab** (the WM passes its Ctrl state into
+  the browser content-click dispatch).
+- Chrome height went from `TOPBAR` (20) to `CHROME = TABBAR_H + TOPBAR` (42);
+  all page-content offsets + the browser proof drivers updated by +22 px.
+
+Proof `scripts/drive_m39_tabs.py` (loopback): Ctrl+click opens a new tab, switch
+between tabs, navigate + back + forward in a tab, zoom in/reset — ALL CHECKS
+PASSED. Regressions (m16, m34, m38) updated for the tab bar and green.
 
 ## Bugfix — large-PNG OOM crash (2026-06-11)
 

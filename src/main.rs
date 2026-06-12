@@ -72,6 +72,7 @@ mod syscall;
 mod timer;
 mod tls;
 mod uart;
+mod vfs;
 mod video;
 mod viewer;
 mod virtio;
@@ -156,6 +157,10 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     }
     milestone9();
     milestone10(&fdt);
+    vfs::init(); // M42 step 6: hierarchical filesystem (load from disk or seed)
+    if !fastboot(&fdt) {
+        vfs::selftest(); // M42 step 6: mkdir/cd/paths + /home dotfiles + disk persistence
+    }
     if milestone12(&fdt) {
         // M14/M15 services (tcp echo, http) as a preemptible kernel task.
         scheduler::spawn_kernel("net-services", http::services_task);

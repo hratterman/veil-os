@@ -123,6 +123,15 @@ impl Host {
                 self.output.push('\n');
                 Some(0)
             }
+            // M41 step 21: the C compiler's print_int — format an int and emit it.
+            "veil_print_int" => {
+                let n = *args.first()? as i32;
+                let s = alloc::format!("{n}");
+                crate::kprintln!("WASM_APP: {s}");
+                self.output.push_str(&s);
+                self.output.push('\n');
+                Some(0)
+            }
             "veil_store_set" => {
                 if let Some(r) = self.deny(crate::perms::FILESYSTEM) {
                     return Some(r);

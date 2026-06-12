@@ -34,6 +34,20 @@ printf 'Hello from the Veil filesystem! This file was written by macOS.\n' > "$M
 printf '// demo.rs - Veil OS\nfn main() {\n    let msg = "hello, world";\n    for i in 0..10 {\n        print(i, msg); // loop\n    }\n}\n' > "$MNT/DEMO.RS"
 # M19b: local timezone, integer UTC offset in hours (EDT = -4 in summer).
 printf -- '-4\n' > "$MNT/TZ.TXT"
+# M41 step 21: a C program to compile + run inside Veil with `cc hello.c`.
+cat > "$MNT/HELLO.C" <<'VEILC'
+// Hello, Veil — compiled inside Veil by the on-OS C compiler, run in Veil.
+int square(int n) { return n * n; }
+int main() {
+    print("Hello, Veil!");
+    int sum = 0;
+    for (int i = 1; i <= 5; i = i + 1) {
+        sum = sum + square(i);
+    }
+    print_int(sum);
+    return 0;
+}
+VEILC
 # M41 step 9: a non-trivial shell script (iterate files, pipe-transform, write
 # output) for the real-shell proof. Run with `sh test.sh`.
 cat > "$MNT/TEST.SH" <<'VEILSH'

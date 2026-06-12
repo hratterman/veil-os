@@ -15,6 +15,7 @@ mod blk;
 mod breakout;
 mod browser;
 mod calc;
+mod cc;
 mod clipboard;
 mod clock;
 mod crypto;
@@ -144,6 +145,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         shell::coreutils_selftest(); // M41: grep(regex)/sed/awk/cut/tr standalone tools
         rsa::selftest(); // M41: from-scratch RSA modexp for X.509 validation
         x509::selftest(); // M41: X.509 parse + chain validation (self-signed/expired/hostname)
+        cc::selftest(); // M41 step 21: compile + run a C program inside Veil
         browser::hsts_selftest(); // M41: HSTS record + http->https upgrade
     }
     milestone9();

@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod blk;
+mod boot_anim;
 mod breakout;
 mod browser;
 mod calc;
@@ -169,6 +170,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         pkg::selftest(); // M42 step 9: .veil package format + pkg manager (install/list/remove)
         pkg::sdk_app_selftest(); // M42 step 12: external SDK app (Calculator) -> .veil -> run in Veil
         users::selftest(); // M42 step 14: multi-user accounts + /home + .veilrc + history
+        boot_anim::selftest(); // M42 step 15: boot-animation frame curve + color blend
         wm::multiplayer_selftest(); // M42 step 10: shared-desktop multi-cursor + peer registry
         wm::window_anim_selftest(); // M42 step 13: window animations (easing/tween) + Expose grid
     }

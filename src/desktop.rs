@@ -29,6 +29,10 @@ pub fn run(screen: Framebuffer, fdt: &dtb::Fdt) {
     timer::start(timer::intid(), 50);
     scheduler::enable_preemption();
 
+    // M42 step 15: an animated Veil splash before anything else (no raw text to
+    // the visitor), then a smooth hand-off to the setup screen / desktop.
+    crate::boot_anim::play(&screen);
+
     // M27: first boot with no USER.TXT -> full-screen setup before desktop.
     if setup::needed() {
         setup::run(&screen);

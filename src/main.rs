@@ -143,6 +143,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::dom_api_selftest(); // M42 step 1: full DOM API + engine fixes (React parses/loads/runs)
         js::webaudio_selftest(); // M42 step 2: Web Audio API -> 440Hz oscillator -> virtio-sound
         js::webgl_selftest(); // M42 step 3: WebGL -> GLSL shaders + software rasteriser -> triangle
+        browser::css_selftest(); // M42 step 4: full CSS (position/overflow/text-transform/flex-col/...)
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
         shell::selftest(); // M41: bash-subset shell interpreter
         shell::coreutils_selftest(); // M41: grep(regex)/sed/awk/cut/tr standalone tools

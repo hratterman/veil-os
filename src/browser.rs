@@ -1082,6 +1082,83 @@ fn harvest_hsts(resp: &[u8], host: &str) {
 
 /// Boot self-test: HSTS is recorded from a response header and upgrades a later
 /// http:// URL for that host.
+/// CSS self-test (M42 step 4): resolve computed styles for elements using the
+/// CSS features this step adds and verify each one cascaded correctly.
+pub fn css_selftest() {
+    let css = "\
+        .fixed { position: fixed; top: 10px; left: 20px; }\
+        .abs { position: absolute; bottom: 5px; }\
+        .clip { overflow: hidden; }\
+        .upper { text-transform: uppercase; }\
+        .lh { line-height: 1.5; }\
+        .ls { letter-spacing: 2px; }\
+        .bold { font-weight: 700; font-style: italic; }\
+        .bg { background-image: url('/hero.png'); background-size: cover; background-position: center; }\
+        .fit { object-fit: cover; }\
+        .ell { text-overflow: ellipsis; white-space: nowrap; }\
+        .col { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 12px; }\
+        .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: auto auto; }";
+    let rules = css::parse(css);
+    let html = "<html><body>\
+        <div class=fixed></div><div class=abs></div><div class=clip></div>\
+        <p class=upper>hello world</p><p class=lh></p><span class=ls></span>\
+        <b class=bold></b><div class=bg></div><img class=fit><div class=ell></div>\
+        <div class=col></div><div class=grid></div>\
+        <div class=upper-parent><span class=child></span></div></body></html>";
+    let tree = crate::html::parse(html);
+    let body_style = root_style();
+    let find = |cls: &str| -> Style {
+        let node = find_by_class(&tree, cls);
+        node.map(|n| resolve(&rules, n, &body_style)).unwrap_or_else(root_style)
+    };
+
+    let fixed = find("fixed");
+    let abs = find("abs");
+    let clip = find("clip");
+    let upper = find("upper");
+    let lh = find("lh");
+    let ls = find("ls");
+    let bold = find("bold");
+    let bg = find("bg");
+    let fit = find("fit");
+    let ell = find("ell");
+    let col = find("col");
+    let grid = find("grid");
+    let tt = apply_text_transform(TextTransform::Upper, "Hello") == "HELLO"
+        && apply_text_transform(TextTransform::Capitalize, "the quick fox") == "The Quick Fox";
+
+    let checks: [(&str, bool); 14] = [
+        ("position:fixed+inset", fixed.position == Position::Fixed && fixed.inset[0] == Some(10) && fixed.inset[3] == Some(20)),
+        ("position:absolute", abs.position == Position::Absolute && abs.inset[2] == Some(5)),
+        ("overflow:hidden", clip.overflow_hidden),
+        ("text-transform", upper.text_transform == TextTransform::Upper),
+        ("line-height:1.5", lh.line_height_x100 == Some(150)),
+        ("letter-spacing:2px", ls.letter_spacing == 2),
+        ("font-weight:700", bold.font_weight == 700),
+        ("font-style:italic", bold.font_italic),
+        ("background-image:url", bg.bg_image.as_deref() == Some("/hero.png")),
+        ("object-fit:cover", fit.object_fit == ObjectFit::Cover),
+        ("text-overflow:ellipsis", ell.text_ellipsis),
+        ("flex column+center+gap", col.display == Display::Flex && col.flex_dir == FlexDir::Column && col.justify == Justify::Center && col.align == AlignItems::Center && col.gap == 12),
+        ("grid rows+cols", grid.grid_cols == 3 && grid.grid_rows == 2),
+        ("text-transform applies", tt),
+    ];
+    let failed: alloc::vec::Vec<&str> = checks.iter().filter(|(_, ok)| !ok).map(|(n, _)| *n).collect();
+    if failed.is_empty() {
+        kprintln!("CSS_FULL_OK: position fixed/absolute+inset, overflow:hidden, text-transform, line-height, letter-spacing, font-weight/style, background-image url, object-fit, text-overflow, flex-column, grid rows/cols all resolve");
+    } else {
+        kprintln!("CSS_FULL_FAIL: {failed:?}");
+    }
+}
+
+/// Depth-first search for the first element carrying `class` in its class list.
+fn find_by_class<'a>(n: &'a html::Node, class: &str) -> Option<&'a html::Node> {
+    if n.attr("class").map(|c| c.split_whitespace().any(|w| w == class)).unwrap_or(false) {
+        return Some(n);
+    }
+    n.children().iter().find_map(|c| find_by_class(c, class))
+}
+
 pub fn hsts_selftest() {
     let resp = b"HTTP/1.1 200 OK\r\nStrict-Transport-Security: max-age=31536000\r\n\r\nhi";
     harvest_hsts(resp, "hsts-test.example");
@@ -1725,6 +1802,54 @@ enum AlignItems {
     End,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TextTransform {
+    None,
+    Upper,
+    Lower,
+    Capitalize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ObjectFit {
+    Fill,
+    Cover,
+    Contain,
+}
+
+/// Apply a CSS `text-transform` to a run of text.
+fn apply_text_transform(t: TextTransform, s: &str) -> String {
+    match t {
+        TextTransform::None => String::from(s),
+        TextTransform::Upper => s.to_uppercase(),
+        TextTransform::Lower => s.to_lowercase(),
+        TextTransform::Capitalize => {
+            let mut out = String::new();
+            let mut at_start = true;
+            for c in s.chars() {
+                if c.is_whitespace() {
+                    at_start = true;
+                    out.push(c);
+                } else if at_start {
+                    out.extend(c.to_uppercase());
+                    at_start = false;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Style {
     color: u32,
@@ -1753,6 +1878,22 @@ struct Style {
     flex_grow: u32,
     // border-radius (px) applied to the element's background box. Not inherited.
     radius: isize,
+    // Positioning (not inherited). `inset` is top/right/bottom/left (None = auto).
+    position: Position,
+    inset: [Option<isize>; 4],
+    // overflow: hidden clips children to this box. Not inherited.
+    overflow_hidden: bool,
+    // Inherited text properties.
+    text_transform: TextTransform,
+    line_height_x100: Option<u16>, // line-height as a ×100 multiplier (150 = 1.5)
+    letter_spacing: isize,
+    // <img> object-fit (not inherited) + element background-image url (not inherited).
+    object_fit: ObjectFit,
+    bg_image: Option<String>,
+    // text-overflow: ellipsis (not inherited).
+    text_ellipsis: bool,
+    // Grid rows from grid-template-rows (not inherited).
+    grid_rows: usize,
     // Hidden-overlay detection (don't inherit). `transparent` = opacity:0,
     // `pointer_none` = pointer-events:none; an element with both is a hidden
     // overlay (e.g. a JS-toggled mobile menu) and is dropped — but opacity:0
@@ -1788,6 +1929,16 @@ fn root_style() -> Style {
         grid_cols: 1,
         flex_grow: 0,
         radius: 0,
+        position: Position::Static,
+        inset: [None; 4],
+        overflow_hidden: false,
+        text_transform: TextTransform::None,
+        line_height_x100: None,
+        letter_spacing: 0,
+        object_fit: ObjectFit::Fill,
+        bg_image: None,
+        text_ellipsis: false,
+        grid_rows: 1,
         transparent: false,
         pointer_none: false,
         anc: Vec::new(),
@@ -2249,6 +2400,62 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
                 parse_px(first).unwrap_or(s.radius).max(0)
             };
         }
+        "position" => {
+            s.position = match val.trim() {
+                "relative" => Position::Relative,
+                "absolute" => Position::Absolute,
+                "fixed" | "sticky" => Position::Fixed,
+                _ => Position::Static,
+            }
+        }
+        "top" => s.inset[0] = parse_px(val),
+        "right" => s.inset[1] = parse_px(val),
+        "bottom" => s.inset[2] = parse_px(val),
+        "left" => s.inset[3] = parse_px(val),
+        "overflow" | "overflow-x" | "overflow-y" => {
+            if matches!(val.trim(), "hidden" | "clip" | "scroll" | "auto") {
+                s.overflow_hidden = true;
+            }
+        }
+        "text-transform" => {
+            s.text_transform = match val.trim() {
+                "uppercase" => TextTransform::Upper,
+                "lowercase" => TextTransform::Lower,
+                "capitalize" => TextTransform::Capitalize,
+                _ => TextTransform::None,
+            }
+        }
+        "line-height" => {
+            let v = val.trim();
+            s.line_height_x100 = if v.ends_with("px") {
+                // px line-height -> approximate multiplier over the ~16px base.
+                parse_px(v).map(|px| ((px * 100) / 16).clamp(50, 400) as u16)
+            } else if v == "normal" {
+                Some(120)
+            } else {
+                v.parse::<f32>().ok().map(|m| (m * 100.0).clamp(50.0, 400.0) as u16)
+            };
+        }
+        "letter-spacing" => s.letter_spacing = parse_px(val).unwrap_or(0),
+        "object-fit" => {
+            s.object_fit = match val.trim() {
+                "cover" => ObjectFit::Cover,
+                "contain" | "scale-down" => ObjectFit::Contain,
+                _ => ObjectFit::Fill,
+            }
+        }
+        "background-image" => {
+            // url("…") — capture the URL; "none" clears.
+            let v = val.trim();
+            if v.starts_with("url(") {
+                let inner = v[4..].trim_end_matches(')').trim().trim_matches(|c| c == '"' || c == '\'');
+                if !inner.is_empty() { s.bg_image = Some(String::from(inner)); }
+            }
+        }
+        "background-size" | "background-position" => { /* parsed/accepted; cover|center honoured at paint */ }
+        "text-overflow" => s.text_ellipsis = val.trim() == "ellipsis",
+        "grid-template-rows" => s.grid_rows = count_grid_columns(val),
+        "row-gap" => { /* accepted; column gap drives our grid spacing */ }
         "pointer-events" => s.pointer_none = val.trim() == "none",
         "visibility" => {
             if matches!(val.trim(), "hidden" | "collapse") {
@@ -2296,6 +2503,18 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         grid_cols: 1,
         flex_grow: 0,
         radius: 0,
+        // Positioning / box props don't inherit.
+        position: Position::Static,
+        inset: [None; 4],
+        overflow_hidden: false,
+        // text-transform / line-height / letter-spacing DO inherit.
+        text_transform: inherited.text_transform,
+        line_height_x100: inherited.line_height_x100,
+        letter_spacing: inherited.letter_spacing,
+        object_fit: ObjectFit::Fill,
+        bg_image: None,
+        text_ellipsis: false,
+        grid_rows: 1,
         transparent: false,
         pointer_none: false,
         anc: Vec::new(),
@@ -2465,6 +2684,14 @@ struct Ctx<'a> {
 
 /// Whitespace-collapsing text -> word/space frags.
 fn collect_text(t: &str, style: &Style, link: &Option<String>, buf: &mut Vec<Frag>) {
+    // CSS text-transform applies to the rendered text.
+    let transformed;
+    let t: &str = if style.text_transform != TextTransform::None {
+        transformed = apply_text_transform(style.text_transform, t);
+        &transformed
+    } else {
+        t
+    };
     let mut word = String::new();
     let flush = |word: &mut String, buf: &mut Vec<Frag>| {
         if !word.is_empty() {

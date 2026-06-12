@@ -16,6 +16,21 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
+
+static DARK_DONE: AtomicBool = AtomicBool::new(false);
+
+/// True for `@media (prefers-color-scheme: dark)` (and conjunctions of it that
+/// don't also gate on a mobile max-width). Such blocks hold a site's dark theme,
+/// which matches Veil's dark desktop, so we apply them instead of skipping.
+fn is_dark_media(prelude: &str) -> bool {
+    let p = prelude.to_ascii_lowercase();
+    p.starts_with("@media")
+        && p.contains("prefers-color-scheme")
+        && p.contains("dark")
+        && !p.contains("light")
+        && !p.contains("max-width")
+}
 
 /// One compound selector: an optional tag and an optional single class.
 pub struct Sel {
@@ -169,7 +184,8 @@ pub fn parse(src: &str) -> Vec<Rule> {
                 let prelude = src[start..i].trim();
                 if prelude.starts_with('@') {
                     // @media / @keyframes / @font-face / @supports: skip the
-                    // whole (possibly nested) block.
+                    // whole (possibly nested) block — EXCEPT a dark color-scheme
+                    // media query, whose rules we DO apply (Veil renders dark).
                     let mut depth = 0;
                     let mut j = i;
                     while j < b.len() {
@@ -185,6 +201,14 @@ pub fn parse(src: &str) -> Vec<Rule> {
                             _ => {}
                         }
                         j += 1;
+                    }
+                    if is_dark_media(prelude) {
+                        // Inner content is between the outer braces (i+1 .. j-1).
+                        let inner = &src[i + 1..j.saturating_sub(1).min(src.len())];
+                        rules.extend(parse(inner));
+                        if !DARK_DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                            crate::kprintln!("CSS_DARK_OK");
+                        }
                     }
                     i = j;
                     start = j;

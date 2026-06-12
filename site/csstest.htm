@@ -1,0 +1,25 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a> | <a href="web.htm">Web</a></div>
+<style>
+.box { background-color: #2a3550; padding: calc(0.5rem + 6px); margin: 14px;
+       width: max(220px, 60px); border-radius: 14px; color: #d0e0ff; }
+.hd { font-size: clamp(20px, 5vw, 40px); color: #88c0ff; }
+.tight { padding: min(40px, 9px); color: #b0c0d0; }
+@media (prefers-color-scheme: dark) {
+  .box { background-color: #143a2a; }
+  .darkonly { color: #40e090; }
+}
+@media (prefers-color-scheme: light) {
+  .box { background-color: #ffffff; }
+  .darkonly { color: #ff0000; }
+}
+</style>
+<h1 class="hd">CSS math + dark mode</h1>
+<div class="box">A rounded card: calc() padding, max() width, dark-mode bg.</div>
+<p class="tight">Tight padding chosen by min().</p>
+<p class="darkonly">DARK MODE TEXT IS GREEN AND VISIBLE</p>
+<p><a href="web.htm">Back</a></p>
+</body>
+</html>

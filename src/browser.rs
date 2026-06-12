@@ -572,6 +572,29 @@ fn repaint_band(win: &mut Window) {
                     pfb.fill_rect(x.max(0) as usize, dy as usize, w as usize, dh as usize, color);
                 }
             }
+            &Item::RoundRect { x, y, w, h, r, color } => {
+                if w <= 0 || h <= 0 {
+                    continue;
+                }
+                let yy = y - top;
+                if yy + h <= 0 || yy >= bh {
+                    continue;
+                }
+                let r = r.min(w / 2).min(h / 2).max(0) as usize;
+                // fill_round_rect needs the whole box in-band; if it straddles a
+                // band edge, fall back to a plain fill (corners square there).
+                if yy >= 0 && yy + h <= bh && x >= 0 {
+                    pfb.fill_round_rect(x as usize, yy as usize, w as usize, h as usize, r, color);
+                    if r > 0 && !CSS_RADIUS_DONE.swap(true, Ordering::Relaxed) {
+                        kprintln!("CSS_RADIUS_OK");
+                    }
+                } else {
+                    let (dy, dh) = if yy < 0 { (0isize, h + yy) } else { (yy, h) };
+                    if dh > 0 {
+                        pfb.fill_rect(x.max(0) as usize, dy as usize, w as usize, dh as usize, color);
+                    }
+                }
+            }
             Item::Text { x, y, s, color, font, .. } => {
                 let yy = *y - top;
                 if *y >= 0 && yy >= 0 && yy < bh {
@@ -1542,6 +1565,8 @@ struct Style {
     grid_cols: usize,
     // Flex item property (this element as a child of a flex container).
     flex_grow: u32,
+    // border-radius (px) applied to the element's background box. Not inherited.
+    radius: isize,
     // Hidden-overlay detection (don't inherit). `transparent` = opacity:0,
     // `pointer_none` = pointer-events:none; an element with both is a hidden
     // overlay (e.g. a JS-toggled mobile menu) and is dropped — but opacity:0
@@ -1576,6 +1601,7 @@ fn root_style() -> Style {
         gap: 0,
         grid_cols: 1,
         flex_grow: 0,
+        radius: 0,
         transparent: false,
         pointer_none: false,
         anc: Vec::new(),
@@ -1650,29 +1676,213 @@ fn readable(fg: u32, bg: u32) -> u32 {
         | mix(fg & 0xff, target & 0xff)
 }
 
-/// Parse a length to pixels, supporting px, rem/em (1 unit ≈ 16px), pt, and
-/// bare numbers. Relative/computed units (%, vw, clamp(), calc()) are unknown.
+static CSS_CALC_DONE: AtomicBool = AtomicBool::new(false);
+static CSS_RADIUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Parse a length to pixels, supporting px, rem/em (1 unit ≈ 16px), pt, bare
+/// numbers, and the CSS math functions `calc()`, `clamp()`, `min()`, `max()`.
+/// Viewport/percent-relative units (%, vw, vh) have no basis here, so a term in
+/// them is treated as unresolvable (dropped from min/max, fails calc).
 fn parse_px(v: &str) -> Option<isize> {
+    eval_len(v.trim())
+}
+
+/// The inner argument string of a `name(...)` call, if `s` is exactly that call.
+fn fn_args<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let s = s.trim();
+    let rest = s.strip_prefix(name)?.strip_prefix('(')?;
+    rest.strip_suffix(')')
+}
+
+/// Split on top-level commas (not inside nested parens).
+fn split_top(s: &str) -> Vec<&str> {
+    let (mut depth, mut start) = (0i32, 0usize);
+    let mut out = Vec::new();
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
+}
+
+/// Evaluate a CSS length (incl. math functions) to pixels.
+fn eval_len(v: &str) -> Option<isize> {
     let v = v.trim();
-    let (num, mul, div) = if let Some(n) = v.strip_suffix("px") {
+    let lower = v.to_ascii_lowercase();
+    if let Some(inner) = fn_args(&lower, "clamp") {
+        let p = split_top(inner);
+        if p.len() == 3 {
+            css_calc_seen();
+            let (lo, mid, hi) = (eval_len(p[0]), eval_len(p[1]), eval_len(p[2]));
+            return match (lo, mid, hi) {
+                (Some(lo), Some(m), Some(hi)) => Some(m.clamp(lo.min(hi), lo.max(hi))),
+                // The preferred (vw-based) term is unknown: use the floor/ceil mean.
+                (Some(lo), None, Some(hi)) => Some((lo + hi) / 2),
+                (lo, m, hi) => m.or(hi).or(lo),
+            };
+        }
+    }
+    if let Some(inner) = fn_args(&lower, "min") {
+        css_calc_seen();
+        return split_top(inner).iter().filter_map(|p| eval_len(p)).min();
+    }
+    if let Some(inner) = fn_args(&lower, "max") {
+        css_calc_seen();
+        return split_top(inner).iter().filter_map(|p| eval_len(p)).max();
+    }
+    if let Some(inner) = fn_args(&lower, "calc") {
+        css_calc_seen();
+        return eval_calc(inner);
+    }
+    parse_len_unit(v)
+}
+
+fn css_calc_seen() {
+    if !CSS_CALC_DONE.swap(true, Ordering::Relaxed) {
+        kprintln!("CSS_CALC_OK");
+    }
+}
+
+/// A plain length token (px/rem/em/pt/number) to pixels. None for unknown units.
+fn parse_len_unit(v: &str) -> Option<isize> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    // Reject units we can't resolve to a fixed px (so calc/min/max drop them).
+    let lower = v.to_ascii_lowercase();
+    if lower.ends_with('%') || lower.ends_with("vw") || lower.ends_with("vh")
+        || lower.ends_with("vmin") || lower.ends_with("vmax")
+    {
+        return None;
+    }
+    let (num, mul, div) = if let Some(n) = lower.strip_suffix("px") {
         (n, 1, 1)
-    } else if let Some(n) = v.strip_suffix("rem") {
+    } else if let Some(n) = lower.strip_suffix("rem") {
         (n, 16, 1)
-    } else if let Some(n) = v.strip_suffix("em") {
+    } else if let Some(n) = lower.strip_suffix("em") {
         (n, 16, 1)
-    } else if let Some(n) = v.strip_suffix("pt") {
+    } else if let Some(n) = lower.strip_suffix("pt") {
         (n, 4, 3) // 1pt = 4/3 px
     } else {
-        (v, 1, 1)
+        (lower.as_str(), 1, 1)
     };
     // Decimal number in tenths (e.g. "2.5" -> 25), to keep integer math.
     let n = num.trim();
+    if !n.is_empty() && !n.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+') {
+        return None; // not a number (e.g. "auto")
+    }
+    let n = n.trim_start_matches('+');
     let (int, frac) = n.split_once('.').unwrap_or((n, ""));
     let neg = int.starts_with('-');
     let i: isize = int.trim_start_matches('-').parse().ok().or(int.is_empty().then_some(0))?;
     let f = frac.bytes().next().map_or(0, |b| (b.wrapping_sub(b'0')).min(9) as isize);
     let tenths = i * 10 + f;
     Some((if neg { -tenths } else { tenths }) * mul / div / 10)
+}
+
+/// Evaluate a `calc()` arithmetic expression (+ - * /, parens) over length
+/// terms, in pixels. Returns None if any term uses an unresolvable unit.
+fn eval_calc(expr: &str) -> Option<isize> {
+    let toks = calc_tokens(expr)?;
+    let mut pos = 0;
+    let v = calc_expr(&toks, &mut pos)?;
+    (pos == toks.len()).then_some(v)
+}
+
+#[derive(Clone)]
+enum CalcTok {
+    Num(isize), // pixels
+    Op(char),
+    Open,
+    Close,
+}
+
+fn calc_tokens(s: &str) -> Option<Vec<CalcTok>> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'(' {
+            out.push(CalcTok::Open);
+            i += 1;
+        } else if c == b')' {
+            out.push(CalcTok::Close);
+            i += 1;
+        } else if matches!(c, b'+' | b'-' | b'*' | b'/')
+            // a leading '-' on a term (not after a number/close) is a sign, not an op
+            && !(matches!(c, b'+' | b'-')
+                && !matches!(out.last(), Some(CalcTok::Num(_)) | Some(CalcTok::Close)))
+        {
+            out.push(CalcTok::Op(c as char));
+            i += 1;
+        } else {
+            // A length term: number + optional sign/unit, up to the next op/paren/space.
+            let start = i;
+            if matches!(b[i], b'+' | b'-') {
+                i += 1;
+            }
+            while i < b.len()
+                && !b[i].is_ascii_whitespace()
+                && !matches!(b[i], b'(' | b')' | b'*' | b'/')
+                && !(matches!(b[i], b'+' | b'-') && i > start)
+            {
+                i += 1;
+            }
+            out.push(CalcTok::Num(parse_len_unit(&s[start..i])?));
+        }
+    }
+    Some(out)
+}
+
+// Recursive-descent: expr = term (('+'|'-') term)*, term = factor (('*'|'/') factor)*.
+fn calc_expr(t: &[CalcTok], pos: &mut usize) -> Option<isize> {
+    let mut acc = calc_term(t, pos)?;
+    while let Some(CalcTok::Op(op @ ('+' | '-'))) = t.get(*pos) {
+        let op = *op;
+        *pos += 1;
+        let rhs = calc_term(t, pos)?;
+        acc = if op == '+' { acc + rhs } else { acc - rhs };
+    }
+    Some(acc)
+}
+
+fn calc_term(t: &[CalcTok], pos: &mut usize) -> Option<isize> {
+    let mut acc = calc_factor(t, pos)?;
+    while let Some(CalcTok::Op(op @ ('*' | '/'))) = t.get(*pos) {
+        let op = *op;
+        *pos += 1;
+        let rhs = calc_factor(t, pos)?;
+        acc = if op == '*' { acc * rhs } else if rhs != 0 { acc / rhs } else { acc };
+    }
+    Some(acc)
+}
+
+fn calc_factor(t: &[CalcTok], pos: &mut usize) -> Option<isize> {
+    match t.get(*pos)? {
+        CalcTok::Num(n) => {
+            *pos += 1;
+            Some(*n)
+        }
+        CalcTok::Open => {
+            *pos += 1;
+            let v = calc_expr(t, pos)?;
+            matches!(t.get(*pos), Some(CalcTok::Close)).then(|| *pos += 1)?;
+            Some(v)
+        }
+        _ => None,
+    }
 }
 
 // CSS custom properties for the current document. Rendering is single-threaded
@@ -1843,6 +2053,16 @@ fn apply_decl(s: &mut Style, prop: &str, val: &str) {
             let v = val.trim();
             s.transparent = !v.is_empty() && v.bytes().all(|b| b == b'0' || b == b'.');
         }
+        "border-radius" => {
+            // First radius (px); percentages clamp to half the (unknown) box,
+            // so a large fallback that paint will cap at min(w,h)/2.
+            let first = val.split_whitespace().next().unwrap_or(val);
+            s.radius = if first.ends_with('%') {
+                9999
+            } else {
+                parse_px(first).unwrap_or(s.radius).max(0)
+            };
+        }
         "pointer-events" => s.pointer_none = val.trim() == "none",
         "visibility" => {
             if matches!(val.trim(), "hidden" | "collapse") {
@@ -1889,6 +2109,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
         gap: 0,
         grid_cols: 1,
         flex_grow: 0,
+        radius: 0,
         transparent: false,
         pointer_none: false,
         anc: Vec::new(),
@@ -1986,6 +2207,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
 
 enum Item {
     Rect { x: isize, y: isize, w: isize, h: isize, color: u32 },
+    RoundRect { x: isize, y: isize, w: isize, h: isize, r: isize, color: u32 },
     Text { x: isize, y: isize, s: String, color: u32, scale: usize, font: Font },
     Image { x: isize, y: isize, w: isize, h: isize, idx: usize },
 }
@@ -2505,10 +2727,12 @@ fn layout_block(
 
     let bottom = cy + style.padding[2];
     if let Some(bg) = style.bg {
-        ctx.items.insert(
-            bg_at,
-            Item::Rect { x: bx, y: top, w: bw, h: bottom - top, color: bg },
-        );
+        let item = if style.radius > 0 {
+            Item::RoundRect { x: bx, y: top, w: bw, h: bottom - top, r: style.radius, color: bg }
+        } else {
+            Item::Rect { x: bx, y: top, w: bw, h: bottom - top, color: bg }
+        };
+        ctx.items.insert(bg_at, item);
     }
     ctx.cur_form = prev_form;
     bottom + style.margin[2]
@@ -2643,7 +2867,7 @@ fn item_right(it: &Item, ctx: &Ctx) -> isize {
     match it {
         Item::Text { x, s, scale, font, .. } => x + text_w(s, *scale, *font),
         Item::Image { x, w, .. } => x + w,
-        Item::Rect { x, w, .. } => x + w,
+        Item::Rect { x, w, .. } | Item::RoundRect { x, w, .. } => x + w,
     }
 }
 
@@ -2675,7 +2899,7 @@ fn measure_item(
     // Content width from text/image items only (ignore full-width bg rects).
     let mut content_w = 0;
     for it in &tmp.items {
-        if !matches!(it, Item::Rect { .. }) {
+        if !matches!(it, Item::Rect { .. } | Item::RoundRect { .. }) {
             content_w = content_w.max(item_right(it, ctx));
         }
     }
@@ -2695,7 +2919,10 @@ fn place(
 ) {
     for it in &mut items {
         match it {
-            Item::Rect { x, y, .. } | Item::Text { x, y, .. } | Item::Image { x, y, .. } => {
+            Item::Rect { x, y, .. }
+            | Item::RoundRect { x, y, .. }
+            | Item::Text { x, y, .. }
+            | Item::Image { x, y, .. } => {
                 *x += dx;
                 *y += dy;
             }

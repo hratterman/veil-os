@@ -279,7 +279,8 @@ WEB = page("""<h1>The Real Web</h1>
 <a href="cssvar.htm">CSS variables test</a> -
 <a href="flextest.htm">Flexbox test</a> - <a href="fonttest.htm">Fonts test</a> -
 <a href="navtest.htm">Nav/selector test</a> -
-<a href="formtest.htm">Form input test</a></p>
+<a href="formtest.htm">Form input test</a> -
+<a href="csstest.htm">CSS math/dark test</a></p>
 <p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
@@ -369,6 +370,26 @@ NAVTEST = page("""<style>
 </nav>
 <div class="overlay">HIDDEN OVERLAY MENU SHOULD NOT APPEAR</div>
 <p class="reveal">REVEAL CONTENT STAYS VISIBLE</p>
+<p><a href="web.htm">Back</a></p>""")
+
+CSSTEST = page("""<style>
+.box { background-color: #2a3550; padding: calc(0.5rem + 6px); margin: 14px;
+       width: max(220px, 60px); border-radius: 14px; color: #d0e0ff; }
+.hd { font-size: clamp(20px, 5vw, 40px); color: #88c0ff; }
+.tight { padding: min(40px, 9px); color: #b0c0d0; }
+@media (prefers-color-scheme: dark) {
+  .box { background-color: #143a2a; }
+  .darkonly { color: #40e090; }
+}
+@media (prefers-color-scheme: light) {
+  .box { background-color: #ffffff; }
+  .darkonly { color: #ff0000; }
+}
+</style>
+<h1 class="hd">CSS math + dark mode</h1>
+<div class="box">A rounded card: calc() padding, max() width, dark-mode bg.</div>
+<p class="tight">Tight padding chosen by min().</p>
+<p class="darkonly">DARK MODE TEXT IS GREEN AND VISIBLE</p>
 <p><a href="web.htm">Back</a></p>""")
 
 IMGTEST = page("""<h1>External images</h1>
@@ -637,7 +658,7 @@ def main():
         "wiki.htm": WIKI, "gallery.htm": GALLERY, "ascii.htm": ASCII,
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
         "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST, "fonttest.htm": FONTTEST,
-        "navtest.htm": NAVTEST, "formtest.htm": FORMTEST,
+        "navtest.htm": NAVTEST, "formtest.htm": FORMTEST, "csstest.htm": CSSTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

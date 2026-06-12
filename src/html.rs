@@ -95,10 +95,50 @@ pub fn decode_entities(s: &str) -> String {
                     "quot" => Some('"'),
                     "apos" => Some('\''),
                     "nbsp" => Some(' '),
-                    _ => ent
-                        .strip_prefix('#')
-                        .and_then(|n| n.parse::<u32>().ok())
-                        .and_then(char::from_u32),
+                    "raquo" => Some('»'),
+                    "laquo" => Some('«'),
+                    "mdash" => Some('—'),
+                    "ndash" => Some('–'),
+                    "hellip" => Some('…'),
+                    "copy" => Some('©'),
+                    "reg" => Some('®'),
+                    "trade" => Some('™'),
+                    "rsquo" | "rsquor" => Some('\u{2019}'),
+                    "lsquo" => Some('\u{2018}'),
+                    "rdquo" => Some('\u{201D}'),
+                    "ldquo" => Some('\u{201C}'),
+                    "bull" => Some('•'),
+                    "middot" => Some('·'),
+                    "deg" => Some('°'),
+                    "plusmn" => Some('±'),
+                    "times" => Some('×'),
+                    "divide" => Some('÷'),
+                    "euro" => Some('€'),
+                    "pound" => Some('£'),
+                    "cent" => Some('¢'),
+                    "yen" => Some('¥'),
+                    "sect" => Some('§'),
+                    "para" => Some('¶'),
+                    "dagger" => Some('†'),
+                    "frac12" => Some('½'),
+                    "frac14" => Some('¼'),
+                    "frac34" => Some('¾'),
+                    "larr" => Some('←'),
+                    "rarr" => Some('→'),
+                    "uarr" => Some('↑'),
+                    "darr" => Some('↓'),
+                    "check" => Some('✓'),
+                    "star" => Some('★'),
+                    "ensp" | "emsp" | "thinsp" => Some(' '),
+                    _ => ent.strip_prefix('#').and_then(|n| {
+                        // Numeric character reference: &#NNN; (decimal) or &#xHH; (hex).
+                        let cp = if let Some(h) = n.strip_prefix(['x', 'X']) {
+                            u32::from_str_radix(h, 16).ok()
+                        } else {
+                            n.parse::<u32>().ok()
+                        };
+                        cp.and_then(char::from_u32)
+                    }),
                 };
                 if let Some(c) = rep {
                     out.push(c);

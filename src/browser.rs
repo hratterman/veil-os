@@ -913,6 +913,19 @@ fn resolve_href(href: &str) -> String {
     }
 }
 
+/// Compatibility shim for sites whose default front end is a JS-only SPA we
+/// can't run: rewrite them to a server-rendered equivalent. Reddit's new site
+/// renders blank without its React bundle, but old.reddit.com serves real HTML
+/// (a readable post list), so transparently route reddit.com there.
+fn compat_rewrite(url: &str) -> String {
+    for prefix in ["https://www.reddit.com", "https://reddit.com", "http://www.reddit.com", "http://reddit.com"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return format!("https://old.reddit.com{rest}");
+        }
+    }
+    String::from(url)
+}
+
 /// Derive a FAT16 8.3 filename for a downloaded resource from its URL and, as a
 /// fallback for the extension, its content type. e.g. "/docs/report.pdf?v=2" +
 /// "application/pdf" -> "REPORT.PDF"; "/dl" + "application/zip" -> "DL.ZIP".
@@ -2645,7 +2658,7 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
 /// Navigate, optionally POSTing `body` (form submission). The body is sent only
 /// on the first request; any 302/303 redirect is then followed with a GET.
 pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_click: bool) {
-    let path = resolve_href(path);
+    let path = compat_rewrite(&resolve_href(path));
     let was_external = is_external(&path);
     let path_for_log = path.clone();
     // Set the base so this page's relative stylesheets/images/links resolve
@@ -2691,7 +2704,7 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
                 };
                 kprintln!("BROWSER: following redirect -> {next}");
                 set_page_base(if is_external(&next) { Some(next.clone()) } else { None });
-                path = next;
+                path = compat_rewrite(&next);
                 continue;
             }
             result = Some((s, c, b));

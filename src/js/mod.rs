@@ -39,9 +39,17 @@ pub struct JsResult {
 /// Run `scripts` (in document order) against the DOM of `tree`, returning the
 /// mutated tree. Each script's source is executed in the same global context,
 /// so later scripts see earlier definitions (shared.js → content.js → inline).
+/// The IndexedDB polyfill, injected ahead of page scripts that use it (backed
+/// by localStorage, which persists per-origin to FAT16).
+pub const INDEXEDDB_POLYFILL: &str = include_str!("../../assets/js/indexeddb.js");
+
 pub fn run(tree: &Node, scripts: &[String]) -> JsResult {
     let dom = dom::Dom::from_tree(tree);
     let mut it = interp::Interp::new(dom);
+    // Inject the IndexedDB polyfill once if any script references it.
+    if scripts.iter().any(|s| s.contains("indexedDB")) {
+        it.run(INDEXEDDB_POLYFILL);
+    }
     for src in scripts {
         it.run(src);
     }
@@ -301,6 +309,50 @@ pub fn canvas_selftest() {
         crate::kprintln!("CANVAS_OK: from-scratch <canvas> 2D context — fillRect, arc fill, stroked line, fillText all rasterized");
     } else {
         crate::kprintln!("CANVAS_FAIL: red={red_ok} green={green_ok} blue={blue_ok} text={text_px}");
+    }
+}
+
+/// IndexedDB self-test: open a db, create a store, put two structured records,
+/// read one back and getAll, writing the round-tripped result into a DOM node.
+/// Exercises the polyfill end to end (async requests drained via setTimeout).
+pub fn indexeddb_selftest() {
+    let skeleton = "<html><body><div id=out></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        const out = document.getElementById('out');
+        const req = indexedDB.open('veildb', 1);
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          db.createObjectStore('notes', { keyPath: 'id' });
+        };
+        req.onsuccess = (e) => {
+          const db = e.target.result;
+          const tx = db.transaction(['notes'], 'readwrite');
+          const store = tx.objectStore('notes');
+          store.put({ id: 1, title: 'hello', tags: ['a', 'b'] });
+          store.put({ id: 2, title: 'world', tags: ['c'] });
+          const getReq = store.get(2);
+          getReq.onsuccess = (ev) => {
+            const rec = ev.target.result;
+            const allReq = store.getAll();
+            allReq.onsuccess = (ev2) => {
+              const all = ev2.target.result;
+              out.textContent = 'got=' + rec.title + ' tags=' + rec.tags.join('-') +
+                ' count=' + all.length + ' first=' + all[0].title;
+            };
+          };
+        };
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    let out = node_text_by_id(&res.tree, "out");
+    crate::kprintln!("JS_IDB: {out}");
+    if !res.errors.is_empty() {
+        crate::kprintln!("JS_IDB: {} issue(s); first: {}", res.errors.len(), res.errors[0]);
+    }
+    if out.contains("got=world") && out.contains("tags=c") && out.contains("count=2") && out.contains("first=hello") {
+        crate::kprintln!("IDB_OK: IndexedDB open/createObjectStore/put/get/getAll round-trip (structured records)");
+    } else {
+        crate::kprintln!("IDB_FAIL: {out}");
     }
 }
 

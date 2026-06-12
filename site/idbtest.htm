@@ -1,0 +1,27 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="nav"><a href="index.htm">Home</a> | <a href="news.htm">News</a> | <a href="wiki.htm">Wiki</a> | <a href="gallery.htm">Gallery</a> | <a href="ascii.htm">ASCII</a> | <a href="tips.htm">Tips</a> | <a href="changes.htm">Changelog</a> | <a href="about.htm">About</a> | <a href="web.htm">Web</a></div>
+<h1>IndexedDB persistence</h1>
+<p>This counter is stored in IndexedDB and survives reloads:</p>
+<p id="status">working...</p>
+<script>
+const req = indexedDB.open('counters', 1);
+req.onupgradeneeded = (e) => { e.target.result.createObjectStore('c', { keyPath: 'id' }); };
+req.onsuccess = (e) => {
+  const db = e.target.result;
+  const tx = db.transaction(['c'], 'readwrite');
+  const s = tx.objectStore('c');
+  const g = s.get('visits');
+  g.onsuccess = (ev) => {
+    const cur = ev.target.result ? ev.target.result.n : 0;
+    const next = cur + 1;
+    s.put({ id: 'visits', n: next, when: 'now' });
+    document.getElementById('status').textContent = 'IndexedDB visit count: ' + next;
+    console.log('IDB_PAGE visits=' + next);
+  };
+};
+</script>
+<p><a href="web.htm">Back</a></p>
+</body>
+</html>

@@ -281,7 +281,8 @@ WEB = page("""<h1>The Real Web</h1>
 <a href="navtest.htm">Nav/selector test</a> -
 <a href="formtest.htm">Form input test</a> -
 <a href="csstest.htm">CSS math/dark test</a> -
-<a href="canvas.htm">Canvas chart test</a></p>
+<a href="canvas.htm">Canvas chart test</a> -
+<a href="idbtest.htm">IndexedDB test</a></p>
 <p><a href="https://henryratterman.com">henryratterman.com</a> - the real acceptance test (direct TLS)</p>
 <div class="card">
 <p>These links leave the island. The browser hands the full URL to a small
@@ -391,6 +392,28 @@ CSSTEST = page("""<style>
 <div class="box">A rounded card: calc() padding, max() width, dark-mode bg.</div>
 <p class="tight">Tight padding chosen by min().</p>
 <p class="darkonly">DARK MODE TEXT IS GREEN AND VISIBLE</p>
+<p><a href="web.htm">Back</a></p>""")
+
+IDBTEST = page("""<h1>IndexedDB persistence</h1>
+<p>This counter is stored in IndexedDB and survives reloads:</p>
+<p id="status">working...</p>
+<script>
+const req = indexedDB.open('counters', 1);
+req.onupgradeneeded = (e) => { e.target.result.createObjectStore('c', { keyPath: 'id' }); };
+req.onsuccess = (e) => {
+  const db = e.target.result;
+  const tx = db.transaction(['c'], 'readwrite');
+  const s = tx.objectStore('c');
+  const g = s.get('visits');
+  g.onsuccess = (ev) => {
+    const cur = ev.target.result ? ev.target.result.n : 0;
+    const next = cur + 1;
+    s.put({ id: 'visits', n: next, when: 'now' });
+    document.getElementById('status').textContent = 'IndexedDB visit count: ' + next;
+    console.log('IDB_PAGE visits=' + next);
+  };
+};
+</script>
 <p><a href="web.htm">Back</a></p>""")
 
 CANVASTEST = page("""<h1>Canvas bar chart</h1>
@@ -691,7 +714,7 @@ def main():
         "tips.htm": TIPS, "about.htm": ABOUT, "changes.htm": CHANGES,
         "web.htm": WEB, "imgtest.htm": IMGTEST, "cssvar.htm": CSSVAR, "flextest.htm": FLEXTEST, "fonttest.htm": FONTTEST,
         "navtest.htm": NAVTEST, "formtest.htm": FORMTEST, "csstest.htm": CSSTEST,
-        "canvas.htm": CANVASTEST,
+        "canvas.htm": CANVASTEST, "idbtest.htm": IDBTEST,
         "style.css": STYLE,
     }
     for name, text in pages.items():

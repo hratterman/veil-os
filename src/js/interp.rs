@@ -1656,6 +1656,8 @@ impl Interp {
                 "innerHeight" => Val::Num(768.0),
                 "devicePixelRatio" => Val::Num(1.0),
                 "scrollY" | "scrollX" | "pageYOffset" => Val::Num(0.0),
+                // window.indexedDB resolves to the polyfilled global.
+                "indexedDB" => self.global_val("indexedDB").unwrap_or(Val::Undef),
                 _ => Val::Native(Native::Method(Box::new(Val::Host(Host::Window)), Rc::from(prop))),
             },
             Host::Math => match prop {

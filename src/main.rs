@@ -126,6 +126,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::es6_selftest(); // M41: ES6+ engine (classes/async/await/Map/Set/...)
         js::jit_selftest(); // M41: native AArch64 JS JIT for numeric hot loops
         js::canvas_selftest(); // M41: from-scratch <canvas> 2D rendering context
+        js::indexeddb_selftest(); // M41: IndexedDB polyfill round-trip
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
     }
     milestone9();

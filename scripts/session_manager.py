@@ -326,7 +326,11 @@ class Manager:
             # M28: wav backend writes PCM to the per-session FIFO tap.
             "-audiodev", f"wav,id=snd0,path={s.fifo}",
             "-device", "virtio-sound-device,audiodev=snd0",
-            "-vnc", f"127.0.0.1:{s.vnc}",
+            # M42 step 10 (multiplayer): share=ignore keeps the framebuffer open
+            # to multiple simultaneous VNC clients (the second visitor on a
+            # shared session link), so QEMU multiplexes both users' mouse/keyboard
+            # into one desktop instead of disconnecting the first client.
+            "-vnc", f"127.0.0.1:{s.vnc},share=ignore",
             "-qmp", f"unix:{s.qmp},server,nowait",
             "-serial", f"file:{s.serial}",
             "-no-reboot", "-semihosting",
@@ -445,6 +449,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "closed")
         if u.path == "/healthz":
             return self._send(200, "ok\n", "text/plain")
+        # M42 step 10 (multiplayer): a "Share Desktop" link for an existing
+        # session. A second visitor opening /share?session=<id> joins the SAME
+        # running QEMU (get_or_create reuses the session), and because QEMU's VNC
+        # is share=ignore both clients see the same framebuffer and both mouse +
+        # keyboard streams multiplex into the one desktop.
+        if u.path == "/share":
+            sid = parse_qs(u.query).get("session", [""])[0]
+            with MGR.lock:
+                exists = sid in MGR.sessions
+            if not sid or not exists:
+                return self._send(404, "no such session to share")
+            join = f"/session/{sid}/vnc.html?path=session/{sid}/websockify&autoconnect=true&shared=true"
+            return self._redirect(join)
         if u.path.startswith("/session/"):
             parts = u.path.split("/", 3)
             rest = parts[3] if len(parts) > 3 else ""

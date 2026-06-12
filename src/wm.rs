@@ -349,6 +349,82 @@ fn wallpaper() -> Option<&'static crate::png::Image> {
     }
 }
 
+/// M42 step 10 self-test: the multiplayer desktop's kernel-side pieces — render
+/// two remote users' labeled colored cursors into a framebuffer and exercise the
+/// peer registry (add with distinct colors, move by id without duplicating,
+/// remove). The session-manager multiplexing lives in `scripts/session_manager.py`.
+pub fn multiplayer_selftest() {
+    let (w, h) = (320usize, 240usize);
+    let mut buf = vec![0u32; w * h];
+    let fb = unsafe { Framebuffer::new(buf.as_mut_ptr(), w, h, w * 4) };
+    // Render two peer cursors at distinct positions in distinct colors.
+    draw_peer_cursor(&fb, 50, 50, 0xff_ff5252, "alice");   // red
+    draw_peer_cursor(&fb, 200, 150, 0xff_42a5f5, "bob");   // blue
+    let red = fb.get_pixel(52, 56);    // inside alice's triangle
+    let blue = fb.get_pixel(202, 156); // inside bob's triangle
+    let bg = fb.get_pixel(5, 5);       // untouched background
+    let red_ok = ((red >> 16) & 0xff) > 150 && (red & 0xff) < 120;
+    let blue_ok = (blue & 0xff) > 150 && ((blue >> 16) & 0xff) < 120;
+    let bg_ok = bg == 0;
+
+    // Peer registry: add two (distinct colors), move one by id, remove one.
+    let mut wm = Wm::new(fb, (32767, 32767));
+    wm.set_peer_cursor(1, "alice", 10, 10);
+    wm.set_peer_cursor(2, "bob", 20, 20);
+    let two = wm.peer_count() == 2;
+    let distinct = wm.peers().len() == 2 && wm.peers()[0].color != wm.peers()[1].color;
+    wm.set_peer_cursor(1, "alice", 99, 88); // update, not duplicate
+    let moved = wm.peer_count() == 2
+        && wm.peers().iter().find(|p| p.id == 1).map(|p| p.x == 99 && p.y == 88).unwrap_or(false);
+    wm.remove_peer(2);
+    let removed = wm.peer_count() == 1 && wm.peers()[0].id == 1;
+
+    crate::kprintln!(
+        "MP: red={red_ok} blue={blue_ok} bg={bg_ok} two={two} distinct={distinct} moved={moved} removed={removed}"
+    );
+    if red_ok && blue_ok && bg_ok && two && distinct && moved && removed {
+        crate::kprintln!("MULTIPLAYER_OK: shared-desktop multi-cursor — two labeled colored peer cursors render + a peer registry (add/move-by-id/remove); session multiplexing in scripts/session_manager.py");
+    } else {
+        crate::kprintln!("MULTIPLAYER_FAIL: red={red_ok} blue={blue_ok} two={two} distinct={distinct} moved={moved} removed={removed}");
+    }
+    // keep buf alive until here
+    let _ = buf.len();
+}
+
+/// Render a remote user's pointer: a filled arrow in their color with a black
+/// outline, plus a small rounded name tag below-right. Used for the shared
+/// (multiplayer) desktop so each user sees who is where.
+fn draw_peer_cursor(fb: &Framebuffer, mx: isize, my: isize, color: u32, label: &str) {
+    const B: u32 = 0xff00_0000;
+    let put = |x: isize, y: isize, c: u32| {
+        if x >= 0 && y >= 0 && (x as usize) < fb.width && (y as usize) < fb.height {
+            fb.put_pixel(x as usize, y as usize, c);
+        }
+    };
+    // A small solid triangle arrow (10 rows) in the peer's color + outline.
+    for r in 0..12isize {
+        for c in 0..=r.min(8) {
+            put(mx + c, my + r, color);
+        }
+        // black outline along the right hypotenuse + bottom
+        put(mx + r.min(8) + 1, my + r, B);
+        put(mx - 1, my + r, B);
+    }
+    for c in 0..=8 {
+        put(mx + c, my + 12, B);
+    }
+    // Name tag.
+    if !label.is_empty() {
+        let tag = if label.len() > 10 { &label[..10] } else { label };
+        let tw = crate::glyph_cache::text_width(tag, FontId::Ui, 12) as usize + 10;
+        let (tx, ty) = ((mx + 12).max(0) as usize, (my + 10).max(0) as usize);
+        if tx + tw < fb.width && ty + 18 < fb.height {
+            fb.fill_round_rect(tx, ty, tw, 18, 5, color);
+            fb.draw_text(tx + 5, ty + 3, tag, FontId::Ui, 12, 0xffff_ffff);
+        }
+    }
+}
+
 /// Render the pointer at (mx, my) in the requested shape. White fill with a
 /// black outline so it reads on any background.
 fn draw_cursor(fb: &Framebuffer, mx: isize, my: isize, shape: CursorShape) {
@@ -602,6 +678,20 @@ pub struct Wm {
     menu: Option<ContextMenu>,         // open right-click menu
     flash: u64,                        // screenshot flash effect expiry tick
     file_drag: Option<FileDrag>,       // dragging a file out of the file manager
+    // M42 step 10 (multiplayer): other users sharing this session. The session
+    // manager streams their cursor positions; each renders as a labeled colored
+    // pointer so everyone sees who is where.
+    peers: Vec<PeerCursor>,
+}
+
+/// A remote user's cursor in a shared session.
+#[derive(Clone)]
+pub struct PeerCursor {
+    pub id: u32,
+    pub label: String,
+    pub color: u32,
+    pub x: isize,
+    pub y: isize,
 }
 
 /// A file being dragged out of the file manager.
@@ -657,7 +747,39 @@ impl Wm {
             menu: None,
             flash: 0,
             file_drag: None,
+            peers: Vec::new(),
         }
+    }
+
+    /// Register or move a peer cursor (called when the session manager relays a
+    /// remote user's mouse). Adds the peer on first sight; updates position
+    /// otherwise. A distinct color is assigned per id.
+    pub fn set_peer_cursor(&mut self, id: u32, label: &str, x: isize, y: isize) {
+        const PALETTE: [u32; 6] = [
+            0xff_ff5252, 0xff_4caf50, 0xff_42a5f5, 0xff_ffb300, 0xff_ab47bc, 0xff_26c6da,
+        ];
+        if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
+            p.x = x;
+            p.y = y;
+            p.label = String::from(label);
+        } else {
+            let color = PALETTE[self.peers.len() % PALETTE.len()];
+            self.peers.push(PeerCursor { id, label: String::from(label), color, x, y });
+        }
+        self.dirty = true;
+    }
+
+    pub fn remove_peer(&mut self, id: u32) {
+        self.peers.retain(|p| p.id != id);
+        self.dirty = true;
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn peers(&self) -> &[PeerCursor] {
+        &self.peers
     }
 
     /// Show a transient toast in the bottom-right (auto-dismiss ~3s).
@@ -2411,6 +2533,12 @@ impl Wm {
         // Screenshot flash.
         if timer::ticks() < self.flash {
             back.blend_rect(0, 0, w, h, 0xffff_ffff, 160);
+        }
+
+        // Peer cursors (multiplayer): each remote user's pointer in their color,
+        // with a small name tag, drawn under the local cursor.
+        for p in &self.peers {
+            draw_peer_cursor(&back, p.x, p.y, p.color, &p.label);
         }
 
         // Cursor, always on top, shape depends on what is under it.

@@ -364,6 +364,70 @@ pub fn indexeddb_selftest() {
 /// the engine fixes this step landed (comma-sequence side effects, regex
 /// literals, labeled statements, Object.is/Symbol.for). Writes a summary into a
 /// DOM node and reads it back. Emits DOMAPI_OK.
+pub const REACT_UMD: &str = include_str!("../../assets/js/vendor/react.production.min.js");
+pub const REACT_DOM_UMD: &str = include_str!("../../assets/js/vendor/react-dom.production.min.js");
+
+/// Locate the first brace-nesting parser desync in `src` (or none). Prints the
+/// surrounding tokens so the breaking construct can be identified.
+pub fn locate_desync(label: &str, src: &str) -> bool {
+    let toks = lexer::tokenize(src);
+    let (_prog, bad) = parser::parse_locate(toks.clone());
+    if bad == usize::MAX {
+        crate::kprintln!("RLOC {label}: clean (no block desync)");
+        return false;
+    }
+    let win = |center: usize| {
+        let a = center.saturating_sub(14);
+        let b = (center + 14).min(toks.len());
+        (a..b).map(|i| {
+            let t = parser::tok_str(&toks, i);
+            if i == center { alloc::format!("[{t}]") } else { t }
+        }).collect::<Vec<_>>().join(" ")
+    };
+    crate::kprintln!("RLOC {label}: desync at tok {bad}: {}", win(bad));
+    true
+}
+
+/// React self-test (M42 step 1, in progress): load real React 18 + ReactDOM 18
+/// (production UMD) and attempt to mount `<h1>Hello from React</h1>` into `#root`.
+/// STATUS: both bundles parse + load + define their globals, `createRoot` works
+/// and `render` resolves via the prototype chain, and the reconciler runs — but
+/// the final host-commit doesn't yet append the element (deep reconciler issue;
+/// see PROGRESS.md / btw.md). Not wired into the boot sequence yet (it is slow
+/// and does not pass); kept for the next session to finish `REACT_OK`.
+pub fn react_selftest() {
+    locate_desync("react.js", REACT_UMD);
+    locate_desync("react-dom.js", REACT_DOM_UMD);
+    let skeleton = "<html><body><div id=root></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let app = r#"
+        var rd = document.getElementById('root');
+        var root = ReactDOM.createRoot(rd);
+        root.render(React.createElement('h1', null, 'Hello from React'));
+    "#;
+    let dom = dom::Dom::from_tree(&tree);
+    let mut it = interp::Interp::new(dom);
+    it.run(REACT_UMD); it.run(REACT_DOM_UMD); it.run(app); it.drain_deferred();
+    let loaded = it.global.borrow().vars.contains_key("React") && it.global.borrow().vars.contains_key("ReactDOM");
+    let res = JsResult { tree: it.dom.to_tree(), errors: it.errors, canvases: Vec::new() };
+    let h1 = node_text_by_tag(&res.tree, "h1");
+    if h1.contains("Hello from React") {
+        crate::kprintln!("REACT_OK: React 18 mounted + rendered <h1>Hello from React</h1> into #root");
+    } else {
+        crate::kprintln!("REACT_PARTIAL: React+ReactDOM loaded={loaded}; reconciler runs but host-commit not yet wired");
+    }
+}
+
+fn node_text_by_tag(tree: &Node, tag: &str) -> String {
+    fn find<'a>(n: &'a Node, tag: &str) -> Option<&'a Node> {
+        if let Node::Element { tag: t, .. } = n { if t == tag { return Some(n); } }
+        n.children().iter().find_map(|c| find(c, tag))
+    }
+    let mut s = String::new();
+    if let Some(n) = find(tree, tag) { n.text(&mut s); }
+    s
+}
+
 pub fn dom_api_selftest() {
     let skeleton = "<html><body><div id=app></div><div id=out></div></body></html>";
     let tree = crate::html::parse(skeleton);
@@ -404,9 +468,17 @@ pub fn dom_api_selftest() {
         var re = /ab+c/i; var reOk = (re.source === 'ab+c' && re.flags === 'i') ? 'reok' : 'rebad';
         var ln = 0; outer: for (var x = 0; x < 4; x++) { ln++; continue outer; }
         var objis = Object.is(NaN, NaN) + ',' + Object.is(-0, 0);
+        // for-in over a bare lvalue (no var/let), bitwise compound assignment,
+        // the pre-ES6 prototype chain, and Math.clz32 (React-critical fixes).
+        var fk = ''; var fkk; for (fkk in {a:1,b:2}) { fk += fkk; }
+        var bits = 0; bits |= 4; bits |= 1; bits <<= 1;
+        function Pt(x){ this.x = x; } Pt.prototype.dbl = function(){ return this.x * 2; };
+        var proto = (new Pt(21)).dbl();
+        var clz = Math.clz32(1);
         var out = [
           'order=' + order, 'nodeType=' + nt, 'class=' + cls, 'attr=' + attr,
-          'qs=' + qs, 'event=' + got, seqOut, reOk, 'label=' + ln, 'objis=' + objis
+          'qs=' + qs, 'event=' + got, seqOut, reOk, 'label=' + ln, 'objis=' + objis,
+          'forin=' + fk, 'bits=' + bits, 'proto=' + proto, 'clz=' + clz
         ].join(' | ');
         document.getElementById('out').textContent = out;
     "#;
@@ -427,10 +499,14 @@ pub fn dom_api_selftest() {
         "reok",                  // regex literal lexed with source+flags
         "label=4",               // labeled loop ran 4 iterations
         "objis=true,false",      // Object.is(NaN,NaN)=true, Object.is(-0,0)=false
+        "forin=ab",              // for-in over a bare lvalue
+        "bits=10",               // (0|4|1)<<1 = 10
+        "proto=42",              // prototype-chain method (new Pt(21)).dbl()
+        "clz=31",                // Math.clz32(1)
     ];
     let pass = checks.iter().all(|c| out.contains(c));
     if pass {
-        crate::kprintln!("DOMAPI_OK: full DOM API (create/fragment/insertBefore/nodeType/classList/attrs/querySelector/dispatchEvent) + comma-seq/regex/labels/Object.is");
+        crate::kprintln!("DOMAPI_OK: full DOM API + comma-seq/regex/labels/Object.is/for-in/bitwise-compound/prototype-chain/clz32 (the JS-engine fixes that make React parse, load + run)");
     } else {
         let missing: Vec<&str> = checks.iter().copied().filter(|c| !out.contains(c)).collect();
         crate::kprintln!("DOMAPI_FAIL: missing {:?}", missing);

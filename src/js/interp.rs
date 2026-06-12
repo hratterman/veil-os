@@ -56,6 +56,12 @@ pub struct Interp {
     /// cached (which would otherwise alias a stale compile — an ABA bug).
     jit: BTreeMap<usize, (Rc<Func>, JitSlot)>,
     jit_enabled: bool,
+    /// Per-function property bag (keyed by Rc<Func> address): holds `.prototype`
+    /// and any static properties assigned to a function object. This gives the
+    /// pre-ES6 prototype model (`Ctor.prototype.method = …`; `new Ctor()`
+    /// instances inherit via a hidden `__proto__` link) that minified UMD
+    /// libraries (React's `ReactDOMRoot.prototype.render`) rely on.
+    func_props: BTreeMap<usize, (Rc<Func>, Rc<RefCell<Obj>>)>,
     /// 2D canvas contexts created via `<canvas>.getContext('2d')`; the owning
     /// element stores its index in a `__cvs` attribute so the browser can blit
     /// the drawn buffer where the canvas sits in layout.
@@ -89,6 +95,7 @@ impl Interp {
             resolvers: Vec::new(),
             jit: BTreeMap::new(),
             jit_enabled: true,
+            func_props: BTreeMap::new(),
             canvases: Vec::new(),
         };
         it.install_globals();
@@ -1009,10 +1016,17 @@ impl Interp {
         if Self::is_class(&ctor) {
             return self.instantiate_class(&ctor, args);
         }
-        // Pre-ES6 constructor function: run with this = fresh object.
-        if let Val::Func(..) = &ctor {
-            let obj = Val::object(Obj::new());
-            let r = self.call(ctor, obj.clone(), args)?;
+        // Pre-ES6 constructor function: run with this = fresh object whose
+        // hidden __proto__ links to the constructor's prototype, so instance
+        // method lookups inherit `Ctor.prototype.method`.
+        if let Val::Func(rc, _) = &ctor {
+            let proto = self.func_bag(rc).borrow().get("prototype").cloned();
+            let mut m = Obj::new();
+            if let Some(p) = proto {
+                m.insert("__proto__".into(), p);
+            }
+            let obj = Val::object(m);
+            let r = self.call(ctor.clone(), obj.clone(), args)?;
             // ctor may return an object; otherwise the new object.
             return Ok(if matches!(r, Val::Object(_)) { r } else { obj });
         }
@@ -1543,8 +1557,31 @@ impl Interp {
         }
     }
 
+    /// The property bag for a function object (creating it, with an empty
+    /// `prototype` object, on first access). Used for `.prototype` and statics.
+    fn func_bag(&mut self, rc: &Rc<Func>) -> Rc<RefCell<Obj>> {
+        let key = Rc::as_ptr(rc) as usize;
+        if let Some((_, bag)) = self.func_props.get(&key) {
+            return bag.clone();
+        }
+        let mut bag = Obj::new();
+        bag.insert("prototype".into(), Val::object(Obj::new()));
+        let bag = Rc::new(RefCell::new(bag));
+        self.func_props.insert(key, (rc.clone(), bag.clone()));
+        bag
+    }
+
     fn get_member(&mut self, o: Val, prop: &str) -> Result<Val, Val> {
         match &o {
+            // Function objects: `.prototype`, statics, and call/apply/bind.
+            Val::Func(rc, _) => {
+                if matches!(prop, "call" | "apply" | "bind") {
+                    return Ok(Val::Native(Native::Method(Box::new(o.clone()), Rc::from(prop))));
+                }
+                let bag = self.func_bag(rc);
+                let r = bag.borrow().get(prop).cloned();
+                return Ok(r.unwrap_or(Val::Undef));
+            }
             Val::Object(map) => {
                 // size on Map/Set
                 if prop == "size" {
@@ -1568,6 +1605,15 @@ impl Interp {
                 if prop == "constructor" {
                     if let Some(c) = map.borrow().get("__classref") {
                         return Ok(c.clone());
+                    }
+                }
+                // Prototype chain: an instance built by `new Ctor()` carries a
+                // hidden `__proto__` to Ctor.prototype — inherit its members.
+                let proto = map.borrow().get("__proto__").cloned();
+                if let Some(p @ Val::Object(_)) = proto {
+                    let inherited = self.get_member(p, prop)?;
+                    if !matches!(inherited, Val::Undef) {
+                        return Ok(inherited);
                     }
                 }
                 // Special objects (Map/Set/Promise/Response/WebSocket) expose methods.
@@ -1614,6 +1660,11 @@ impl Interp {
                     return;
                 }
                 map.borrow_mut().insert(prop.into(), v);
+            }
+            // Function statics / prototype replacement (`Ctor.prototype = {…}`).
+            Val::Func(rc, _) => {
+                let bag = self.func_bag(rc);
+                bag.borrow_mut().insert(prop.into(), v);
             }
             Val::Node(idx) => self.set_node_member(*idx, prop, v),
             Val::Host(Host::Style(idx)) => {
@@ -3026,6 +3077,7 @@ fn binop(op: &str, l: Val, r: Val) -> Val {
         "^" => Val::Num(((l.as_num() as i64) ^ (r.as_num() as i64)) as f64),
         "<<" => Val::Num((((l.as_num() as i64) << (r.as_num() as i64 & 31)) as i32) as f64),
         ">>" => Val::Num((((l.as_num() as i32) >> (r.as_num() as i64 & 31)) as i32) as f64),
+        ">>>" => Val::Num((((l.as_num() as i64 as u32) >> (r.as_num() as i64 & 31)) as u32) as f64),
         "instanceof" => Val::Bool(false),
         "in" => match &r {
             Val::Object(o) => Val::Bool(o.borrow().contains_key(&l.to_str())),
@@ -3131,6 +3183,10 @@ fn math_method(name: &str, args: &[Val]) -> Val {
             }
         }
         "hypot" => mathf::sqrt(a0 * a0 + a1 * a1),
+        // clz32: count leading zero bits in the 32-bit value. React's lane
+        // priority math is `31 - clz32(lanes)`; without it the reconciler loops.
+        "clz32" => (a0 as i64 as u32).leading_zeros() as f64,
+        "max_safe" => 9007199254740991.0,
         _ => f64::NAN,
     })
 }

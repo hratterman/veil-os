@@ -289,33 +289,24 @@ impl<'a> Lexer<'a> {
     }
 
     fn punct(&mut self) -> Option<&'static str> {
-        // Longest-match against known operators.
-        const THREE: &[&str] = &["===", "!==", "...", ">>>", "&&=", "||=", "**="];
+        // Longest-match against known operators (4 chars first).
+        const FOUR: &[&str] = &[">>>="];
+        const THREE: &[&str] = &["===", "!==", "...", ">>>", "&&=", "||=", "**=", "<<=", ">>=", "??="];
         const TWO: &[&str] = &[
             "==", "!=", "<=", ">=", "&&", "||", "=>", "++", "--", "+=", "-=", "*=", "/=", "%=", "?.",
-            "??", "**", "<<", ">>",
+            "??", "**", "<<", ">>", "|=", "&=", "^=",
         ];
         const ONE: &[&str] = &[
             "+", "-", "*", "/", "%", "=", "<", ">", "!", "?", ":", ".", ",", ";", "(", ")", "[", "]",
             "{", "}", "&", "|", "^", "~",
         ];
         let rest = &self.s[self.i..];
-        for p in THREE {
-            if rest.starts_with(p) {
-                self.i += 3;
-                return Some(p);
-            }
-        }
-        for p in TWO {
-            if rest.starts_with(p) {
-                self.i += 2;
-                return Some(p);
-            }
-        }
-        for p in ONE {
-            if rest.starts_with(p) {
-                self.i += 1;
-                return Some(p);
+        for (n, set) in [(4usize, FOUR), (3, THREE), (2, TWO), (1, ONE)] {
+            for p in set {
+                if rest.starts_with(p) {
+                    self.i += n;
+                    return Some(p);
+                }
             }
         }
         None

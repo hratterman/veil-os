@@ -12,15 +12,88 @@ use alloc::vec::Vec;
 pub struct Parser {
     t: Vec<Tok>,
     p: usize,
+    /// Token-level brace match (idx of `{` -> idx of its `}` and vice versa),
+    /// usize::MAX where none. Used only by the desync localizer.
+    bm: Vec<usize>,
+    /// First `block()` whose `{` closed at a `}` other than its token-level
+    /// match — i.e. the first parser/brace desync. usize::MAX = none.
+    first_bad: usize,
+}
+
+/// Truly-reserved words that can never be an identifier/binding name. This is
+/// `is_keyword` minus the *contextual* keywords (`of`, `as`, `get`, `set`,
+/// `static`, `async`, `await`, `yield`, `let`, `undefined`) that JS permits as
+/// names — minifiers reuse them freely (e.g. `function of(){}`, `var get=…`).
+fn is_reserved(s: &str) -> bool {
+    is_keyword(s)
+        && !matches!(
+            s,
+            "of" | "as" | "from" | "get" | "set" | "static" | "async" | "await"
+                | "yield" | "let" | "undefined"
+        )
+}
+
+/// Convert an lvalue expression (used as a for-in/for-of target without a
+/// declaration keyword) into a binding pattern. Only a bare identifier binds a
+/// name; anything else (member access etc.) falls back to a throwaway binding.
+fn expr_to_pat(e: Expr) -> Pat {
+    match e {
+        Expr::Ident(n) => Pat::Ident(n),
+        _ => Pat::Ident(String::from("_")),
+    }
+}
+
+fn brace_match(toks: &[Tok]) -> Vec<usize> {
+    let mut bm = alloc::vec![usize::MAX; toks.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if let Tok::Punct(p) = t {
+            if *p == "{" {
+                stack.push(i);
+            } else if *p == "}" {
+                if let Some(o) = stack.pop() {
+                    bm[o] = i;
+                    bm[i] = o;
+                }
+            }
+        }
+    }
+    bm
 }
 
 pub fn parse(toks: Vec<Tok>) -> Vec<Stmt> {
-    let mut p = Parser { t: toks, p: 0 };
+    let mut p = Parser { t: toks, p: 0, bm: Vec::new(), first_bad: usize::MAX };
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.stmt());
     }
     out
+}
+
+/// Parse while locating the first brace-nesting desync. Returns the first
+/// `block()` open-`{` token index that closed at the wrong `}` (usize::MAX if
+/// the parse's block nesting matched the token-level brace structure).
+pub fn parse_locate(toks: Vec<Tok>) -> (Vec<Stmt>, usize) {
+    let bm = brace_match(&toks);
+    let mut p = Parser { t: toks, p: 0, bm, first_bad: usize::MAX };
+    let mut out = Vec::new();
+    while !p.at_eof() {
+        out.push(p.stmt());
+    }
+    (out, p.first_bad)
+}
+
+/// Read the raw token at index i as a short string, for desync diagnostics.
+pub fn tok_str(toks: &[Tok], i: usize) -> alloc::string::String {
+    match toks.get(i) {
+        Some(Tok::Punct(p)) => alloc::string::String::from(*p),
+        Some(Tok::Ident(s)) => s.clone(),
+        Some(Tok::Num(n)) => alloc::format!("{n}"),
+        Some(Tok::Str(_)) => alloc::string::String::from("\"str\""),
+        Some(Tok::Regex(..)) => alloc::string::String::from("/re/"),
+        Some(Tok::Tmpl(_)) => alloc::string::String::from("`tmpl`"),
+        _ => alloc::string::String::from("<eof>"),
+    }
 }
 
 impl Parser {
@@ -200,10 +273,18 @@ impl Parser {
     }
 
     fn block(&mut self) -> Vec<Stmt> {
+        let open = self.p; // index of the `{`
         self.expect_punct("{");
         let mut out = Vec::new();
         while !self.is_punct("}") && !self.at_eof() {
             out.push(self.stmt());
+        }
+        let close = self.p; // index of the `}` we're about to consume
+        // Localizer: did this block close at its token-level matching brace?
+        if !self.bm.is_empty() && self.first_bad == usize::MAX {
+            if self.bm.get(open).copied().unwrap_or(usize::MAX) != close {
+                self.first_bad = open;
+            }
         }
         self.expect_punct("}");
         out
@@ -367,6 +448,25 @@ impl Parser {
             return Stmt::For(Box::new(None), cond, upd, self.body());
         }
         let first = self.expr();
+        // for-in / for-of with a bare lvalue (no var/let/const), e.g. minified
+        // `for(f in b)` / `for(k of arr)`. `expr()` absorbs `f in b` as a binary
+        // `in`; `of` is not an operator so it's left as the next token.
+        if let Expr::Binary("in", lhs, rhs) = first {
+            self.expect_punct(")");
+            return Stmt::ForIn(expr_to_pat(*lhs), *rhs, self.body());
+        }
+        if matches!(self.peek(), Tok::Ident(k) if k == "of") {
+            self.bump(); // of
+            let it = self.assign();
+            self.expect_punct(")");
+            return Stmt::ForOf(expr_to_pat(first), it, self.body());
+        }
+        if matches!(self.peek(), Tok::Ident(k) if k == "in") {
+            self.bump(); // in
+            let it = self.assign();
+            self.expect_punct(")");
+            return Stmt::ForIn(expr_to_pat(first), it, self.body());
+        }
         self.expect_punct(";");
         let cond = if self.is_punct(";") { None } else { Some(self.expr()) };
         self.expect_punct(";");
@@ -563,7 +663,9 @@ impl Parser {
         let is_generator = self.eat_punct("*");
         let name = if named {
             if let Tok::Ident(n) = self.peek().clone() {
-                if !is_keyword(&n) {
+                // Contextual keywords (of/as/get/set/…) are legal function names;
+                // minifiers emit them (e.g. `function of(...)` in React).
+                if !is_reserved(&n) {
                     self.bump();
                     Some(n)
                 } else {
@@ -631,7 +733,8 @@ impl Parser {
             return arrow;
         }
         let lhs = self.cond();
-        for op in ["=", "+=", "-=", "*=", "/=", "%=", "&&=", "||=", "**="].iter() {
+        for op in ["=", "+=", "-=", "*=", "/=", "%=", "&&=", "||=", "**=",
+                   "|=", "&=", "^=", "<<=", ">>=", ">>>=", "??="].iter() {
             if self.is_punct(op) {
                 self.bump();
                 let rhs = self.assign();
@@ -739,7 +842,7 @@ impl Parser {
                     "&" => (*p, 5, false),
                     "==" | "!=" | "===" | "!==" => (*p, 6, false),
                     "<" | ">" | "<=" | ">=" => (*p, 7, false),
-                    "<<" | ">>" => (*p, 8, false),
+                    "<<" | ">>" | ">>>" => (*p, 8, false),
                     "+" | "-" => (*p, 9, false),
                     "*" | "/" | "%" => (*p, 10, false),
                     "**" => (*p, 11, false),
@@ -882,7 +985,7 @@ impl Parser {
                     match part {
                         TplPart::Str(s) => elems.push(TplElem::Str(s)),
                         TplPart::Expr(toks) => {
-                            let mut sub = Parser { t: toks, p: 0 };
+                            let mut sub = Parser { t: toks, p: 0, bm: Vec::new(), first_bad: usize::MAX };
                             elems.push(TplElem::Expr(Box::new(sub.expr())));
                         }
                     }

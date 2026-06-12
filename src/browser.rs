@@ -120,14 +120,203 @@ pub struct BrowserState {
     find_query: String,
     find_matches: Vec<usize>, // indices into text_runs that match
     find_idx: usize,
+    // M41 text selection: each visible word is a `SelRun` (original case +
+    // geometry, document coords, reading order). A selection is a (run, char)
+    // anchor + cursor; `selecting` is true while the mouse drag is live.
+    sel_runs: Vec<SelRun>,
+    sel_anchor: Option<(usize, usize)>,
+    sel_cursor: Option<(usize, usize)>,
+    selecting: bool,
+}
+
+/// One selectable text run (a laid-out word) in document coordinates.
+#[derive(Clone)]
+struct SelRun {
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    s: String,
+    font: Font,
 }
 
 /// Copy the page's visible text to the clipboard (Ctrl+A selects all, Ctrl+C
 /// copies). Returns the number of bytes copied.
 pub fn copy_text(win: &Window) -> usize {
     let crate::wm::App::Browser(st) = &win.app else { return 0 };
-    crate::clipboard::set(st.page_text.clone());
-    st.page_text.len()
+    // A live drag-selection wins over "copy the whole page".
+    let s = selected_string(st);
+    let out = if s.is_empty() { st.page_text.clone() } else { s };
+    let n = out.len();
+    crate::clipboard::set(out);
+    n
+}
+
+// --- M41 text selection --------------------------------------------------------
+
+/// Map a document-space point to the nearest (run index, char offset). Vertical
+/// distance dominates (pick the right line first), x is the within-line tiebreak.
+fn sel_hit(runs: &[SelRun], px: isize, py: isize) -> Option<(usize, usize)> {
+    if runs.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, isize)> = None;
+    for (i, r) in runs.iter().enumerate() {
+        let vy = if py < r.y {
+            r.y - py
+        } else if py >= r.y + r.h {
+            py - (r.y + r.h) + 1
+        } else {
+            0
+        };
+        let hx = if px < r.x {
+            r.x - px
+        } else if px > r.x + r.w {
+            px - (r.x + r.w)
+        } else {
+            0
+        };
+        let score = vy * 100_000 + hx;
+        if best.is_none_or(|(_, b)| score < b) {
+            best = Some((i, score));
+        }
+    }
+    let (ri, _) = best?;
+    Some((ri, sel_char_at(&runs[ri], px)))
+}
+
+/// Character offset within a run for an x coordinate (document space), using
+/// midpoint rounding so the caret lands on the nearer glyph boundary.
+fn sel_char_at(r: &SelRun, px: isize) -> usize {
+    let n = r.s.chars().count();
+    if px <= r.x {
+        return 0;
+    }
+    if px >= r.x + r.w {
+        return n;
+    }
+    let mut acc = String::new();
+    let mut prev_w = 0isize;
+    for (i, c) in r.s.chars().enumerate() {
+        acc.push(c);
+        let w = text_w(&acc, 1, r.font);
+        let mid = r.x + (prev_w + w) / 2;
+        if px < mid {
+            return i;
+        }
+        if r.x + w >= px {
+            return i + 1;
+        }
+        prev_w = w;
+    }
+    n
+}
+
+/// Selection endpoints in (run, char) order: (start, end), start <= end.
+fn sel_range(st: &BrowserState) -> Option<((usize, usize), (usize, usize))> {
+    let a = st.sel_anchor?;
+    let c = st.sel_cursor?;
+    if a == c {
+        return None;
+    }
+    Some(if a <= c { (a, c) } else { (c, a) })
+}
+
+/// The selected text (words joined by spaces, line breaks between rows).
+fn selected_string(st: &BrowserState) -> String {
+    let Some((start, end)) = sel_range(st) else { return String::new() };
+    let mut out = String::new();
+    let mut last_y: Option<isize> = None;
+    for ri in start.0..=end.0 {
+        let Some(r) = st.sel_runs.get(ri) else { break };
+        let chars: Vec<char> = r.s.chars().collect();
+        let from = if ri == start.0 { start.1 } else { 0 };
+        let to = if ri == end.0 { end.1 } else { chars.len() };
+        let from = from.min(chars.len());
+        let to = to.min(chars.len());
+        if from >= to {
+            continue;
+        }
+        if let Some(ly) = last_y {
+            // A new row of text becomes a newline; same row, a space.
+            out.push(if (r.y - ly).abs() > r.h / 2 { '\n' } else { ' ' });
+        }
+        out.extend(&chars[from..to]);
+        last_y = Some(r.y);
+    }
+    out
+}
+
+/// Begin a selection drag at viewport point (rx, ry) (content-relative). Returns
+/// false if there's nothing selectable there (so the caller can fall through).
+pub fn sel_begin(win: &mut Window, rx: isize, ry: isize) -> bool {
+    let crate::wm::App::Browser(st) = &mut win.app else { return false };
+    if ry < CHROME as isize || st.sel_runs.is_empty() {
+        return false;
+    }
+    let (px, py) = (rx, ry - CHROME as isize + st.scroll as isize);
+    let hit = sel_hit(&st.sel_runs, px, py);
+    st.sel_anchor = hit;
+    st.sel_cursor = hit;
+    st.selecting = true;
+    paint_view(win);
+    true
+}
+
+/// Extend the live selection to viewport point (rx, ry).
+pub fn sel_extend(win: &mut Window, rx: isize, ry: isize) {
+    {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        if !st.selecting {
+            return;
+        }
+        let (px, py) = (rx, ry - CHROME as isize + st.scroll as isize);
+        st.sel_cursor = sel_hit(&st.sel_runs, px, py);
+    }
+    paint_view(win);
+}
+
+/// End the drag; the selection stays highlighted until the next click.
+pub fn sel_end(win: &mut Window) {
+    let crate::wm::App::Browser(st) = &mut win.app else { return };
+    st.selecting = false;
+    let n = selected_string(st).len();
+    if n > 0 {
+        crate::kprintln!("BROWSER: selected {n} bytes");
+    }
+}
+
+/// True while a selection drag is in progress (the WM routes moves to us).
+pub fn is_selecting(win: &Window) -> bool {
+    matches!(&win.app, crate::wm::App::Browser(st) if st.selecting)
+}
+
+/// True if there's a committed (non-empty) selection.
+pub fn has_selection(win: &Window) -> bool {
+    matches!(&win.app, crate::wm::App::Browser(st) if sel_range(st).is_some())
+}
+
+/// Ctrl+A: select every run on the page.
+pub fn select_all(win: &mut Window) {
+    {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        if st.sel_runs.is_empty() {
+            return;
+        }
+        let last = st.sel_runs.len() - 1;
+        st.sel_anchor = Some((0, 0));
+        st.sel_cursor = Some((last, st.sel_runs[last].s.chars().count()));
+        st.selecting = false;
+    }
+    paint_view(win);
+}
+
+/// Clear any selection (e.g. a plain click in the page).
+pub fn clear_selection(win: &mut Window) {
+    let crate::wm::App::Browser(st) = &mut win.app else { return };
+    st.sel_anchor = None;
+    st.sel_cursor = None;
+    st.selecting = false;
 }
 
 /// Paste clipboard text into the focused address bar or input field.
@@ -251,6 +440,10 @@ impl BrowserState {
             find_query: String::new(),
             find_matches: Vec::new(),
             find_idx: 0,
+            sel_runs: Vec::new(),
+            sel_anchor: None,
+            sel_cursor: None,
+            selecting: false,
         }
     }
 }
@@ -3250,14 +3443,23 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     // Measure the text runs (for find-in-page) and gather all visible text over
     // the whole document, independent of which band is currently rasterized.
     let mut text_runs: Vec<(isize, isize, isize, String)> = Vec::new();
+    let mut sel_runs: Vec<SelRun> = Vec::new();
     {
         let mut dummy = [0u32; 1];
         let mfb = unsafe { Framebuffer::new(dummy.as_mut_ptr(), 1, 1, 4) };
         for item in &ctx.items {
-            if let Item::Text { x, y, s, font, .. } = item {
+            if let Item::Text { x, y, s, scale, font, .. } = item {
                 if *y >= 0 {
                     let rw = mfb.measure_text(s, font.id, font.px).0 as isize;
                     text_runs.push((*x, *y, rw, s.to_lowercase()));
+                    sel_runs.push(SelRun {
+                        x: *x,
+                        y: *y,
+                        w: rw,
+                        h: text_h(*scale, *font),
+                        s: s.clone(),
+                        font: *font,
+                    });
                 }
             }
         }
@@ -3316,6 +3518,10 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     }
     st.page_text = text;
     st.text_runs = text_runs;
+    st.sel_runs = sel_runs;
+    st.sel_anchor = None;
+    st.sel_cursor = None;
+    st.selecting = false;
     st.find_open = false;
     st.find_query.clear();
     st.find_matches.clear();
@@ -3473,6 +3679,31 @@ pub fn paint_view(win: &mut Window) {
     fb.fill_rect(18, TABBAR_H, 18, TOPBAR, if can_fwd { 0xff90_a8c0 } else { 0xffb0_b4bc });
     fb.draw_string(23, TABBAR_H + 2, ">", BAR_TEXT, None);
     fb.draw_string(40, TABBAR_H + 2, &bar, BAR_TEXT, None);
+
+    // M41 text selection: a blue wash over the selected portion of each run.
+    if let crate::wm::App::Browser(st) = &win.app {
+        if let Some((start, end)) = sel_range(st) {
+            let view_h = ch - CHROME;
+            for ri in start.0..=end.0 {
+                let Some(r) = st.sel_runs.get(ri) else { break };
+                if r.y < st.scroll as isize || (r.y as usize) + (r.h as usize) > st.scroll + view_h {
+                    continue; // run not in the visible band
+                }
+                let chars: Vec<char> = r.s.chars().collect();
+                let from = if ri == start.0 { start.1.min(chars.len()) } else { 0 };
+                let to = if ri == end.0 { end.1.min(chars.len()) } else { chars.len() };
+                if from >= to {
+                    continue;
+                }
+                let pre: String = chars[..from].iter().collect();
+                let mid: String = chars[from..to].iter().collect();
+                let x0 = r.x + text_w(&pre, 1, r.font);
+                let w = text_w(&mid, 1, r.font).max(2);
+                let cy = CHROME + (r.y as usize - st.scroll);
+                fb.blend_rect(x0.max(0) as usize, cy, w as usize, r.h as usize, 0xff5b_8af0, 110);
+            }
+        }
+    }
 
     // M36 find-in-page: highlight matches in view + a find bar at the bottom.
     if let crate::wm::App::Browser(st) = &win.app {

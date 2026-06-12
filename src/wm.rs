@@ -624,6 +624,7 @@ pub struct ContextMenu {
 enum MenuTarget {
     Desktop,
     Window(usize),
+    Browser(usize),
     Clipboard,
 }
 
@@ -942,6 +943,9 @@ impl Wm {
                 keymap::BTN_RIGHT => {
                     self.pend_buttons = (self.pend_buttons & !2) | ((value != 0) as u32) << 1;
                 }
+                keymap::BTN_MIDDLE => {
+                    self.pend_buttons = (self.pend_buttons & !4) | ((value != 0) as u32) << 2;
+                }
                 keymap::KEY_SYSRQ if value == 1 => self.screenshot(self.alt),
                 _ if value == 1 => self.on_key(code),
                 _ => {}
@@ -1053,7 +1057,20 @@ impl Wm {
                     }
                     return;
                 }
-                keymap::KEY_C | keymap::KEY_A => {
+                keymap::KEY_A => {
+                    // In the browser, Ctrl+A selects all page text (highlight);
+                    // elsewhere it copies (the old select-all-to-clipboard).
+                    if let Some(win) = self.windows.last_mut() {
+                        if matches!(win.app, App::Browser(_)) {
+                            browser::select_all(win);
+                            self.dirty = true;
+                            return;
+                        }
+                    }
+                    self.clipboard_copy();
+                    return;
+                }
+                keymap::KEY_C => {
                     self.clipboard_copy();
                     return;
                 }
@@ -1263,6 +1280,9 @@ impl Wm {
             App::Browser(_) => {
                 browser::paste(win);
             }
+            App::Editor(_) => {
+                editor_paste(win, &text);
+            }
             App::Lisp(_) => {
                 for c in text.chars().filter(|c| *c != '\n') {
                     repl::char_input(win, c);
@@ -1424,6 +1444,9 @@ impl Wm {
         }
         if pressed & 2 != 0 {
             self.on_right_down();
+        }
+        if pressed & 4 != 0 {
+            self.on_middle_down();
         }
     }
 
@@ -1651,6 +1674,20 @@ impl Wm {
         self.dirty = true;
     }
 
+    /// Middle-click paste: drop the clipboard at the click point in a text input
+    /// (X11-style). In the browser it focuses the field under the cursor first.
+    fn on_middle_down(&mut self) {
+        if let Some((idx, Hit::Content(rx, ry))) = self.hit_test(self.mx, self.my) {
+            let top = self.raise(idx);
+            let win = &mut self.windows[top];
+            if matches!(win.app, App::Browser(_)) {
+                browser::focus_field(win, rx, ry);
+            }
+        }
+        self.clipboard_paste();
+        self.dirty = true;
+    }
+
     fn on_right_down(&mut self) {
         if self.menu.take().is_some() {
             self.dirty = true;
@@ -1667,7 +1704,14 @@ impl Wm {
             }
             Some((idx, Hit::Content(..))) => {
                 let top = self.raise(idx);
-                (win_items(), MenuTarget::Window(top))
+                if matches!(self.windows[top].app, App::Browser(_)) {
+                    (
+                        ["Copy", "Select All"].iter().map(|s| s.to_string()).collect(),
+                        MenuTarget::Browser(top),
+                    )
+                } else {
+                    (win_items(), MenuTarget::Window(top))
+                }
             }
             None => (
                 ["New File", "New Folder", "Screenshot", "Change Wallpaper", "Settings"]
@@ -1698,6 +1742,21 @@ impl Wm {
         if let MenuTarget::Clipboard = menu.target {
             crate::clipboard::pick(row);
             self.clipboard_paste();
+            return true;
+        }
+        if let MenuTarget::Browser(idx) = menu.target {
+            if idx < self.windows.len() {
+                let top = self.raise(idx);
+                let win = &mut self.windows[top];
+                match item {
+                    "Select All" => browser::select_all(win),
+                    "Copy" => {
+                        let n = browser::copy_text(win);
+                        kprintln!("BROWSER: Ctrl+C copied {n} bytes of page text");
+                    }
+                    _ => {}
+                }
+            }
             return true;
         }
         match (&menu.target, item) {
@@ -1781,6 +1840,7 @@ impl Wm {
                         self.dirty = true;
                     }
                     App::Browser(_) => {
+                        browser::clear_selection(win);
                         if browser::topbar_click(win, rx, ry) {
                             // tab strip / back / forward buttons
                         } else if browser::chrome_click(win, rx, ry) {
@@ -1797,6 +1857,9 @@ impl Wm {
                                 kprintln!("BROWSER: clicked link -> {href}");
                                 browser::navigate(win, &href, true);
                             }
+                        } else {
+                            // Empty page area: begin a text-selection drag.
+                            browser::sel_begin(win, rx, ry);
                         }
                         self.dirty = true;
                     }
@@ -2000,19 +2063,31 @@ impl Wm {
             let win = &self.windows[idx];
             kprintln!("WM: '{}' moved to ({}, {})", win.title, win.x, win.y);
         } else if let Some(win) = self.windows.last_mut() {
-            if let App::Paint(_) = win.app {
-                paint_mouse_up(win);
+            match &win.app {
+                App::Paint(_) => paint_mouse_up(win),
+                App::Browser(_) if browser::is_selecting(win) => {
+                    browser::sel_end(win);
+                    self.dirty = true;
+                }
+                _ => {}
             }
         }
     }
 
     fn forward_mouse_move(&mut self) {
         if let Some(win) = self.windows.last_mut() {
-            if let App::Paint(_) = win.app {
-                let rx = self.mx - win.x - BORDER;
-                let ry = self.my - win.y - BORDER - TITLE_H;
-                paint_mouse_move(win, rx, ry);
-                self.dirty = true;
+            let rx = self.mx - win.x - BORDER;
+            let ry = self.my - win.y - BORDER - TITLE_H;
+            match &win.app {
+                App::Paint(_) => {
+                    paint_mouse_move(win, rx, ry);
+                    self.dirty = true;
+                }
+                App::Browser(_) if browser::is_selecting(win) => {
+                    browser::sel_extend(win, rx, ry);
+                    self.dirty = true;
+                }
+                _ => {}
             }
         }
     }
@@ -3251,6 +3326,20 @@ fn editor_key(win: &mut Window, ch: char) {
             _ => {}
         }
         st.scroll = usize::MAX; // typing jumps back to the cursor
+        st.status = String::from("edited");
+    }
+    render_editor(win);
+}
+
+/// Append clipboard text at the editor's (end-of-buffer) cursor.
+fn editor_paste(win: &mut Window, text: &str) {
+    {
+        let App::Editor(st) = &mut win.app else { return };
+        let room = EDITOR_MAX.saturating_sub(st.text.len());
+        for c in text.chars().take(room) {
+            st.text.push(c);
+        }
+        st.scroll = usize::MAX; // jump to the cursor
         st.status = String::from("edited");
     }
     render_editor(win);

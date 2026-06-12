@@ -283,6 +283,35 @@ impl Framebuffer {
         }
     }
 
+    /// Blit `src` (sw×sh) into the dw×dh box at (dx,dy) with nearest-neighbour
+    /// scaling. Clips to the framebuffer; skips fully-transparent source pixels.
+    pub fn blit_scaled(&self, dx: isize, dy: isize, dw: isize, dh: isize, src: &[u32], sw: usize, sh: usize) {
+        if dw <= 0 || dh <= 0 || sw == 0 || sh == 0 {
+            return;
+        }
+        for row in 0..dh {
+            let y = dy + row;
+            if y < 0 || y >= self.height as isize {
+                continue;
+            }
+            let sy = (row as usize * sh / dh as usize).min(sh - 1);
+            for col in 0..dw {
+                let x = dx + col;
+                if x < 0 || x >= self.width as isize {
+                    continue;
+                }
+                let sx = (col as usize * sw / dw as usize).min(sw - 1);
+                let px = src[sy * sw + sx];
+                if px >> 24 == 0 {
+                    continue;
+                }
+                unsafe {
+                    self.base.add(y as usize * self.stride_px + x as usize).write_volatile(px);
+                }
+            }
+        }
+    }
+
     /// Flip a full back buffer (stride == width) onto this framebuffer.
     pub fn copy_from(&self, src: &[u32]) {
         debug_assert!(self.stride_px == self.width && src.len() >= self.width * self.height);

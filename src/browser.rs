@@ -74,7 +74,9 @@ pub const TOPBAR: usize = 20; // address-bar row height
 pub const TABBAR_H: usize = 22; // tab-strip row height (above the address bar)
 pub const CHROME: usize = TABBAR_H + TOPBAR; // total chrome; page content starts here
 const MAX_DOC_H: usize = 16000; // logical doc height cap (band rasterizer, not the buffer)
-const BAND_H: usize = 2000; // tallest rasterized band; repainted on scroll-out
+const BAND_H: usize = 2000; // tallest rasterized band; repainted on scroll
+const DEFAULT_IMG_W: isize = 120; // placeholder box for a deferred, attr-less <img>
+const DEFAULT_IMG_H: isize = 90;
 const FETCH_TIMEOUT: u64 = 500; // 10 s at the 50 Hz tick
 const BAR_BG: u32 = 0xffc8_ccd4;
 const BAR_TEXT: u32 = 0xff20_2830;
@@ -92,7 +94,8 @@ pub struct BrowserState {
     doc_h: usize,     // full logical document height (the scroll range)
     band_top: usize,  // document y at which the band buffer currently starts
     items: Vec<Item>, // retained display list, painted per band
-    imgs: Vec<png::Image>, // decoded images, indexed by Item::Image.idx
+    imgs: Vec<Option<png::Image>>, // decoded images by slot; None = not fetched yet
+    img_src: Vec<String>,          // source URL per slot, for lazy (on-scroll) loading
     links: Vec<LinkBox>,
     scroll: usize,
     page_bg: u32,
@@ -216,6 +219,7 @@ impl BrowserState {
             band_top: 0,
             items: Vec::new(),
             imgs: Vec::new(),
+            img_src: Vec::new(),
             links: Vec::new(),
             scroll: 0,
             page_bg: 0xffff_ffff,
@@ -369,9 +373,31 @@ fn repaint_band(win: &mut Window) {
                     pfb.draw_text((*x).max(0) as usize, yy as usize, s, font.id, font.px, color);
                 }
             }
-            &Item::Image { x, y, idx } => {
-                if let Some(img) = st.imgs.get(idx) {
-                    pfb.blit(x, y - top, &img.pixels, img.w, img.h);
+            &Item::Image { x, y, w, h, idx } => {
+                let dy = y - top;
+                if dy + h <= 0 || dy >= bh {
+                    continue;
+                }
+                match st.imgs.get(idx) {
+                    Some(Some(img)) if img.w as isize == w && img.h as isize == h => {
+                        pfb.blit(x, dy, &img.pixels, img.w, img.h);
+                    }
+                    Some(Some(img)) => {
+                        // Decoded size differs from the laid-out box (deferred
+                        // image): nearest-neighbour scale into the box.
+                        pfb.blit_scaled(x, dy, w, h, &img.pixels, img.w, img.h);
+                    }
+                    _ => {
+                        // Not fetched yet: a light placeholder box so layout is
+                        // stable and the user sees something until it loads.
+                        if w > 1 && h > 1 {
+                            let (py, ph) = if dy < 0 { (0isize, h + dy) } else { (dy, h) };
+                            if ph > 0 {
+                                pfb.fill_rect(x.max(0) as usize, py as usize, w as usize, ph as usize, 0xff26_2a30);
+                                pfb.fill_rect(x.max(0) as usize, py as usize, w as usize, 1, 0xff3a_4048);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -911,6 +937,104 @@ fn resolve_href(href: &str) -> String {
     } else {
         format!("/{href}")
     }
+}
+
+/// Fetch + decode the image in slot `i`, updating its laid-out size to the
+/// decoded dimensions and inserting it into the LRU cache. Returns true on a
+/// successful decode.
+fn fetch_image_slot(
+    slots: &mut [ImgSlot],
+    pixels: &mut [Option<png::Image>],
+    i: usize,
+    cache: &mut Vec<(String, png::Image)>,
+) -> bool {
+    let src = slots[i].src.clone();
+    if let Some((200, _, data)) = http_get(&src) {
+        if let Some(img) = png::decode_any(&data) {
+            kprintln!("BROWSER: decoded {src} ({}x{} px)", img.w, img.h);
+            if is_external(&src) && !EXT_IMG_DONE.swap(true, Ordering::Relaxed) {
+                kprintln!("EXT_IMG_OK");
+            }
+            slots[i].w = img.w as isize;
+            slots[i].h = img.h as isize;
+            cache.insert(0, (src, img.clone()));
+            cache.truncate(IMG_CACHE_CAP);
+            pixels[i] = Some(img);
+            return true;
+        }
+        kprintln!("BROWSER: {src} is not a PNG (skipped)");
+    }
+    false
+}
+
+/// Lazily fetch any deferred images that have scrolled within ~1 viewport of the
+/// visible window, then repaint if anything loaded. Called on scroll. Deferred
+/// images keep their laid-out box, so the decoded pixels are scaled into it (no
+/// re-layout). Returns true if at least one image loaded.
+fn lazy_load_images(win: &mut Window, view_h: usize) -> bool {
+    // Collect the deferred slots now near the viewport (item index -> slot).
+    let to_fetch: Vec<usize> = {
+        let crate::wm::App::Browser(st) = &win.app else { return false };
+        let lo = st.scroll.saturating_sub(view_h) as isize;
+        let hi = (st.scroll + 2 * view_h) as isize;
+        let mut want: Vec<usize> = Vec::new();
+        for it in &st.items {
+            if let &Item::Image { y, h, idx, .. } = it {
+                let visible = y + h >= lo && y <= hi;
+                if visible
+                    && matches!(st.imgs.get(idx), Some(None))
+                    && !want.contains(&idx)
+                {
+                    want.push(idx);
+                }
+            }
+        }
+        want
+    };
+    if to_fetch.is_empty() {
+        return false;
+    }
+    // Fetch each, updating the per-slot pixels + decoded size in place.
+    let mut cache = match &mut win.app {
+        crate::wm::App::Browser(st) => core::mem::take(&mut st.img_cache),
+        _ => return false,
+    };
+    let mut any = false;
+    for idx in to_fetch {
+        let (src, mut img) = {
+            let crate::wm::App::Browser(st) = &win.app else { break };
+            (st.img_src.get(idx).cloned().unwrap_or_default(), None)
+        };
+        if src.is_empty() {
+            continue;
+        }
+        // Cache hit or fetch.
+        if let Some(pos) = cache.iter().position(|(s, _)| *s == src) {
+            img = Some(cache[pos].1.clone());
+        } else if let Some((200, _, data)) = http_get(&src) {
+            if let Some(decoded) = png::decode_any(&data) {
+                kprintln!("BROWSER: lazy-decoded {src} ({}x{} px)", decoded.w, decoded.h);
+                cache.insert(0, (src.clone(), decoded.clone()));
+                cache.truncate(IMG_CACHE_CAP);
+                img = Some(decoded);
+            }
+        }
+        if let Some(decoded) = img {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                if let Some(slot) = st.imgs.get_mut(idx) {
+                    *slot = Some(decoded);
+                    any = true;
+                }
+            }
+        }
+    }
+    if let crate::wm::App::Browser(st) = &mut win.app {
+        st.img_cache = cache;
+    }
+    if any {
+        repaint_band(win);
+    }
+    any
 }
 
 /// Compatibility shim for sites whose default front end is a JS-only SPA we
@@ -1475,7 +1599,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
 enum Item {
     Rect { x: isize, y: isize, w: isize, h: isize, color: u32 },
     Text { x: isize, y: isize, s: String, color: u32, scale: usize, font: Font },
-    Image { x: isize, y: isize, idx: usize },
+    Image { x: isize, y: isize, w: isize, h: isize, idx: usize },
 }
 
 enum Frag {
@@ -1522,9 +1646,17 @@ fn frag_h(f: &Frag) -> isize {
     }
 }
 
+/// One `<img>` slot: its source and the box it occupies in layout (the decoded
+/// size once fetched, otherwise the HTML width/height attrs or a default).
+struct ImgSlot {
+    src: String,
+    w: isize,
+    h: isize,
+}
+
 struct Ctx<'a> {
     sheet: &'a [css::Rule],
-    imgs: &'a [(String, png::Image)],
+    imgs: &'a [ImgSlot],
     items: Vec<Item>,
     links: Vec<LinkBox>,
     img_spots: Vec<(usize, isize, isize)>, // (imgs idx, x, y) for the proof log
@@ -1663,17 +1795,12 @@ fn collect_inline(
                 }
                 "img" => {
                     let src = node.attr("src").map(resolve_href).unwrap_or_default();
-                    match ctx.imgs.iter().position(|(s, _)| *s == src) {
-                        Some(idx) => {
-                            let img = &ctx.imgs[idx].1;
-                            buf.push(Frag::Img {
-                                idx,
-                                w: img.w as isize,
-                                h: img.h as isize,
-                            });
-                        }
-                        // Not decoded (failed fetch / non-PNG): render nothing.
-                        None => {}
+                    // Every <img> with a known slot reserves its box (so deferred,
+                    // not-yet-fetched images still take up space and can be
+                    // lazy-loaded into place on scroll).
+                    if let Some(idx) = ctx.imgs.iter().position(|s| s.src == src) {
+                        let slot = &ctx.imgs[idx];
+                        buf.push(Frag::Img { idx, w: slot.w, h: slot.h });
                     }
                 }
                 _ => {
@@ -1716,9 +1843,9 @@ fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> is
                 }
                 ctx.items.push(Item::Text { x: x + dx, y: fy, s, color, scale, font });
             }
-            Frag::Img { idx, .. } => {
+            Frag::Img { idx, w: fw, h: fh } => {
                 ctx.img_spots.push((idx, x + dx, fy));
-                ctx.items.push(Item::Image { x: x + dx, y: fy, idx });
+                ctx.items.push(Item::Image { x: x + dx, y: fy, w: fw, h: fh, idx });
             }
             Frag::Input { name, value, kind, checked, w: fw, h: fh, multiline, options } => {
                 let (bx, by) = (x + dx, fy);
@@ -2088,7 +2215,7 @@ static FLEX_DONE: AtomicBool = AtomicBool::new(false);
 fn item_right(it: &Item, ctx: &Ctx) -> isize {
     match it {
         Item::Text { x, s, scale, font, .. } => x + text_w(s, *scale, *font),
-        Item::Image { x, idx, .. } => x + ctx.imgs[*idx].1.w as isize,
+        Item::Image { x, w, .. } => x + w,
         Item::Rect { x, w, .. } => x + w,
     }
 }
@@ -2799,47 +2926,37 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     crate::glyph_cache::clear();
     register_font_faces(&all_css);
 
-    // Images: fetch + decode each unique PNG src, served by the persistent LRU
-    // cache so navigating back doesn't re-fetch. https -> TLS, http -> proxy,
-    // relative/absolute -> loopback (all via http_get). Non-PNG (JPEG/WebP/SVG)
-    // is skipped silently — no [img] placeholder.
+    // Images (viewport-aware): build a slot for every unique <img> src, sized
+    // from its width/height attrs (or a default box). Decode only the slots near
+    // the initial viewport; the rest stay placeholders and are fetched lazily on
+    // scroll (lazy_load_images). This bounds memory + network on image-heavy
+    // pages. Cached decodes (LRU) are reused at their real size immediately.
     let mut cache = match &mut win.app {
         crate::wm::App::Browser(st) => core::mem::take(&mut st.img_cache),
         _ => Vec::new(),
     };
-    let mut imgs: Vec<(String, png::Image)> = Vec::new();
     let mut img_nodes = Vec::new();
     doc.find_all("img", &mut img_nodes);
+    let mut slots: Vec<ImgSlot> = Vec::new();
+    let mut pixels: Vec<Option<png::Image>> = Vec::new();
     for node in img_nodes {
         let Some(src) = node.attr("src").map(resolve_href) else { continue };
-        if imgs.iter().any(|(s, _)| *s == src) {
+        if slots.iter().any(|s| s.src == src) {
             continue;
         }
-        // Cache hit: move-to-front (LRU) and reuse the decoded image.
+        let aw = node.attr("width").and_then(|v| v.trim().parse::<isize>().ok());
+        let ah = node.attr("height").and_then(|v| v.trim().parse::<isize>().ok());
+        let (bw, bh) = (aw.unwrap_or(DEFAULT_IMG_W).max(1), ah.unwrap_or(DEFAULT_IMG_H).max(1));
+        // Cache hit: reuse the decoded image (and its real size) right away.
         if let Some(pos) = cache.iter().position(|(s, _)| *s == src) {
             let entry = cache.remove(pos);
-            imgs.push((entry.0.clone(), entry.1.clone()));
-            cache.insert(0, entry);
-            continue;
+            cache.insert(0, entry.clone());
+            slots.push(ImgSlot { src, w: entry.1.w as isize, h: entry.1.h as isize });
+            pixels.push(Some(entry.1));
+        } else {
+            slots.push(ImgSlot { src, w: bw, h: bh });
+            pixels.push(None);
         }
-        if let Some((200, _, data)) = http_get(&src) {
-            match png::decode_any(&data) {
-                Some(img) => {
-                    kprintln!("BROWSER: decoded {src} ({}x{} px)", img.w, img.h);
-                    if is_external(&src) && !EXT_IMG_DONE.swap(true, Ordering::Relaxed) {
-                        kprintln!("EXT_IMG_OK");
-                    }
-                    cache.insert(0, (src.clone(), img.clone()));
-                    cache.truncate(IMG_CACHE_CAP);
-                    imgs.push((src, img));
-                }
-                None => kprintln!("BROWSER: {src} is not a PNG (skipped, no placeholder)"),
-            }
-        }
-    }
-    // Return the (possibly grown) cache to the window for the next navigation.
-    if let crate::wm::App::Browser(st) = &mut win.app {
-        st.img_cache = cache;
     }
 
     // Layout at the window's content width.
@@ -2848,22 +2965,47 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     let root = root_style();
     let body_style = resolve(&sheet, body_node, &root);
     let page_bg = body_style.bg.unwrap_or(0xffff_ffff);
+
+    // Pass 1: lay out with placeholder/cached sizes to find each image's y, then
+    // fetch the ones within ~2 viewports of the top (initial scroll = 0).
+    let view_h = win.ch.saturating_sub(CHROME);
+    let fetch_ahead = (view_h as isize) * 2;
+    {
+        let mut ctx1 = Ctx {
+            sheet: &sheet, imgs: &slots, items: Vec::new(), links: Vec::new(),
+            img_spots: Vec::new(), fields: Vec::new(), forms: Vec::new(), cur_form: usize::MAX,
+        };
+        layout_block(&mut ctx1, body_node, &root, 0, view_w as isize, 0, None);
+        let mut slot_y = alloc::vec![isize::MAX; slots.len()];
+        for it in &ctx1.items {
+            if let &Item::Image { y, idx, .. } = it {
+                if y < slot_y[idx] {
+                    slot_y[idx] = y;
+                }
+            }
+        }
+        for i in 0..slots.len() {
+            if pixels[i].is_none() && slot_y[i] <= fetch_ahead {
+                fetch_image_slot(&mut slots, &mut pixels, i, &mut cache);
+            }
+        }
+        let deferred = pixels.iter().filter(|p| p.is_none()).count();
+        if deferred > 0 {
+            kprintln!("BROWSER: {deferred}/{} image(s) deferred (off-viewport)", slots.len());
+        }
+    }
+
+    // Pass 2: final layout, now with decoded sizes for the fetched images.
     let mut ctx = Ctx {
-        sheet: &sheet,
-        imgs: &imgs,
-        items: Vec::new(),
-        links: Vec::new(),
-        img_spots: Vec::new(),
-        fields: Vec::new(),
-        forms: Vec::new(),
-        cur_form: usize::MAX,
+        sheet: &sheet, imgs: &slots, items: Vec::new(), links: Vec::new(),
+        img_spots: Vec::new(), fields: Vec::new(), forms: Vec::new(), cur_form: usize::MAX,
     };
     let end_y = layout_block(&mut ctx, body_node, &root, 0, view_w as isize, 0, None);
 
-    // Free the previous page's buffer (often a couple MB) before allocating the
-    // new one, so back-to-back navigations don't double up on the 16 MB heap.
+    // Return the (possibly grown) cache to the window for the next navigation.
     if let crate::wm::App::Browser(st) = &mut win.app {
-        st.page = Vec::new();
+        st.img_cache = cache;
+        st.page = Vec::new(); // free the old band buffer before reallocating
     }
     // The document is kept as a retained display list and rasterized one band at
     // a time (see repaint_band), so its full logical height — capped only at
@@ -2888,8 +3030,8 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
 
     // Proof breadcrumbs: where things ended up, in document coordinates.
     for &(idx, x, y) in &ctx.img_spots {
-        let (src, img) = &imgs[idx];
-        kprintln!("BROWSER: img '{src}' at ({x}, {y}) {}x{}", img.w, img.h);
+        let slot = &slots[idx];
+        kprintln!("BROWSER: img '{}' at ({x}, {y}) {}x{}", slot.src, slot.w, slot.h);
     }
     let mut seen: Vec<&str> = Vec::new();
     for l in &ctx.links {
@@ -2918,7 +3060,8 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
         st.tabs[a].title = tab_title(&path);
     }
     st.items = ctx.items;
-    st.imgs = imgs.iter().map(|(_, img)| img.clone()).collect();
+    st.img_src = slots.iter().map(|s| s.src.clone()).collect();
+    st.imgs = pixels;
     st.page_w = view_w;
     st.doc_h = doc_h;
     st.band_top = 0;
@@ -2993,6 +3136,7 @@ fn render_message(win: &mut Window, path: &str, msg: &str) {
     st.doc_h = 64;
     st.band_top = 0;
     st.imgs = Vec::new();
+    st.img_src = Vec::new();
     st.items = alloc::vec![Item::Text {
         x: 8,
         y: 8,
@@ -3360,6 +3504,8 @@ fn scroll_to(win: &mut Window, target: isize) -> bool {
     if tall && new > 0 && !SCROLL_DONE.swap(true, Ordering::Relaxed) {
         kprintln!("SCROLL_OK");
     }
+    // Pull in any images that just scrolled near the viewport, then paint.
+    lazy_load_images(win, view_h);
     paint_view(win);
     true
 }

@@ -308,7 +308,7 @@ class Manager:
             threading.Thread(target=self.drain_fifo, args=(s,), daemon=True).start()
         s.qemu = subprocess.Popen([
             "qemu-system-aarch64",
-            "-machine", "virt", "-cpu", "cortex-a72", "-m", "512M",
+            "-machine", "virt", "-cpu", "cortex-a72", "-smp", "4", "-m", "512M",
             "-global", "virtio-mmio.force-legacy=false",
             "-device", "ramfb",
             "-device", "virtio-keyboard-device",

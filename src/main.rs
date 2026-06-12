@@ -62,6 +62,7 @@ mod semihosting;
 mod settings;
 mod setup;
 mod shell;
+mod smp;
 mod snake;
 mod snd;
 mod store;
@@ -120,6 +121,8 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     milestone4();
     scheduler::init(kernel_mapper.root());
     harden::selftest(); // M41 step 18: stack canary + W^X (needs MMU + kernel root)
+    smp::bring_up(&fdt); // M41 step 19: start the secondary CPU cores (PSCI)
+    smp::selftest(); // M41 step 19: nproc + parallel-workload speedup
     crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
     font::selftest(); // M34: prove the generated bitmap fonts loaded
     milestone35_jpeg(); // M35: prove the baseline JPEG decoder

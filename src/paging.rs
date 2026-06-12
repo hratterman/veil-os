@@ -174,6 +174,34 @@ impl Mapper {
     }
 
     /// Switch address spaces (no ASIDs yet: full TLB flush each time).
+    /// Enable the MMU + caches on a secondary core, using the kernel's existing
+    /// page tables (`root`). Mirrors `enable()` but takes the root directly.
+    pub fn enable_at(root: usize) {
+        unsafe {
+            core::arch::asm!(
+                "msr mair_el1, {mair}",
+                "msr tcr_el1, {tcr}",
+                "msr ttbr0_el1, {ttbr}",
+                "dsb ish",
+                "isb",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                "mrs {sctlr}, sctlr_el1",
+                "orr {sctlr}, {sctlr}, #1",
+                "orr {sctlr}, {sctlr}, #(1 << 2)",
+                "orr {sctlr}, {sctlr}, #(1 << 12)",
+                "msr sctlr_el1, {sctlr}",
+                "isb",
+                mair = in(reg) MAIR,
+                tcr = in(reg) TCR,
+                ttbr = in(reg) root as u64,
+                sctlr = out(reg) _,
+                options(nostack)
+            );
+        }
+    }
+
     pub fn switch_ttbr0(root: usize) {
         unsafe {
             core::arch::asm!(

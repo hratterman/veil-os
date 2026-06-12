@@ -81,3 +81,24 @@ _start:
     mov     x0, x19
     bl      kernel_main
     b       .Lpark
+
+// M41 step 19: secondary-core entry, jumped to by PSCI CPU_ON. x0 = the core
+// index we passed as the PSCI context id. MMU is off; we set a per-core stack,
+// enable FP, then call secondary_main(core) which turns the MMU on and works.
+.global secondary_entry
+secondary_entry:
+    mov     x20, x0                     // core index
+    mov     x0, #(3 << 20)              // CPACR_EL1.FPEN = 0b11
+    msr     cpacr_el1, x0
+    isb
+    // sp = SECONDARY_SP[core]
+    ldr     x0, =SECONDARY_SP
+    lsl     x1, x20, #3
+    add     x0, x0, x1
+    ldr     x0, [x0]
+    mov     sp, x0
+    mov     x0, x20
+    bl      secondary_main
+.Lpark_sec:
+    wfe
+    b       .Lpark_sec

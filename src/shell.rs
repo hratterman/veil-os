@@ -1053,6 +1053,7 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
         "find" => leaf(find(&args_joined)),
         "date" => (date(), 0),
         "df" => (df(), 0),
+        "nproc" => (format!("{}\n", crate::smp::nproc()), 0),
         "chmod" => (String::new(), 0),
         "seq" => (seq(&rest), 0),
         "basename" => (format!("{}\n", rest.first().map(|s| s.rsplit('/').next().unwrap_or(s)).unwrap_or("")), 0),

@@ -52,6 +52,7 @@ mod mbox;
 mod mp3;
 mod net;
 mod netdev;
+mod netfs;
 mod paging;
 mod perms;
 #[cfg(feature = "pi4")]
@@ -160,6 +161,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     vfs::init(); // M42 step 6: hierarchical filesystem (load from disk or seed)
     if !fastboot(&fdt) {
         vfs::selftest(); // M42 step 6: mkdir/cd/paths + /home dotfiles + disk persistence
+        netfs::selftest(); // M42 step 7: network filesystem protocol + mount registry
     }
     if milestone12(&fdt) {
         // M14/M15 services (tcp echo, http) as a preemptible kernel task.

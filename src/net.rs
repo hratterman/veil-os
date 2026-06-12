@@ -44,7 +44,7 @@ const FLAG_RST: u8 = 0x04;
 const FLAG_PSH: u8 = 0x08;
 const FLAG_ACK: u8 = 0x10;
 
-type Ip = [u8; 4];
+pub type Ip = [u8; 4];
 
 pub fn fmt_mac(m: &[u8; 6]) -> String {
     let mut s = String::new();

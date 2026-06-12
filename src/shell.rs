@@ -1021,8 +1021,10 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
         "env" => (st.vars.iter().map(|(k, v)| format!("{k}={v}\n")).collect(), 0),
         "help" => (HELP.to_string(), 0),
         // --- leaf file/text commands ---
-        "ls" => leaf(ls(&args_joined)),
-        "cat" => leaf(cat_multi(&rest, stdin.as_deref())),
+        "ls" => leaf(ls_router(&rest, &args_joined)),
+        "cat" => leaf(cat_router(&rest, stdin.as_deref())),
+        "mount" => (mount_cmd(&rest), 0),
+        "umount" | "unmount" => (umount_cmd(&rest), 0),
         "cp" => leaf(cp(&args_joined)),
         "mv" => leaf(mv(&args_joined)),
         "rm" => leaf(rm(&args_joined)),
@@ -1197,6 +1199,89 @@ fn cat_multi(files: &[String], stdin: Option<&str>) -> String {
         out.push_str(&cat(f));
     }
     out
+}
+
+/// `ls` that routes a path under a network mount to the remote server, else
+/// falls back to the normal (FAT16) listing.
+fn ls_router(rest: &[String], args_joined: &str) -> String {
+    let target = rest.iter().find(|a| !a.starts_with('-')).cloned();
+    if let Some(path) = target {
+        let abspath = abspath(&path);
+        if let Some((m, remote)) = crate::netfs::resolve_mount(&abspath) {
+            return match crate::netfs::list_remote(m.ip, m.port, &remote) {
+                crate::netfs::ListResult::Ok(entries) => {
+                    let mut out = String::new();
+                    for (name, is_dir, _sz) in entries {
+                        out.push_str(&name);
+                        if is_dir { out.push('/'); }
+                        out.push('\n');
+                    }
+                    out
+                }
+                crate::netfs::ListResult::Err(e) => format!("ls: {path}: {e}\n"),
+            };
+        }
+    }
+    ls(args_joined)
+}
+
+/// `cat` that routes mounted paths to the remote server.
+fn cat_router(files: &[String], stdin: Option<&str>) -> String {
+    if files.is_empty() {
+        return cat_multi(files, stdin);
+    }
+    let mut out = String::new();
+    for f in files {
+        let abspath = abspath(f);
+        if let Some((m, remote)) = crate::netfs::resolve_mount(&abspath) {
+            match crate::netfs::read_remote(m.ip, m.port, &remote) {
+                Ok(data) => out.push_str(&String::from_utf8_lossy(&data)),
+                Err(e) => out.push_str(&format!("cat: {f}: {e}\n")),
+            }
+        } else {
+            out.push_str(&cat(f));
+        }
+    }
+    out
+}
+
+/// Resolve a path against the VFS cwd into an absolute path (for mount routing).
+fn abspath(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        let cwd = crate::vfs::get().cwd_path();
+        if cwd == "/" { format!("/{path}") } else { format!("{cwd}/{path}") }
+    }
+}
+
+/// `mount` (no args -> list mounts) / `mount <host:/path> <local>`.
+fn mount_cmd(rest: &[String]) -> String {
+    if rest.is_empty() {
+        let mut out = String::new();
+        for m in crate::netfs::list_mounts() {
+            out.push_str(&format!("{}:{} on {} (netfs)\n", m.host, m.remote, m.local));
+        }
+        return out;
+    }
+    if rest.len() < 2 {
+        return "mount: usage: mount <host:/path> <mountpoint>\n".to_string();
+    }
+    match crate::netfs::mount(&rest[0], &rest[1]) {
+        Ok(()) => format!("mounted {} at {}\n", rest[0], rest[1]),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
+fn umount_cmd(rest: &[String]) -> String {
+    let Some(local) = rest.first() else {
+        return "umount: usage: umount <mountpoint>\n".to_string();
+    };
+    if crate::netfs::umount(local) {
+        format!("unmounted {local}\n")
+    } else {
+        format!("umount: {local}: not mounted\n")
+    }
 }
 
 fn uniq(text: &str) -> String {

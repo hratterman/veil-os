@@ -21,6 +21,28 @@ pub struct Host {
     sockets: Vec<Option<crate::net::Handle>>,
     /// Drawing surface for a graphical app (None for plain WASI modules).
     pub fb: Option<HostFb>,
+    /// M41 step 16: granted capabilities (perms::*) + the app name (for logs).
+    /// Protected host calls are refused here when the bit isn't set.
+    pub perms: u32,
+    pub app_name: String,
+}
+
+impl Host {
+    /// Refuse a protected host call the app lacks permission for. Returns the
+    /// rejection value if denied, or None if allowed.
+    fn deny(&self, cap: u32) -> Option<i64> {
+        if self.perms & cap == 0 {
+            crate::kprintln!(
+                "PERM_DENIED: {} blocked a {} call from {}",
+                "kernel",
+                crate::perms::name(cap),
+                self.app_name
+            );
+            Some(-1)
+        } else {
+            None
+        }
+    }
 }
 
 /// Read a guest string given (ptr, len) i64 args.
@@ -41,12 +63,18 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 
 impl Host {
     pub fn new() -> Host {
-        Host { output: String::new(), sockets: Vec::new(), fb: None }
+        Host { output: String::new(), sockets: Vec::new(), fb: None, perms: crate::perms::ALL, app_name: String::from("system") }
     }
 
     /// A host with a `w*h` drawing surface (for graphical apps).
     pub fn new_graphical(w: usize, h: usize) -> Host {
-        Host { output: String::new(), sockets: Vec::new(), fb: Some(HostFb { px: vec![0xff14_1414; w * h], w, h }) }
+        Host {
+            output: String::new(),
+            sockets: Vec::new(),
+            fb: Some(HostFb { px: vec![0xff14_1414; w * h], w, h }),
+            perms: crate::perms::ALL,
+            app_name: String::from("system"),
+        }
     }
 
     /// Dispatch an imported function call. Returns its (single) i32/i64 result.
@@ -96,12 +124,18 @@ impl Host {
                 Some(0)
             }
             "veil_store_set" => {
+                if let Some(r) = self.deny(crate::perms::FILESYSTEM) {
+                    return Some(r);
+                }
                 let k = mem_str(mem, *args.first()?, *args.get(1)?)?;
                 let v = mem_str(mem, *args.get(2)?, *args.get(3)?)?;
                 crate::browser::storage_set(true, "wasmapp", &k, &v);
                 Some(0)
             }
             "veil_store_get" => {
+                if let Some(r) = self.deny(crate::perms::FILESYSTEM) {
+                    return Some(r);
+                }
                 let k = mem_str(mem, *args.first()?, *args.get(1)?)?;
                 let out = *args.get(2)? as u32 as usize;
                 let cap = *args.get(3)? as u32 as usize;
@@ -113,11 +147,19 @@ impl Host {
                 }
                 Some(b.len() as i64)
             }
-            "veil_beep" => Some(0), // audio tone — reserved in the ABI, no-op here
+            "veil_beep" => {
+                if let Some(r) = self.deny(crate::perms::AUDIO) {
+                    return Some(r);
+                }
+                Some(0) // audio tone — reserved in the ABI, no-op here
+            }
             // ---- M41 step 11: Veil network host functions ----
             // veil_http_get(url_ptr, url_len, out_ptr, out_cap) -> body length
             // (full length even if truncated to out_cap; -1 on failure).
             "veil_http_get" | "veil_http_post" => {
+                if let Some(r) = self.deny(crate::perms::NETWORK) {
+                    return Some(r);
+                }
                 let url = mem_str(mem, *args.first()?, *args.get(1)?)?;
                 let (out_ptr, out_cap, body);
                 if field == "veil_http_post" {
@@ -147,6 +189,9 @@ impl Host {
             }
             // veil_dns_resolve(host_ptr, host_len) -> packed big-endian IPv4 (-1)
             "veil_dns_resolve" => {
+                if let Some(r) = self.deny(crate::perms::NETWORK) {
+                    return Some(r);
+                }
                 let host = mem_str(mem, *args.first()?, *args.get(1)?)?;
                 match parse_ipv4(&host).or_else(|| crate::net::dns_resolve(&host)) {
                     Some(ip) => Some(u32::from_be_bytes(ip) as i64),
@@ -155,6 +200,9 @@ impl Host {
             }
             // veil_tcp_connect(host_ptr, host_len, port) -> socket handle (-1)
             "veil_tcp_connect" => {
+                if let Some(r) = self.deny(crate::perms::NETWORK) {
+                    return Some(r);
+                }
                 let host = mem_str(mem, *args.first()?, *args.get(1)?)?;
                 let port = *args.get(2)? as u16;
                 let ip = parse_ipv4(&host).or_else(|| crate::net::dns_resolve(&host))?;
@@ -209,6 +257,9 @@ impl Host {
             }
             // veil_ws_connect(url_ptr, url_len) -> ws handle (-1)
             "veil_ws_connect" => {
+                if let Some(r) = self.deny(crate::perms::NETWORK) {
+                    return Some(r);
+                }
                 let url = mem_str(mem, *args.first()?, *args.get(1)?)?;
                 match crate::browser::js_ws_open(&url) {
                     Some(id) => Some(id as i64),

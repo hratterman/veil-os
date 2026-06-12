@@ -29,6 +29,10 @@ pub struct WasmState {
     data: Vec<u8>,
     mem: Vec<u8>,
     surface: Vec<u32>, // APP_W * APP_H, the last rendered frame
+    // M41 step 16: capability gating.
+    perms: u32,
+    perm_prompt: bool, // a first-launch permission dialog is showing
+    requested: u32,    // capabilities the dialog asks to grant
 }
 
 impl WasmState {
@@ -38,7 +42,15 @@ impl WasmState {
         // A graphical Veil app: run init + first render, keep memory + surface.
         if data.starts_with(b"\0asm") && wasm::app_has_render(&data) {
             kprintln!("WASMAPP: {name} is a graphical Veil app (render export)");
-            let frame = wasm::app_frame(&data, APP_W, APP_H, None, Some(("init", &[])));
+            let perms = crate::perms::for_app(name);
+            // First-launch permission dialog for an untrusted app: ask for the
+            // capabilities it doesn't already hold (default request: net + fs).
+            let want = crate::perms::NETWORK | crate::perms::FILESYSTEM;
+            let perm_prompt = !crate::perms::is_system(name) && (perms & want) != want;
+            if perm_prompt {
+                kprintln!("PERMS: {name} requests {} — showing permission dialog", crate::perms::list(want));
+            }
+            let frame = wasm::app_frame(&data, APP_W, APP_H, None, Some(("init", &[])), perms, name);
             let (surface, mem) = match frame {
                 Some(f) => (f.px, f.mem),
                 None => (alloc::vec![BG; APP_W * APP_H], Vec::new()),
@@ -51,6 +63,9 @@ impl WasmState {
                 data,
                 mem,
                 surface,
+                perms,
+                perm_prompt,
+                requested: want,
             };
         }
 
@@ -91,7 +106,17 @@ impl WasmState {
             lines.push((String::from("not a WASM module"), 0xffd0_5a4a));
         }
         kprintln!("WASMAPP_OK: ran {name}");
-        WasmState { name: String::from(name), lines, graphical: false, data: Vec::new(), mem: Vec::new(), surface: Vec::new() }
+        WasmState {
+            name: String::from(name),
+            lines,
+            graphical: false,
+            data: Vec::new(),
+            mem: Vec::new(),
+            surface: Vec::new(),
+            perms: crate::perms::ALL,
+            perm_prompt: false,
+            requested: 0,
+        }
     }
 
     fn run_compute(data: &[u8], lines: &mut Vec<(String, u32)>, name: &str) -> bool {
@@ -113,16 +138,46 @@ impl WasmState {
     }
 }
 
-/// A content click in a graphical app: dispatch `on_click(x, y)`, re-render.
+// Permission-dialog button geometry (surface coords).
+const PD_ALLOW: (isize, isize, isize, isize) = (APP_W as isize / 2 - 150, APP_H as isize / 2 + 10, 130, 34);
+const PD_DENY: (isize, isize, isize, isize) = (APP_W as isize / 2 + 20, APP_H as isize / 2 + 10, 130, 34);
+
+fn hit(b: (isize, isize, isize, isize), x: isize, y: isize) -> bool {
+    x >= b.0 && x < b.0 + b.2 && y >= b.1 && y < b.1 + b.3
+}
+
+/// A content click in a graphical app: the permission dialog, or `on_click`.
 pub fn click(win: &mut Window, rx: isize, ry: isize) {
-    let (data, mem) = {
+    let (data, mem, prompt, name, requested) = {
         let App::Wasm(st) = &win.app else { return };
         if !st.graphical || rx < 0 || ry < 0 {
             return;
         }
-        (st.data.clone(), st.mem.clone())
+        (st.data.clone(), st.mem.clone(), st.perm_prompt, st.name.clone(), st.requested)
     };
-    let frame = wasm::app_frame(&data, APP_W, APP_H, Some(mem), Some(("on_click", &[rx as i64, ry as i64])));
+    // Permission dialog: Allow grants the requested caps and re-runs; Deny just
+    // dismisses (the app keeps running with whatever it already had).
+    if prompt {
+        if hit(PD_ALLOW, rx, ry) {
+            crate::perms::grant(&name, requested);
+        } else if !hit(PD_DENY, rx, ry) {
+            return; // click elsewhere: leave the dialog up
+        }
+        let perms = crate::perms::for_app(&name);
+        let frame = wasm::app_frame(&data, APP_W, APP_H, Some(mem), None, perms, &name);
+        if let App::Wasm(st) = &mut win.app {
+            st.perm_prompt = false;
+            st.perms = perms;
+            if let Some(f) = frame {
+                st.surface = f.px;
+                st.mem = f.mem;
+            }
+        }
+        render(win);
+        return;
+    }
+    let perms = crate::perms::for_app(&name);
+    let frame = wasm::app_frame(&data, APP_W, APP_H, Some(mem), Some(("on_click", &[rx as i64, ry as i64])), perms, &name);
     if let (App::Wasm(st), Some(f)) = (&mut win.app, frame) {
         st.surface = f.px;
         st.mem = f.mem;
@@ -131,9 +186,9 @@ pub fn click(win: &mut Window, rx: isize, ry: isize) {
 }
 
 pub fn render(win: &mut Window) {
-    let (graphical, surface, lines) = {
+    let (graphical, surface, lines, prompt, name, requested) = {
         let App::Wasm(st) = &win.app else { return };
-        (st.graphical, st.surface.clone(), st.lines.clone())
+        (st.graphical, st.surface.clone(), st.lines.clone(), st.perm_prompt, st.name.clone(), st.requested)
     };
     let (cw, ch) = (win.cw, win.ch);
     let fb = win.canvas_fb();
@@ -141,6 +196,21 @@ pub fn render(win: &mut Window) {
     if graphical && surface.len() == APP_W * APP_H {
         let _ = (cw, ch);
         fb.blit(0, 0, &surface, APP_W, APP_H); // clipped to the canvas
+        if prompt {
+            use crate::freetype::FontId;
+            // Dim, then a centered permission card.
+            fb.blend_rect(0, 0, APP_W.min(cw), APP_H.min(ch), 0xff00_0000, 150);
+            let (bx, by, bw, bh) = (APP_W / 2 - 170, APP_H / 2 - 60, 340, 140);
+            fb.fill_round_rect(bx, by, bw, bh, 8, 0xff24_2832);
+            fb.draw_text(bx + 16, by + 12, "Permission request", FontId::Ui, 18, 0xff5b_8af0);
+            let msg = format!("\"{name}\" wants access to:");
+            fb.draw_text(bx + 16, by + 40, &msg, FontId::Ui, 14, 0xffd0_d8e0);
+            fb.draw_text(bx + 16, by + 60, &crate::perms::list(requested), FontId::Ui, 14, 0xffff_d060);
+            fb.fill_round_rect((PD_ALLOW.0) as usize, (PD_ALLOW.1) as usize, PD_ALLOW.2 as usize, PD_ALLOW.3 as usize, 5, 0xff2f_9e6b);
+            fb.draw_text((PD_ALLOW.0 + 38) as usize, (PD_ALLOW.1 + 8) as usize, "Allow", FontId::Ui, 15, 0xffffffff);
+            fb.fill_round_rect((PD_DENY.0) as usize, (PD_DENY.1) as usize, PD_DENY.2 as usize, PD_DENY.3 as usize, 5, 0xff80_4040);
+            fb.draw_text((PD_DENY.0 + 42) as usize, (PD_DENY.1 + 8) as usize, "Deny", FontId::Ui, 15, 0xffffffff);
+        }
         return;
     }
     let mut y = 8;

@@ -14,7 +14,7 @@ pub struct SettingsState {
     pub test_sound: bool,  // one-shot request flag the WM consumes
 }
 
-const PAGES: [&str; 4] = ["Display", "Sound", "System", "About"];
+const PAGES: [&str; 5] = ["Display", "Sound", "System", "Apps", "About"];
 const BG: u32 = 0xff1a_1a1a;
 const SIDE_BG: u32 = 0xff14_1414;
 const ACCENT: u32 = 0xff5b_8af0;
@@ -86,6 +86,17 @@ pub fn click(win: &mut Window, rx: isize, ry: isize) -> bool {
                 st.test_sound = true;
             }
         }
+        3 => {
+            // Apps & Permissions: a Revoke button per granted app.
+            let cw = win.cw as isize;
+            for (i, (name, _)) in crate::perms::all_grants().iter().enumerate() {
+                let y = 78 + i as isize * 30;
+                if (y - 4..y + 22).contains(&ry) && rx >= cw - 92 {
+                    crate::perms::revoke(name, crate::perms::ALL);
+                    break;
+                }
+            }
+        }
         _ => {}
     }
     render(win);
@@ -131,6 +142,20 @@ pub fn render(win: &mut Window) {
             fb.draw_text(x0, 50, &format!("Username: {username}"), FontId::Ui, 15, 0xffd0d0d0);
             fb.draw_text(x0, 78, &format!("Uptime: {:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60), FontId::Ui, 15, 0xffd0d0d0);
             fb.draw_text(x0, 106, &format!("Apps running: {}", crate::wm::window_count()), FontId::Ui, 15, 0xffd0d0d0);
+        }
+        3 => {
+            fb.draw_text(x0, 50, "App permissions (third-party apps)", FontId::Ui, 14, 0xffb0b0b0);
+            let grants = crate::perms::all_grants();
+            if grants.is_empty() {
+                fb.draw_text(x0, 80, "No app permissions granted yet.", FontId::Ui, 13, 0xff808080);
+            }
+            for (i, (name, bits)) in grants.iter().enumerate() {
+                let y = 78 + i * 30;
+                fb.draw_text(x0, y + 2, &format!("{name}", name = name), FontId::Ui, 14, 0xffe0e0e0);
+                fb.draw_text(x0 + 130, y + 4, &crate::perms::list(*bits), FontId::Ui, 12, 0xffffd060);
+                fb.fill_round_rect(cw - 92, y, 76, 22, 4, 0xff80_4040);
+                fb.draw_text(cw - 80, y + 4, "Revoke", FontId::Ui, 12, 0xffffffff);
+            }
         }
         _ => {
             let lines = [

@@ -50,6 +50,7 @@ mod mp3;
 mod net;
 mod netdev;
 mod paging;
+mod perms;
 #[cfg(feature = "pi4")]
 mod pi4;
 mod png;

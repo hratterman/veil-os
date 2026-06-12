@@ -71,9 +71,13 @@ pub fn app_frame(
     h: usize,
     mem: Option<Vec<u8>>,
     cb: Option<(&str, &[i64])>,
+    perms: u32,
+    app_name: &str,
 ) -> Option<AppFrame> {
     let module = parser::parse(data)?;
     let mut host = host::Host::new_graphical(w, h);
+    host.perms = perms;
+    host.app_name = String::from(app_name);
     let mut inst = runtime::Instance::new(&module, &mut host);
     if let Some(m) = mem {
         let n = m.len().min(inst.mem.len());

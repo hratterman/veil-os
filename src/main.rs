@@ -148,6 +148,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::webgl_selftest(); // M42 step 3: WebGL -> GLSL shaders + software rasteriser -> triangle
         browser::css_selftest(); // M42 step 4: full CSS (position/overflow/text-transform/flex-col/...)
         js::multiwindow_selftest(); // M42 step 5: window.open proxy + postMessage between windows
+        js::game_selftest(); // M42 step 11: Star Dodger — Canvas2D+WebAudio+rAF+localStorage game
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
         shell::selftest(); // M41: bash-subset shell interpreter
         shell::coreutils_selftest(); // M41: grep(regex)/sed/awk/cut/tr standalone tools

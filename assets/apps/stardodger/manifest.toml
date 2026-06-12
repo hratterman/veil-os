@@ -1,0 +1,6 @@
+name = "stardodger"
+version = "1.0.0"
+description = "Star Dodger — a Canvas 2D + Web Audio arcade game"
+author = "henry"
+entry = "game.htm"
+permissions = ["storage"]

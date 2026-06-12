@@ -85,6 +85,44 @@ impl Parser {
             self.bump();
             return Stmt::FuncDecl(Box::new(self.func(true)));
         }
+        // async function declaration
+        if matches!(self.peek(), Tok::Ident(i) if i == "async") && matches!(self.peek2(), Tok::Ident(i) if i == "function") {
+            self.bump(); // async
+            self.bump(); // function
+            return Stmt::FuncDecl(Box::new(self.func_flags(true, true)));
+        }
+        // class declaration
+        if matches!(self.peek(), Tok::Ident(i) if i == "class") {
+            let c = self.class_expr();
+            let name = if let Expr::Class(cb) = &c { cb.name.clone() } else { None };
+            if let Some(n) = name {
+                // bind the class to its name like a const declaration
+                return Stmt::Decl(alloc::vec![(Pat::Ident(n), Some(c))]);
+            }
+            return Stmt::Expr(c);
+        }
+        // ES module syntax: import ... ; export ... — we run scripts in one
+        // shared global, so treat `export` as a no-op wrapper and skip `import`.
+        if matches!(self.peek(), Tok::Ident(i) if i == "import") {
+            self.skip_import();
+            return Stmt::Empty;
+        }
+        if matches!(self.peek(), Tok::Ident(i) if i == "export") {
+            self.bump(); // export
+            if self.eat_kw("default") {
+                let e = self.assign();
+                self.eat_punct(";");
+                return Stmt::Expr(e);
+            }
+            if matches!(self.peek(), Tok::Punct("{")) {
+                // export { a, b } — names already in scope; skip
+                self.skip_braces();
+                self.eat_punct(";");
+                return Stmt::Empty;
+            }
+            // export const/let/var/function/class … : parse the inner statement
+            return self.stmt();
+        }
         if self.eat_kw("return") {
             if self.is_punct(";") || self.is_punct("}") || self.at_eof() {
                 self.eat_punct(";");
@@ -186,13 +224,63 @@ impl Parser {
                     }
                     break;
                 }
-                items.push(self.pattern());
+                if self.is_punct(",") {
+                    // elision: [, x]
+                    items.push(Pat::Ident(String::from("_")));
+                    self.bump();
+                    continue;
+                }
+                let mut p = self.pattern();
+                if self.eat_punct("=") {
+                    p = Pat::Default(Box::new(p), Box::new(self.assign()));
+                }
+                items.push(p);
                 if !self.eat_punct(",") {
                     break;
                 }
             }
             self.expect_punct("]");
             Pat::Array(items, rest)
+        } else if self.eat_punct("{") {
+            // object destructuring: { a, b: c, d = 1, ...rest }
+            let mut props = Vec::new();
+            let mut rest = None;
+            while !self.is_punct("}") && !self.at_eof() {
+                if self.eat_punct("...") {
+                    if let Tok::Ident(n) = self.bump() {
+                        rest = Some(n);
+                    }
+                    break;
+                }
+                let key = match self.peek().clone() {
+                    Tok::Ident(i) => {
+                        self.bump();
+                        i
+                    }
+                    Tok::Str(s) => {
+                        self.bump();
+                        s
+                    }
+                    _ => {
+                        self.bump();
+                        String::from("_")
+                    }
+                };
+                let mut sub = if self.eat_punct(":") {
+                    self.pattern()
+                } else {
+                    Pat::Ident(key.clone())
+                };
+                if self.eat_punct("=") {
+                    sub = Pat::Default(Box::new(sub), Box::new(self.assign()));
+                }
+                props.push((key, sub));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("}");
+            Pat::Object(props, rest)
         } else if let Tok::Ident(n) = self.peek().clone() {
             self.bump();
             Pat::Ident(n)
@@ -341,9 +429,120 @@ impl Parser {
         Stmt::Block(chain)
     }
 
+    // ---- classes / modules -------------------------------------------------
+
+    fn class_expr(&mut self) -> Expr {
+        self.bump(); // `class`
+        let name = if let Tok::Ident(n) = self.peek().clone() {
+            if n != "extends" {
+                self.bump();
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let parent = if matches!(self.peek(), Tok::Ident(i) if i == "extends") {
+            self.bump();
+            Some(Box::new(self.postfix_no_call()))
+        } else {
+            None
+        };
+        self.expect_punct("{");
+        let mut ctor = None;
+        let mut methods: Vec<(String, Func, bool, &'static str)> = Vec::new();
+        while !self.is_punct("}") && !self.at_eof() {
+            if self.eat_punct(";") {
+                continue;
+            }
+            let is_static = matches!(self.peek(), Tok::Ident(i) if i == "static")
+                && !matches!(self.peek2(), Tok::Punct("(") | Tok::Punct("="));
+            if is_static {
+                self.bump();
+            }
+            let mut kind = "method";
+            if let Tok::Ident(g) = self.peek().clone() {
+                if (g == "get" || g == "set") && !matches!(self.peek2(), Tok::Punct("(") | Tok::Punct("=")) {
+                    self.bump();
+                    kind = if g == "get" { "get" } else { "set" };
+                }
+            }
+            let is_async = matches!(self.peek(), Tok::Ident(i) if i == "async")
+                && !matches!(self.peek2(), Tok::Punct("(") | Tok::Punct("="));
+            if is_async {
+                self.bump();
+            }
+            let is_gen = self.eat_punct("*");
+            let mname = self.prop_name();
+            // class fields: name = value;  (store as a pseudo-method we run in ctor)
+            if self.is_punct("=") {
+                self.bump();
+                let init = self.assign();
+                self.eat_punct(";");
+                // model a field initializer as a method named "@field:name"
+                let f = Func {
+                    name: None, params: Vec::new(),
+                    body: alloc::vec![Stmt::Expr(Expr::Assign("=",
+                        Box::new(Expr::Member(Box::new(Expr::This), mname.clone(), false)),
+                        Box::new(init)))],
+                    expr_body: None, arrow: false, is_async: false, is_generator: false,
+                };
+                methods.push((alloc::format!("@field:{mname}"), f, is_static, "field"));
+                continue;
+            }
+            let params = self.params();
+            let body = self.block();
+            let f = Func { name: Some(mname.clone()), params, body, expr_body: None, arrow: false, is_async, is_generator: is_gen };
+            if mname == "constructor" && kind == "method" && !is_static {
+                ctor = Some(f);
+            } else {
+                methods.push((mname, f, is_static, match kind { "get" => "get", "set" => "set", _ => "method" }));
+            }
+        }
+        self.expect_punct("}");
+        Expr::Class(Box::new(Class { name, parent, ctor, methods }))
+    }
+
+    fn skip_import(&mut self) {
+        // import ... from 'mod';  or  import 'mod';  — consume to the semicolon
+        // or end of line's statement. We run all scripts in one global, so the
+        // imported names are expected to already be defined.
+        self.bump(); // import
+        while !self.is_punct(";") && !self.at_eof() {
+            if matches!(self.peek(), Tok::Ident(i) if i == "from") {
+                self.bump();
+                self.bump(); // the module string
+                break;
+            }
+            self.bump();
+        }
+        self.eat_punct(";");
+    }
+
+    fn skip_braces(&mut self) {
+        if !self.eat_punct("{") {
+            return;
+        }
+        let mut depth = 1;
+        while depth > 0 && !self.at_eof() {
+            if self.is_punct("{") {
+                depth += 1;
+            } else if self.is_punct("}") {
+                depth -= 1;
+            }
+            self.bump();
+        }
+    }
+
     // ---- functions ---------------------------------------------------------
 
     fn func(&mut self, named: bool) -> Func {
+        self.func_flags(named, false)
+    }
+
+    fn func_flags(&mut self, named: bool, is_async: bool) -> Func {
+        let is_generator = self.eat_punct("*");
         let name = if named {
             if let Tok::Ident(n) = self.peek().clone() {
                 if !is_keyword(&n) {
@@ -360,7 +559,7 @@ impl Parser {
         };
         let params = self.params();
         let body = self.block();
-        Func { name, params, body, expr_body: None, arrow: false }
+        Func { name, params, body, expr_body: None, arrow: false, is_async, is_generator }
     }
 
     fn params(&mut self) -> Vec<Pat> {
@@ -374,13 +573,14 @@ impl Parser {
                 }
                 break;
             }
-            let mut pat = self.pattern();
-            // default param value: ignore the default, keep the binding
-            if self.eat_punct("=") {
-                let _ = self.assign();
-            }
-            // (object-destructuring params are not used by the target pages)
-            let _ = &mut pat;
+            let pat = self.pattern();
+            // default param value: wrap the binding so the interpreter can fill
+            // it when the argument is missing/undefined.
+            let pat = if self.eat_punct("=") {
+                Pat::Default(Box::new(pat), Box::new(self.assign()))
+            } else {
+                pat
+            };
             out.push(pat);
             if !self.eat_punct(",") {
                 break;
@@ -417,8 +617,29 @@ impl Parser {
         lhs
     }
 
-    /// Recognise `ident =>` and `( params ) =>` arrow functions.
+    /// Recognise `ident =>`, `( params ) =>`, and their `async` forms.
     fn try_arrow(&mut self) -> Option<Expr> {
+        // async arrow: `async ident =>` or `async (...) =>`
+        if matches!(self.peek(), Tok::Ident(i) if i == "async") {
+            if let Tok::Ident(n) = self.peek2().clone() {
+                if !is_keyword(&n) && matches!(self.t.get(self.p + 2), Some(Tok::Punct("=>"))) {
+                    self.bump(); // async
+                    self.bump(); // ident
+                    self.bump(); // =>
+                    return Some(self.arrow_body_async(alloc::vec![Pat::Ident(n)], true));
+                }
+            }
+            if matches!(self.peek2(), Tok::Punct("(")) {
+                let save = self.p;
+                self.bump(); // async
+                if self.is_punct("(") && self.paren_is_arrow() {
+                    let params = self.params();
+                    self.expect_punct("=>");
+                    return Some(self.arrow_body_async(params, true));
+                }
+                self.p = save;
+            }
+        }
         // single ident arrow
         if let Tok::Ident(n) = self.peek().clone() {
             if !is_keyword(&n) && matches!(self.peek2(), Tok::Punct("=>")) {
@@ -458,12 +679,16 @@ impl Parser {
     }
 
     fn arrow_body(&mut self, params: Vec<Pat>) -> Expr {
+        self.arrow_body_async(params, false)
+    }
+
+    fn arrow_body_async(&mut self, params: Vec<Pat>, is_async: bool) -> Expr {
         if self.is_punct("{") {
             let body = self.block();
-            Expr::Arrow(Box::new(Func { name: None, params, body, expr_body: None, arrow: true }))
+            Expr::Arrow(Box::new(Func { name: None, params, body, expr_body: None, arrow: true, is_async, is_generator: false }))
         } else {
             let e = self.assign();
-            Expr::Arrow(Box::new(Func { name: None, params, body: Vec::new(), expr_body: Some(Box::new(e)), arrow: true }))
+            Expr::Arrow(Box::new(Func { name: None, params, body: Vec::new(), expr_body: Some(Box::new(e)), arrow: true, is_async, is_generator: false }))
         }
     }
 
@@ -532,6 +757,22 @@ impl Parser {
         if self.is_kw("delete") {
             self.bump();
             return Expr::Unary("delete", Box::new(self.unary()));
+        }
+        // await expr (contextual; treat as a prefix operator)
+        if matches!(self.peek(), Tok::Ident(i) if i == "await")
+            && !matches!(self.peek2(), Tok::Punct("=>") | Tok::Punct("=") | Tok::Punct(".") | Tok::Punct(";") | Tok::Punct(")"))
+        {
+            self.bump();
+            return Expr::Await(Box::new(self.unary()));
+        }
+        // yield [*] expr inside a generator
+        if matches!(self.peek(), Tok::Ident(i) if i == "yield") {
+            self.bump();
+            let delegate = self.eat_punct("*");
+            if self.is_punct(";") || self.is_punct(")") || self.is_punct("}") || self.is_punct(",") || self.at_eof() {
+                return Expr::Yield(None, delegate);
+            }
+            return Expr::Yield(Some(Box::new(self.assign())), delegate);
         }
         // prefix ++/--
         for op in ["++", "--"].iter() {
@@ -678,8 +919,29 @@ impl Parser {
                         self.bump();
                         Expr::Func(Box::new(self.func(true)))
                     }
+                    "async" if matches!(self.peek2(), Tok::Ident(i) if i == "function") => {
+                        self.bump(); // async
+                        self.bump(); // function
+                        Expr::Func(Box::new(self.func_flags(true, true)))
+                    }
+                    "class" => self.class_expr(),
+                    "super" => {
+                        self.bump();
+                        if self.eat_punct(".") {
+                            let name = self.ident_name();
+                            Expr::Super(Some(name))
+                        } else {
+                            Expr::Super(None)
+                        }
+                    }
                     "new" => {
                         self.bump();
+                        if matches!(self.peek(), Tok::Punct(".")) {
+                            // new.target — not supported, evaluate to undefined
+                            self.bump();
+                            let _ = self.ident_name();
+                            return Expr::Undef;
+                        }
                         let callee = self.postfix_no_call();
                         let args = if self.is_punct("(") { self.args() } else { Vec::new() };
                         Expr::New(Box::new(callee), args)
@@ -719,12 +981,36 @@ impl Parser {
         self.expect_punct("{");
         let mut props = Vec::new();
         while !self.is_punct("}") && !self.at_eof() {
-            // spread in object: ...x — skip (rare in target)
+            // object spread: ...x
             if self.eat_punct("...") {
-                let _ = self.assign();
+                let e = self.assign();
+                props.push((PropKey::Spread, e));
                 self.eat_punct(",");
                 continue;
             }
+            // getter/setter shorthand: get name() {}, set name(v) {}
+            if let Tok::Ident(g) = self.peek().clone() {
+                if (g == "get" || g == "set")
+                    && !matches!(self.peek2(), Tok::Punct(":") | Tok::Punct(",") | Tok::Punct("(") | Tok::Punct("}"))
+                {
+                    self.bump(); // get/set
+                    let name = self.prop_name();
+                    let params = self.params();
+                    let body = self.block();
+                    let f = Func { name: None, params, body, expr_body: None, arrow: false, is_async: false, is_generator: false };
+                    let key = if g == "get" { PropKey::Getter(name) } else { PropKey::Setter(name) };
+                    props.push((key, Expr::Func(Box::new(f))));
+                    self.eat_punct(",");
+                    continue;
+                }
+            }
+            // async / generator method shorthand
+            let is_async = matches!(self.peek(), Tok::Ident(i) if i == "async")
+                && !matches!(self.peek2(), Tok::Punct(":") | Tok::Punct(",") | Tok::Punct("(") | Tok::Punct("}"));
+            if is_async {
+                self.bump();
+            }
+            let is_gen = self.eat_punct("*");
             let key = match self.peek().clone() {
                 Tok::Str(s) => {
                     self.bump();
@@ -755,9 +1041,12 @@ impl Parser {
                 // method shorthand
                 let params = self.params();
                 let body = self.block();
-                Expr::Func(Box::new(Func { name: None, params, body, expr_body: None, arrow: false }))
+                Expr::Func(Box::new(Func { name: None, params, body, expr_body: None, arrow: false, is_async, is_generator: is_gen }))
             } else {
-                // shorthand { foo }
+                // shorthand { foo } or { foo = default } (destructuring-ish)
+                if self.eat_punct("=") {
+                    let _ = self.assign();
+                }
                 match &key {
                     PropKey::Ident(n) => Expr::Ident(n.clone()),
                     _ => Expr::Undef,
@@ -770,5 +1059,14 @@ impl Parser {
         }
         self.expect_punct("}");
         Expr::Object(props)
+    }
+
+    fn prop_name(&mut self) -> String {
+        match self.bump() {
+            Tok::Ident(n) => n,
+            Tok::Str(s) => s,
+            Tok::Num(n) => super::value::num_to_str(n),
+            _ => String::from("_"),
+        }
     }
 }

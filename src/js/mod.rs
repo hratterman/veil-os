@@ -69,6 +69,91 @@ pub fn selftest() {
     }
 }
 
+/// ES6+ feature self-test: exercise classes, destructuring, default params,
+/// spread, template literals, arrow fns, Map/Set, Object/Array statics, optional
+/// chaining, nullish coalescing, generators-ish, and async/await with a resolved
+/// Promise — writing the combined result into a DOM node we read back.
+pub fn es6_selftest() {
+    let skeleton = "<html><body><div id=out></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        class Animal {
+          constructor(name) { this.name = name; this.legs = 4; }
+          describe() { return `${this.name} has ${this.legs} legs`; }
+          static make(n) { return new Animal(n); }
+        }
+        class Dog extends Animal {
+          constructor(name) { super(name); this.sound = "woof"; }
+          describe() { return super.describe() + ` and says ${this.sound}`; }
+        }
+        const d = new Dog("Rex");
+        const { name, sound } = d;
+        const nums = [1, 2, 3, 4, 5];
+        const [first, ...rest] = nums;
+        const sum = nums.reduce((a, b) => a + b, 0);
+        const doubled = nums.map(n => n * 2).filter(n => n > 4);
+        const greet = (who = "world") => `hi ${who}`;
+        const m = new Map();
+        m.set("a", 1); m.set("b", 2);
+        const s = new Set([1, 1, 2, 3, 3]);
+        const obj = { x: 1, y: 2 };
+        const merged = { ...obj, z: 3 };
+        const keys = Object.keys(merged).join(",");
+        const maybe = null;
+        const safe = maybe?.foo ?? "fallback";
+        async function compute() {
+          const base = await Promise.resolve(10);
+          return base + sum;
+        }
+        let total = 0;
+        (async () => { total = await compute(); })();
+        const parsed = JSON.parse('{"ok":true,"n":42}');
+        const out = [
+          d.describe(),
+          `name=${name} sound=${sound}`,
+          `first=${first} rest=${rest.join("-")}`,
+          `sum=${sum} doubled=${doubled.join(",")}`,
+          greet(),
+          `map.size=${m.size} map.a=${m.get("a")}`,
+          `set.size=${s.size}`,
+          `keys=${keys}`,
+          `safe=${safe}`,
+          `total=${total}`,
+          `parsed.n=${parsed.n} parsed.ok=${parsed.ok}`,
+          `instanceof=${d instanceof Animal}`
+        ].join(" | ");
+        document.getElementById("out").textContent = out;
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    let out = node_text_by_id(&res.tree, "out");
+    crate::kprintln!("JS_ES6: {out}");
+    if !res.errors.is_empty() {
+        crate::kprintln!("JS_ES6: {} issue(s); first: {}", res.errors.len(), res.errors[0]);
+    }
+    // Acceptance: every feature produced its expected substring.
+    let checks = [
+        "Rex has 4 legs and says woof",
+        "name=Rex sound=woof",
+        "first=1 rest=2-3-4-5",
+        "sum=15 doubled=6,8,10",
+        "hi world",
+        "map.size=2 map.a=1",
+        "set.size=3",
+        "keys=x,y,z",
+        "safe=fallback",
+        "total=25",
+        "parsed.n=42 parsed.ok=true",
+        "instanceof=true",
+    ];
+    let pass = checks.iter().all(|c| out.contains(c));
+    if pass {
+        crate::kprintln!("JS_ES6_OK: classes, destructuring, defaults, spread, Map/Set, Object.keys, ?./??, async/await, Promise, JSON, instanceof all work");
+    } else {
+        let missing: alloc::vec::Vec<&str> = checks.iter().copied().filter(|c| !out.contains(c)).collect();
+        crate::kprintln!("JS_ES6_FAIL: missing {:?}", missing);
+    }
+}
+
 fn find_by_id<'a>(n: &'a Node, id: &str) -> Option<&'a Node> {
     if n.attr("id") == Some(id) {
         return Some(n);

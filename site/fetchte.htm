@@ -1,0 +1,19 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<h1>fetch + async/await test</h1>
+<div id="out">pending</div>
+<script>
+async function load() {
+  const res = await fetch('/echo?q=hello');
+  const text = await res.text();
+  const ok = res.ok;
+  const status = res.status;
+  const msg = `FETCHED status=${status} ok=${ok} bytes=${text.length} hasSubmitted=${text.includes('SUBMITTED')}`;
+  console.log(msg);
+  document.getElementById('out').textContent = msg;
+}
+load();
+</script>
+</body>
+</html>

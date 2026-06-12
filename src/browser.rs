@@ -850,6 +850,15 @@ fn http_post(path: &str, body: &[u8]) -> Option<(u32, String, Vec<u8>)> {
     http_request(path, Some(body))
 }
 
+/// Synchronous fetch used by the JS engine's `fetch()` — resolves a URL against
+/// the current page base, performs the request over our HTTP/TLS stack, and
+/// returns (status, content-type, body). `body` non-None makes it a POST.
+pub fn js_fetch(url: &str, body: Option<&str>) -> Option<(u32, String, Vec<u8>)> {
+    let resolved = resolve_href(url);
+    kprintln!("BROWSER: fetch() -> {resolved}");
+    http_request(&resolved, body.map(|b| b.as_bytes()))
+}
+
 /// Fetch `path`, optionally with a POST `body`. Local paths ("/page.htm") hit
 /// our own HTTP server on loopback; `https://` URLs use the from-scratch TLS 1.3
 /// stack directly; other external `http://` URLs go direct over our TCP stack,

@@ -47,6 +47,9 @@ pub struct Interp {
     pub listeners: Vec<Listener>,
     pub errors: Vec<String>,
     steps: u64,
+    /// Promise resolve/reject cells, indexed by the id baked into the
+    /// `__resolve:N` / `__reject:N` native function name.
+    resolvers: Vec<Rc<RefCell<(String, Val)>>>,
 }
 
 impl Interp {
@@ -60,6 +63,7 @@ impl Interp {
             listeners: Vec::new(),
             errors: Vec::new(),
             steps: 0,
+            resolvers: Vec::new(),
         };
         it.install_globals();
         it
@@ -81,9 +85,18 @@ impl Interp {
         for f in ["setTimeout", "setInterval", "requestAnimationFrame", "clearTimeout",
                   "clearInterval", "cancelAnimationFrame", "parseInt", "parseFloat", "isNaN",
                   "isFinite", "String", "Number", "Boolean", "Array", "Object", "JSON",
-                  "encodeURIComponent", "decodeURIComponent", "alert", "fetch", "addEventListener"] {
+                  "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
+                  "alert", "fetch", "addEventListener", "structuredClone", "queueMicrotask",
+                  // ES6 constructors / namespaces (callable + member access via
+                  // get_member returning "Name.prop" natives).
+                  "Promise", "Map", "Set", "WeakMap", "WeakSet", "Symbol", "Date",
+                  "RegExp", "Error", "TypeError", "RangeError", "SyntaxError",
+                  "ReferenceError", "Reflect", "Proxy", "BigInt"] {
             b.vars.insert(f.into(), Val::Native(Native::Global(Rc::from(f))));
         }
+        b.vars.insert("NaN".into(), Val::Num(f64::NAN));
+        b.vars.insert("Infinity".into(), Val::Num(f64::INFINITY));
+        b.vars.insert("undefined".into(), Val::Undef);
     }
 
     /// Run a script's source against the current DOM. Errors are recorded, not
@@ -156,7 +169,7 @@ impl Interp {
                         Some(e) => self.eval(e, scope)?,
                         None => Val::Undef,
                     };
-                    self.bind_pat(pat, v, scope);
+                    self.bind_pat(pat, v, scope)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -226,7 +239,7 @@ impl Interp {
                 let items = self.iterate(iter, scope)?;
                 for it in items {
                     let inner = new_scope(Some(scope.clone()));
-                    self.bind_pat(pat, it, &inner);
+                    self.bind_pat(pat, it, &inner)?;
                     match self.exec_block(body, &inner)? {
                         Flow::Break => break,
                         Flow::Return(v) => return Ok(Flow::Return(v)),
@@ -244,7 +257,7 @@ impl Interp {
                 };
                 for k in keys {
                     let inner = new_scope(Some(scope.clone()));
-                    self.bind_pat(pat, k, &inner);
+                    self.bind_pat(pat, k, &inner)?;
                     match self.exec_block(body, &inner)? {
                         Flow::Break => break,
                         Flow::Return(v) => return Ok(Flow::Return(v)),
@@ -285,22 +298,47 @@ impl Interp {
         }
     }
 
-    fn bind_pat(&mut self, pat: &Pat, val: Val, scope: &Scope) {
+    fn bind_pat(&mut self, pat: &Pat, val: Val, scope: &Scope) -> Result<(), Val> {
         match pat {
             Pat::Ident(n) => {
                 scope.borrow_mut().vars.insert(n.clone(), val);
             }
+            Pat::Default(inner, def) => {
+                let v = if matches!(val, Val::Undef) { self.eval(def, scope)? } else { val };
+                self.bind_pat(inner, v, scope)?;
+            }
             Pat::Array(items, rest) => {
                 let arr = self.to_vec(&val);
                 for (i, p) in items.iter().enumerate() {
-                    self.bind_pat(p, arr.get(i).cloned().unwrap_or(Val::Undef), scope);
+                    self.bind_pat(p, arr.get(i).cloned().unwrap_or(Val::Undef), scope)?;
                 }
                 if let Some(r) = rest {
                     let tail: Vec<Val> = arr.into_iter().skip(items.len()).collect();
                     scope.borrow_mut().vars.insert(r.clone(), Val::array(tail));
                 }
             }
+            Pat::Object(props, rest) => {
+                let mut taken: Vec<String> = Vec::new();
+                for (key, sub) in props {
+                    let v = self.get_member(val.clone(), key)?;
+                    taken.push(key.clone());
+                    self.bind_pat(sub, v, scope)?;
+                }
+                if let Some(r) = rest {
+                    // rest collects the remaining own enumerable props.
+                    let mut o = Obj::new();
+                    if let Val::Object(m) = &val {
+                        for (k, v) in m.borrow().iter() {
+                            if !taken.contains(k) && !k.starts_with("__") {
+                                o.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    scope.borrow_mut().vars.insert(r.clone(), Val::object(o));
+                }
+            }
         }
+        Ok(())
     }
 
     fn iterate(&mut self, e: &Expr, scope: &Scope) -> Result<Vec<Val>, Val> {
@@ -353,12 +391,43 @@ impl Interp {
             Expr::Object(props) => {
                 let mut o = Obj::new();
                 for (k, v) in props {
-                    let key = match k {
-                        PropKey::Ident(s) => s.clone(),
-                        PropKey::Computed(e) => self.eval(e, scope)?.to_str(),
-                    };
-                    let val = self.eval(v, scope)?;
-                    o.insert(key, val);
+                    match k {
+                        PropKey::Spread => {
+                            let src = self.eval(v, scope)?;
+                            match src {
+                                Val::Object(m) => {
+                                    for (kk, vv) in m.borrow().iter() {
+                                        if !kk.starts_with("__") {
+                                            o.insert(kk.clone(), vv.clone());
+                                        }
+                                    }
+                                }
+                                Val::Array(a) => {
+                                    for (i, vv) in a.borrow().iter().enumerate() {
+                                        o.insert(i.to_string(), vv.clone());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        PropKey::Getter(name) => {
+                            let f = self.eval(v, scope)?;
+                            o.insert(alloc::format!("__get:{name}"), f);
+                        }
+                        PropKey::Setter(name) => {
+                            let f = self.eval(v, scope)?;
+                            o.insert(alloc::format!("__set:{name}"), f);
+                        }
+                        PropKey::Ident(s) => {
+                            let val = self.eval(v, scope)?;
+                            o.insert(s.clone(), val);
+                        }
+                        PropKey::Computed(e) => {
+                            let key = self.eval(e, scope)?.to_str();
+                            let val = self.eval(v, scope)?;
+                            o.insert(key, val);
+                        }
+                    }
                 }
                 Ok(Val::object(o))
             }
@@ -393,6 +462,9 @@ impl Interp {
             Expr::Binary(op, a, b) => {
                 let l = self.eval(a, scope)?;
                 let r = self.eval(b, scope)?;
+                if *op == "instanceof" {
+                    return Ok(Val::Bool(self.instance_of(&l, &r)));
+                }
                 Ok(binop(op, l, r))
             }
             Expr::Logical(op, a, b) => {
@@ -455,16 +527,58 @@ impl Interp {
             }
             Expr::Call(callee, args, opt) => self.eval_call(callee, args, *opt, scope),
             Expr::New(callee, args) => {
-                // Minimal: most constructors used (Date, Error) return an object.
-                let _ = (callee, args);
-                let mut o = Obj::new();
-                o.insert("__new".into(), Val::Bool(true));
-                Ok(Val::object(o))
+                let ctor = self.eval(callee, scope)?;
+                let ctor_name = match &**callee {
+                    Expr::Ident(n) => n.clone(),
+                    Expr::Member(_, p, _) => p.clone(),
+                    _ => String::new(),
+                };
+                let argv = self.eval_args(args, scope)?;
+                self.construct(ctor, &ctor_name, argv)
+            }
+            Expr::Await(e) => {
+                let v = self.eval(e, scope)?;
+                self.await_val(v)
+            }
+            Expr::Yield(e, _) => match e {
+                Some(e) => self.eval(e, scope),
+                None => Ok(Val::Undef),
+            },
+            Expr::Class(c) => self.eval_class(c, scope),
+            Expr::Super(prop) => {
+                // bare `super` value: return the superclass; super.prop read.
+                let sc = self.current_super(scope);
+                match prop {
+                    None => Ok(sc),
+                    Some(p) => {
+                        let m = self.class_lookup_method(&sc, p);
+                        Ok(m.unwrap_or(Val::Undef))
+                    }
+                }
             }
         }
     }
 
     fn eval_call(&mut self, callee: &Expr, args: &[Expr], opt: bool, scope: &Scope) -> Result<Val, Val> {
+        // super(...) and super.method(...) inside a class
+        if let Expr::Super(prop) = callee {
+            let argv = self.eval_args(args, scope)?;
+            let this = self.lookup(scope, "this").unwrap_or(Val::Undef);
+            let sc = self.current_super(scope);
+            match prop {
+                None => {
+                    // super(...) — run the parent constructor chain on `this`.
+                    self.run_ctor_chain(&sc, this, argv)?;
+                    return Ok(Val::Undef);
+                }
+                Some(p) => {
+                    if let Some(m) = self.class_lookup_method(&sc, p) {
+                        return self.call(m, this, argv);
+                    }
+                    return Ok(Val::Undef);
+                }
+            }
+        }
         // method calls: capture receiver
         let (func, this) = match callee {
             Expr::Member(obj, prop, mopt) => {
@@ -523,17 +637,29 @@ impl Interp {
                         }
                         _ => {
                             let v = args.get(i).cloned().unwrap_or(Val::Undef);
-                            self.bind_pat(p, v, &inner);
+                            self.bind_pat(p, v, &inner)?;
                         }
                     }
                 }
-                if let Some(eb) = &f.expr_body {
+                let result = if let Some(eb) = &f.expr_body {
                     self.eval(eb, &inner)
                 } else {
-                    match self.exec_block(&f.body, &inner)? {
-                        Flow::Return(v) => Ok(v),
-                        _ => Ok(Val::Undef),
+                    match self.exec_block(&f.body, &inner) {
+                        Ok(Flow::Return(v)) => Ok(v),
+                        Ok(_) => Ok(Val::Undef),
+                        Err(e) => Err(e),
                     }
+                };
+                // async functions resolve to a Promise (and capture a throw as a
+                // rejection) so `await f()` / `f().then()` work in our sync model.
+                if f.is_async {
+                    Ok(match result {
+                        Ok(v) if Self::is_promise(&v) => v,
+                        Ok(v) => self.make_promise("fulfilled", v),
+                        Err(e) => self.make_promise("rejected", e),
+                    })
+                } else {
+                    result
                 }
             }
             Val::Native(Native::Global(name)) => self.call_global(&name, args),
@@ -545,6 +671,543 @@ impl Interp {
                 }
             }
             _ => Ok(Val::Undef),
+        }
+    }
+
+    // ---- classes -----------------------------------------------------------
+
+    /// Evaluate a class expression into a class object: a Val::Object carrying
+    /// `__class`, `__ctor`, `__methods`, `__getters`, `__setters`, `__fields`,
+    /// `__parent`, plus static members as direct keys.
+    fn eval_class(&mut self, c: &Class, scope: &Scope) -> Result<Val, Val> {
+        let parent = match &c.parent {
+            Some(e) => self.eval(e, scope)?,
+            None => Val::Null,
+        };
+        let mut obj = Obj::new();
+        let name = c.name.clone().unwrap_or_else(|| String::from("Class"));
+        obj.insert("__class".into(), Val::str(name));
+        obj.insert("__parent".into(), parent);
+        if let Some(ctor) = &c.ctor {
+            obj.insert("__ctor".into(), Val::Func(rc_func(ctor), scope.clone()));
+        }
+        let mut methods = Obj::new();
+        let mut getters = Obj::new();
+        let mut setters = Obj::new();
+        let mut fields: Vec<Val> = Vec::new();
+        for (mname, f, is_static, kind) in &c.methods {
+            let fv = Val::Func(rc_func(f), scope.clone());
+            if *kind == "field" {
+                // "@field:x" — field initializer; statics run now, instance later
+                if *is_static {
+                    let _ = self.call(fv, Val::object(obj.clone()), Vec::new());
+                } else {
+                    fields.push(fv);
+                }
+                continue;
+            }
+            if *is_static {
+                obj.insert(mname.clone(), fv);
+            } else if *kind == "get" {
+                getters.insert(mname.clone(), fv);
+            } else if *kind == "set" {
+                setters.insert(mname.clone(), fv);
+            } else {
+                methods.insert(mname.clone(), fv);
+            }
+        }
+        obj.insert("__methods".into(), Val::object(methods));
+        obj.insert("__getters".into(), Val::object(getters));
+        obj.insert("__setters".into(), Val::object(setters));
+        obj.insert("__fields".into(), Val::array(fields));
+        Ok(Val::object(obj))
+    }
+
+    /// The superclass visible from the current scope: the `__superclass` bound
+    /// in a constructor, or (inside an instance method) the parent of the
+    /// instance's own class — `this.__classref.__parent`.
+    fn current_super(&self, scope: &Scope) -> Val {
+        if let Some(sc) = self.lookup(scope, "__superclass") {
+            if !matches!(sc, Val::Undef) {
+                return sc;
+            }
+        }
+        if let Some(Val::Object(inst)) = self.lookup(scope, "this") {
+            if let Some(Val::Object(cls)) = inst.borrow().get("__classref") {
+                return cls.borrow().get("__parent").cloned().unwrap_or(Val::Null);
+            }
+        }
+        Val::Null
+    }
+
+    /// Look up an instance method `name` walking a class's parent chain.
+    fn class_lookup_method(&self, cls: &Val, name: &str) -> Option<Val> {
+        let mut cur = cls.clone();
+        loop {
+            let Val::Object(m) = &cur else { return None };
+            let b = m.borrow();
+            if let Some(Val::Object(methods)) = b.get("__methods") {
+                if let Some(f) = methods.borrow().get(name) {
+                    return Some(f.clone());
+                }
+            }
+            let parent = b.get("__parent").cloned().unwrap_or(Val::Null);
+            drop(b);
+            cur = parent;
+            if matches!(cur, Val::Null | Val::Undef) {
+                return None;
+            }
+        }
+    }
+
+    /// Is `cls` a class object (has __methods)?
+    fn is_class(v: &Val) -> bool {
+        matches!(v, Val::Object(m) if m.borrow().contains_key("__methods"))
+    }
+
+    /// `obj instanceof ctor`: walk the instance's class chain comparing class
+    /// names, or match a builtin constructor against the value's shape.
+    fn instance_of(&self, obj: &Val, ctor: &Val) -> bool {
+        // builtin: Array / Object / Map / Set / Promise / Error
+        if let Val::Native(Native::Global(name)) = ctor {
+            return match &**name {
+                "Array" => matches!(obj, Val::Array(_)),
+                "Object" => matches!(obj, Val::Object(_) | Val::Array(_)),
+                "Map" | "WeakMap" => matches!(obj, Val::Object(m) if m.borrow().contains_key("__map")),
+                "Set" | "WeakSet" => matches!(obj, Val::Object(m) if m.borrow().contains_key("__set")),
+                "Promise" => Self::is_promise(obj),
+                "Error" | "TypeError" | "RangeError" => matches!(obj, Val::Object(m) if m.borrow().contains_key("stack")),
+                "Function" => matches!(obj, Val::Func(..) | Val::Native(_)),
+                _ => false,
+            };
+        }
+        // class instance: compare the instance's class chain to `ctor`'s name.
+        let target = if let Val::Object(m) = ctor {
+            m.borrow().get("__class").map(|v| v.to_str())
+        } else {
+            None
+        };
+        let Some(target) = target else { return false };
+        let mut cur = if let Val::Object(m) = obj {
+            m.borrow().get("__classref").cloned()
+        } else {
+            None
+        };
+        while let Some(Val::Object(m)) = cur {
+            if m.borrow().get("__class").map(|v| v.to_str()).as_deref() == Some(target.as_str()) {
+                return true;
+            }
+            cur = m.borrow().get("__parent").cloned();
+        }
+        false
+    }
+
+    /// Construct an instance, by class object or builtin constructor name.
+    fn construct(&mut self, ctor: Val, name: &str, args: Vec<Val>) -> Result<Val, Val> {
+        // Built-in constructors recognised by name.
+        match name {
+            "Promise" => return self.construct_promise(args),
+            "Map" | "WeakMap" => return self.construct_map(args),
+            "Set" | "WeakSet" => return self.construct_set(args),
+            "Array" => return Ok(self.call_global("Array", args)?),
+            "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
+                let mut o = Obj::new();
+                o.insert("message".into(), args.first().cloned().unwrap_or(Val::str("")));
+                o.insert("name".into(), Val::str(name.to_string()));
+                o.insert("stack".into(), Val::str(""));
+                return Ok(Val::object(o));
+            }
+            "Date" => {
+                let mut o = Obj::new();
+                o.insert("__date".into(), Val::Num(0.0));
+                return Ok(Val::object(o));
+            }
+            "Object" => return Ok(args.into_iter().next().unwrap_or_else(|| Val::object(Obj::new()))),
+            "RegExp" => {
+                let mut o = Obj::new();
+                o.insert("source".into(), args.first().cloned().unwrap_or(Val::str("")));
+                o.insert("__regex".into(), Val::Bool(true));
+                return Ok(Val::object(o));
+            }
+            _ => {}
+        }
+        if Self::is_class(&ctor) {
+            return self.instantiate_class(&ctor, args);
+        }
+        // Pre-ES6 constructor function: run with this = fresh object.
+        if let Val::Func(..) = &ctor {
+            let obj = Val::object(Obj::new());
+            let r = self.call(ctor, obj.clone(), args)?;
+            // ctor may return an object; otherwise the new object.
+            return Ok(if matches!(r, Val::Object(_)) { r } else { obj });
+        }
+        Ok(Val::object(Obj::new()))
+    }
+
+    fn instantiate_class(&mut self, cls: &Val, args: Vec<Val>) -> Result<Val, Val> {
+        // Build the instance: copy methods from the whole chain (parent first so
+        // subclasses override), record the class name + superclass for super.*.
+        let mut inst = Obj::new();
+        let mut chain: Vec<Val> = Vec::new();
+        let mut cur = cls.clone();
+        while let Val::Object(m) = &cur {
+            chain.push(cur.clone());
+            let p = m.borrow().get("__parent").cloned().unwrap_or(Val::Null);
+            if matches!(p, Val::Null | Val::Undef) {
+                break;
+            }
+            cur = p;
+        }
+        let class_name = if let Val::Object(m) = cls {
+            m.borrow().get("__class").map(|v| v.to_str()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        inst.insert("__class".into(), Val::str(class_name));
+        inst.insert("__classref".into(), cls.clone());
+        // parent first
+        for c in chain.iter().rev() {
+            if let Val::Object(m) = c {
+                if let Some(Val::Object(methods)) = m.borrow().get("__methods") {
+                    for (k, v) in methods.borrow().iter() {
+                        inst.insert(k.clone(), v.clone());
+                    }
+                }
+                if let Some(Val::Object(g)) = m.borrow().get("__getters") {
+                    for (k, v) in g.borrow().iter() {
+                        inst.insert(alloc::format!("__get:{k}"), v.clone());
+                    }
+                }
+                if let Some(Val::Object(s)) = m.borrow().get("__setters") {
+                    for (k, v) in s.borrow().iter() {
+                        inst.insert(alloc::format!("__set:{k}"), v.clone());
+                    }
+                }
+            }
+        }
+        let obj = Val::object(inst);
+        // Field initializers (parent first), then the constructor chain.
+        for c in chain.iter().rev() {
+            if let Val::Object(m) = c {
+                if let Some(Val::Array(fields)) = m.borrow().get("__fields") {
+                    for f in fields.borrow().iter() {
+                        self.call(f.clone(), obj.clone(), Vec::new())?;
+                    }
+                }
+            }
+        }
+        self.run_ctor_chain(cls, obj.clone(), args)?;
+        Ok(obj)
+    }
+
+    /// Run a class's constructor (or, lacking one, implicitly forward to the
+    /// parent) with `this` already created. super(...) inside re-enters here.
+    fn run_ctor_chain(&mut self, cls: &Val, this: Val, args: Vec<Val>) -> Result<(), Val> {
+        let Val::Object(m) = cls else { return Ok(()) };
+        let ctor = m.borrow().get("__ctor").cloned();
+        let parent = m.borrow().get("__parent").cloned().unwrap_or(Val::Null);
+        match ctor {
+            Some(Val::Func(f, captured)) => {
+                let inner = new_scope(Some(captured));
+                inner.borrow_mut().vars.insert("this".into(), this);
+                inner.borrow_mut().vars.insert("__superclass".into(), parent);
+                inner.borrow_mut().vars.insert("arguments".into(), Val::array(args.clone()));
+                for (i, p) in f.params.iter().enumerate() {
+                    match p {
+                        Pat::Array(items, rest) if items.is_empty() && rest.is_some() => {
+                            let tail: Vec<Val> = args.iter().skip(i).cloned().collect();
+                            inner.borrow_mut().vars.insert(rest.clone().unwrap(), Val::array(tail));
+                        }
+                        _ => {
+                            let v = args.get(i).cloned().unwrap_or(Val::Undef);
+                            self.bind_pat(p, v, &inner)?;
+                        }
+                    }
+                }
+                self.exec_block(&f.body, &inner)?;
+                Ok(())
+            }
+            _ => {
+                // No own constructor: implicitly super(...args).
+                if Self::is_class(&parent) {
+                    self.run_ctor_chain(&parent, this, args)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // ---- promises (synchronous model) --------------------------------------
+
+    fn is_promise(v: &Val) -> bool {
+        matches!(v, Val::Object(m) if matches!(m.borrow().get("__promise"), Some(Val::Bool(true))))
+    }
+
+    fn make_promise(&self, state: &str, value: Val) -> Val {
+        let mut o = Obj::new();
+        o.insert("__promise".into(), Val::Bool(true));
+        o.insert("__state".into(), Val::str(state.to_string()));
+        o.insert("__value".into(), value);
+        Val::object(o)
+    }
+
+    /// Unwrap a resolved promise (or pass through a plain value); reject throws.
+    fn await_val(&mut self, v: Val) -> Result<Val, Val> {
+        self.drain_deferred();
+        if let Val::Object(m) = &v {
+            let b = m.borrow();
+            if matches!(b.get("__promise"), Some(Val::Bool(true))) {
+                let state = b.get("__state").map(|s| s.to_str()).unwrap_or_default();
+                let val = b.get("__value").cloned().unwrap_or(Val::Undef);
+                drop(b);
+                if state == "rejected" {
+                    return Err(val);
+                }
+                // a promise of a promise: unwrap again
+                return self.await_val(val);
+            }
+        }
+        Ok(v)
+    }
+
+    fn construct_promise(&mut self, args: Vec<Val>) -> Result<Val, Val> {
+        // new Promise((resolve, reject) => ...) — run the executor synchronously.
+        // resolve/reject are native closures (id into `resolvers`) that record
+        // the outcome into a shared cell, which we read back after the executor.
+        let cell = Rc::new(RefCell::new((String::from("pending"), Val::Undef)));
+        let id = self.resolvers.len();
+        self.resolvers.push(cell.clone());
+        let resolve = Val::Native(Native::Global(Rc::from(alloc::format!("__resolve:{id}").as_str())));
+        let reject = Val::Native(Native::Global(Rc::from(alloc::format!("__reject:{id}").as_str())));
+        if let Some(exec) = args.first().cloned() {
+            if let Err(e) = self.call(exec, Val::Undef, alloc::vec![resolve, reject]) {
+                return Ok(self.make_promise("rejected", e));
+            }
+        }
+        let (state, value) = cell.borrow().clone();
+        if state == "pending" {
+            Ok(self.make_promise("fulfilled", Val::Undef))
+        } else {
+            Ok(self.make_promise(&state, value))
+        }
+    }
+
+    fn promise_method(&mut self, o: &Rc<RefCell<Obj>>, name: &str, args: &[Val]) -> Result<Val, Val> {
+        let state = o.borrow().get("__state").map(|s| s.to_str()).unwrap_or_default();
+        let value = o.borrow().get("__value").cloned().unwrap_or(Val::Undef);
+        match name {
+            "then" => {
+                let mut result = Val::object(o.borrow().clone());
+                if state == "fulfilled" {
+                    if let Some(cb) = args.first().cloned() {
+                        let r = self.call(cb, Val::Undef, alloc::vec![value])?;
+                        result = if Self::is_promise(&r) { r } else { self.make_promise("fulfilled", r) };
+                    }
+                } else if state == "rejected" {
+                    if let Some(cb) = args.get(1).cloned() {
+                        let r = self.call(cb, Val::Undef, alloc::vec![value])?;
+                        result = if Self::is_promise(&r) { r } else { self.make_promise("fulfilled", r) };
+                    }
+                }
+                Ok(result)
+            }
+            "catch" => {
+                if state == "rejected" {
+                    if let Some(cb) = args.first().cloned() {
+                        let r = self.call(cb, Val::Undef, alloc::vec![value])?;
+                        return Ok(if Self::is_promise(&r) { r } else { self.make_promise("fulfilled", r) });
+                    }
+                }
+                Ok(Val::object(o.borrow().clone()))
+            }
+            "finally" => {
+                if let Some(cb) = args.first().cloned() {
+                    self.call(cb, Val::Undef, Vec::new())?;
+                }
+                Ok(Val::object(o.borrow().clone()))
+            }
+            _ => Ok(Val::Undef),
+        }
+    }
+
+    // ---- Map / Set ---------------------------------------------------------
+
+    fn construct_map(&mut self, args: Vec<Val>) -> Result<Val, Val> {
+        let mut o = Obj::new();
+        let mut entries: Vec<Val> = Vec::new();
+        if let Some(it) = args.first() {
+            for pair in self.to_vec(it) {
+                entries.push(pair);
+            }
+        }
+        o.insert("__map".into(), Val::array(entries));
+        Ok(Val::object(o))
+    }
+
+    fn construct_set(&mut self, args: Vec<Val>) -> Result<Val, Val> {
+        let mut o = Obj::new();
+        let mut vals: Vec<Val> = Vec::new();
+        if let Some(it) = args.first() {
+            for v in self.to_vec(it) {
+                if !vals.iter().any(|x| strict_eq(x, &v)) {
+                    vals.push(v);
+                }
+            }
+        }
+        o.insert("__set".into(), Val::array(vals));
+        Ok(Val::object(o))
+    }
+
+    fn map_entries(&self, o: &Rc<RefCell<Obj>>) -> Rc<RefCell<Vec<Val>>> {
+        if let Some(Val::Array(a)) = o.borrow().get("__map") {
+            return a.clone();
+        }
+        Rc::new(RefCell::new(Vec::new()))
+    }
+
+    fn map_method(&mut self, o: &Rc<RefCell<Obj>>, name: &str, args: &[Val]) -> Result<Val, Val> {
+        let entries = self.map_entries(o);
+        let a0 = args.first().cloned().unwrap_or(Val::Undef);
+        let find = |k: &Val| entries.borrow().iter().position(|e| {
+            matches!(e, Val::Array(p) if p.borrow().first().map(|x| strict_eq(x, k)).unwrap_or(false))
+        });
+        Ok(match name {
+            "get" => find(&a0)
+                .and_then(|i| match &entries.borrow()[i] {
+                    Val::Array(p) => p.borrow().get(1).cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Val::Undef),
+            "set" => {
+                let v1 = args.get(1).cloned().unwrap_or(Val::Undef);
+                if let Some(i) = find(&a0) {
+                    if let Val::Array(p) = &entries.borrow()[i] {
+                        let mut pb = p.borrow_mut();
+                        if pb.len() < 2 {
+                            pb.push(v1);
+                        } else {
+                            pb[1] = v1;
+                        }
+                    }
+                } else {
+                    entries.borrow_mut().push(Val::array(alloc::vec![a0, v1]));
+                }
+                Val::object(o.borrow().clone())
+            }
+            "has" => Val::Bool(find(&a0).is_some()),
+            "delete" => {
+                if let Some(i) = find(&a0) {
+                    entries.borrow_mut().remove(i);
+                    Val::Bool(true)
+                } else {
+                    Val::Bool(false)
+                }
+            }
+            "clear" => {
+                entries.borrow_mut().clear();
+                Val::Undef
+            }
+            "forEach" => {
+                let snap = entries.borrow().clone();
+                for e in snap {
+                    if let Val::Array(p) = e {
+                        let k = p.borrow().first().cloned().unwrap_or(Val::Undef);
+                        let v = p.borrow().get(1).cloned().unwrap_or(Val::Undef);
+                        self.call(a0.clone(), Val::Undef, alloc::vec![v, k])?;
+                    }
+                }
+                Val::Undef
+            }
+            "keys" => Val::array(entries.borrow().iter().filter_map(|e| match e {
+                Val::Array(p) => p.borrow().first().cloned(),
+                _ => None,
+            }).collect()),
+            "values" => Val::array(entries.borrow().iter().filter_map(|e| match e {
+                Val::Array(p) => p.borrow().get(1).cloned(),
+                _ => None,
+            }).collect()),
+            "entries" => Val::array(entries.borrow().clone()),
+            _ => Val::Undef,
+        })
+    }
+
+    fn set_values(&self, o: &Rc<RefCell<Obj>>) -> Rc<RefCell<Vec<Val>>> {
+        if let Some(Val::Array(a)) = o.borrow().get("__set") {
+            return a.clone();
+        }
+        Rc::new(RefCell::new(Vec::new()))
+    }
+
+    fn set_method(&mut self, o: &Rc<RefCell<Obj>>, name: &str, args: &[Val]) -> Result<Val, Val> {
+        let vals = self.set_values(o);
+        let a0 = args.first().cloned().unwrap_or(Val::Undef);
+        Ok(match name {
+            "add" => {
+                if !vals.borrow().iter().any(|x| strict_eq(x, &a0)) {
+                    vals.borrow_mut().push(a0);
+                }
+                Val::object(o.borrow().clone())
+            }
+            "has" => Val::Bool(vals.borrow().iter().any(|x| strict_eq(x, &a0))),
+            "delete" => {
+                let pos = vals.borrow().iter().position(|x| strict_eq(x, &a0));
+                if let Some(i) = pos {
+                    vals.borrow_mut().remove(i);
+                    Val::Bool(true)
+                } else {
+                    Val::Bool(false)
+                }
+            }
+            "clear" => {
+                vals.borrow_mut().clear();
+                Val::Undef
+            }
+            "forEach" => {
+                let snap = vals.borrow().clone();
+                for v in snap {
+                    self.call(a0.clone(), Val::Undef, alloc::vec![v.clone(), v])?;
+                }
+                Val::Undef
+            }
+            "values" | "keys" => Val::array(vals.borrow().clone()),
+            _ => Val::Undef,
+        })
+    }
+
+    /// Dispatch methods on special objects (promise / map / set / Response).
+    /// Returns None for plain objects so user function props are used instead.
+    fn object_method(&mut self, o: Rc<RefCell<Obj>>, name: &str, args: &[Val]) -> Result<Option<Val>, Val> {
+        let kind = {
+            let b = o.borrow();
+            if b.contains_key("__promise") {
+                1
+            } else if b.contains_key("__map") {
+                2
+            } else if b.contains_key("__set") {
+                3
+            } else if b.contains_key("__body") {
+                4
+            } else {
+                0
+            }
+        };
+        match kind {
+            1 => Ok(Some(self.promise_method(&o, name, args)?)),
+            2 => Ok(Some(self.map_method(&o, name, args)?)),
+            3 => Ok(Some(self.set_method(&o, name, args)?)),
+            4 => {
+                // fetch() Response
+                let body = o.borrow().get("__body").map(|v| v.to_str()).unwrap_or_default();
+                match name {
+                    "text" => Ok(Some(self.make_promise("fulfilled", Val::str(body)))),
+                    "json" => {
+                        let v = json_parse(&body);
+                        Ok(Some(self.make_promise("fulfilled", v)))
+                    }
+                    _ => Ok(Some(Val::Undef)),
+                }
+            }
+            _ => Ok(None),
         }
     }
 
@@ -639,8 +1302,33 @@ impl Interp {
     fn get_member(&mut self, o: Val, prop: &str) -> Result<Val, Val> {
         match &o {
             Val::Object(map) => {
+                // size on Map/Set
+                if prop == "size" {
+                    let b = map.borrow();
+                    if let Some(Val::Array(a)) = b.get("__map").or_else(|| b.get("__set")) {
+                        return Ok(Val::Num(a.borrow().len() as f64));
+                    }
+                }
+                // getter
+                {
+                    let gkey = alloc::format!("__get:{prop}");
+                    let getter = map.borrow().get(&gkey).cloned();
+                    if let Some(g) = getter {
+                        return self.call(g, o.clone(), Vec::new());
+                    }
+                }
                 if let Some(v) = map.borrow().get(prop) {
                     return Ok(v.clone());
+                }
+                // `constructor` on a class instance returns its class object.
+                if prop == "constructor" {
+                    if let Some(c) = map.borrow().get("__classref") {
+                        return Ok(c.clone());
+                    }
+                }
+                // Special objects (Map/Set/Promise/Response) expose methods.
+                if map.borrow().keys().any(|k| matches!(k.as_str(), "__map" | "__set" | "__promise" | "__body")) {
+                    return Ok(Val::Native(Native::Method(Box::new(o.clone()), Rc::from(prop))));
                 }
                 Ok(Val::Undef)
             }
@@ -655,18 +1343,37 @@ impl Interp {
             Val::Num(_) => Ok(Val::Native(Native::Method(Box::new(o.clone()), Rc::from(prop)))),
             Val::Node(idx) => Ok(self.node_member(*idx, prop)),
             Val::Host(h) => Ok(self.host_member(h.clone(), prop)),
+            // Namespace/constructor objects: Object.keys, Array.from, Promise.all,
+            // Number.isInteger, JSON.parse, ... resolve to a "Name.prop" native.
+            Val::Native(Native::Global(name)) => {
+                match (&**name, prop) {
+                    ("Math", _) | ("Number", "MAX_SAFE_INTEGER") => {}
+                    _ => {}
+                }
+                if prop == "prototype" {
+                    return Ok(Val::object(Obj::new()));
+                }
+                Ok(Val::Native(Native::Global(Rc::from(alloc::format!("{name}.{prop}").as_str()))))
+            }
             _ => Ok(Val::Undef),
         }
     }
 
     fn set_member(&mut self, o: Val, prop: &str, v: Val) {
-        match o {
+        match &o {
             Val::Object(map) => {
+                // setter?
+                let skey = alloc::format!("__set:{prop}");
+                let setter = map.borrow().get(&skey).cloned();
+                if let Some(s) = setter {
+                    let _ = self.call(s, o.clone(), alloc::vec![v]);
+                    return;
+                }
                 map.borrow_mut().insert(prop.into(), v);
             }
-            Val::Node(idx) => self.set_node_member(idx, prop, v),
+            Val::Node(idx) => self.set_node_member(*idx, prop, v),
             Val::Host(Host::Style(idx)) => {
-                self.dom.set_style(idx, prop, &v.to_str());
+                self.dom.set_style(*idx, prop, &v.to_str());
             }
             Val::Host(Host::Location) => { /* navigation ignored */ }
             _ => {}
@@ -847,6 +1554,7 @@ impl Interp {
             Val::Array(a) => Ok(self.array_method(a.clone(), name, args)?),
             Val::Str(s) => Ok(Some(str_method(s, name, args))),
             Val::Num(n) => Ok(Some(num_method(*n, name, args))),
+            Val::Object(o) => self.object_method(o.clone(), name, args),
             _ => Ok(None),
         }
     }
@@ -1261,23 +1969,441 @@ impl Interp {
             "String" => Val::str(a0.to_str()),
             "Number" => Val::Num(a0.as_num()),
             "Boolean" => Val::Bool(a0.truthy()),
-            "encodeURIComponent" | "decodeURIComponent" => Val::str(a0.to_str()),
+            "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI" => Val::str(a0.to_str()),
             "Array" => {
-                // Array.from / Array(n) — treat single number as length
-                if let Val::Num(n) = a0 {
-                    Val::array(vec![Val::Undef; n.max(0.0) as usize])
+                // Array(n) — single number is length; else wrap the args.
+                if args.len() == 1 {
+                    if let Val::Num(n) = a0 {
+                        return Ok(Val::array(vec![Val::Undef; n.max(0.0) as usize]));
+                    }
+                }
+                Val::array(args)
+            }
+            "Object" => if matches!(a0, Val::Object(_)) { a0 } else { Val::object(Obj::new()) },
+            "Symbol" => Val::str(alloc::format!("Symbol({})", a0.to_str())),
+            "structuredClone" => deep_clone(&a0),
+            "queueMicrotask" => {
+                if let Some(f) = args.first() {
+                    self.deferred.push((f.clone(), Vec::new()));
+                }
+                Val::Undef
+            }
+
+            // ---- Object statics ----
+            "Object.keys" => Val::array(object_keys(&a0).into_iter().map(Val::str).collect()),
+            "Object.values" => match &a0 {
+                Val::Object(m) => Val::array(m.borrow().iter().filter(|(k, _)| !k.starts_with("__")).map(|(_, v)| v.clone()).collect()),
+                Val::Array(a) => Val::array(a.borrow().clone()),
+                _ => Val::array(Vec::new()),
+            },
+            "Object.entries" => match &a0 {
+                Val::Object(m) => Val::array(
+                    m.borrow().iter().filter(|(k, _)| !k.starts_with("__"))
+                        .map(|(k, v)| Val::array(alloc::vec![Val::str(k.clone()), v.clone()])).collect(),
+                ),
+                _ => Val::array(Vec::new()),
+            },
+            "Object.assign" => {
+                let target = a0.clone();
+                if let Val::Object(t) = &target {
+                    for src in args.iter().skip(1) {
+                        if let Val::Object(s) = src {
+                            for (k, v) in s.borrow().iter() {
+                                t.borrow_mut().insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                target
+            }
+            "Object.freeze" | "Object.seal" | "Object.preventExtensions" => a0,
+            "Object.create" => {
+                let mut o = Obj::new();
+                if let Val::Object(proto) = &a0 {
+                    for (k, v) in proto.borrow().iter() {
+                        o.insert(k.clone(), v.clone());
+                    }
+                }
+                Val::object(o)
+            }
+            "Object.getPrototypeOf" => Val::Null,
+            "Object.defineProperty" => {
+                if let (Val::Object(t), Some(key), Some(Val::Object(desc))) = (&a0, args.get(1), args.get(2)) {
+                    let k = key.to_str();
+                    if let Some(v) = desc.borrow().get("value") {
+                        t.borrow_mut().insert(k, v.clone());
+                    } else if let Some(g) = desc.borrow().get("get") {
+                        t.borrow_mut().insert(alloc::format!("__get:{k}"), g.clone());
+                    }
+                }
+                a0
+            }
+            "Object.fromEntries" => {
+                let mut o = Obj::new();
+                for pair in self.to_vec(&a0) {
+                    let kv = self.to_vec(&pair);
+                    if let Some(k) = kv.first() {
+                        o.insert(k.to_str(), kv.get(1).cloned().unwrap_or(Val::Undef));
+                    }
+                }
+                Val::object(o)
+            }
+            "Object.getOwnPropertyNames" => Val::array(object_keys(&a0).into_iter().map(Val::str).collect()),
+
+            // ---- Array statics ----
+            "Array.isArray" => Val::Bool(matches!(a0, Val::Array(_))),
+            "Array.from" => {
+                let items = self.to_vec(&a0);
+                if let Some(mapper) = args.get(1).cloned() {
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, x) in items.into_iter().enumerate() {
+                        out.push(self.call(mapper.clone(), Val::Undef, alloc::vec![x, Val::Num(i as f64)])?);
+                    }
+                    Val::array(out)
+                } else if let Val::Object(m) = &a0 {
+                    // Array.from({length: n}) or Map/Set
+                    let b = m.borrow();
+                    if let Some(Val::Array(e)) = b.get("__set") {
+                        Val::array(e.borrow().clone())
+                    } else if let Some(Val::Array(e)) = b.get("__map") {
+                        Val::array(e.borrow().clone())
+                    } else if let Some(len) = b.get("length") {
+                        Val::array(vec![Val::Undef; len.as_num().max(0.0) as usize])
+                    } else {
+                        Val::array(items)
+                    }
                 } else {
-                    Val::array(self.to_vec(&a0))
+                    Val::array(items)
                 }
             }
-            "Object" => a0,
-            "fetch" => Val::Undef,
+            "Array.of" => Val::array(args),
+
+            // ---- Number statics ----
+            "Number.isInteger" => Val::Bool(matches!(a0, Val::Num(n) if n.is_finite() && n == mathf::trunc(n))),
+            "Number.isFinite" => Val::Bool(matches!(a0, Val::Num(n) if n.is_finite())),
+            "Number.isNaN" => Val::Bool(matches!(a0, Val::Num(n) if n.is_nan())),
+            "Number.parseFloat" => return self.call_global("parseFloat", args),
+            "Number.parseInt" => return self.call_global("parseInt", args),
+
+            // ---- String statics ----
+            "String.fromCharCode" => {
+                let s: String = args.iter().filter_map(|v| char::from_u32(v.as_num() as u32)).collect();
+                Val::str(s)
+            }
+
+            // ---- JSON ----
+            "JSON.parse" => json_parse(&a0.to_str()),
+            "JSON.stringify" => Val::str(json_stringify(&a0, args.get(2).map(|v| v.as_num() as usize).unwrap_or(0))),
+
+            // ---- Promise statics ----
+            "Promise.resolve" => self.make_promise("fulfilled", a0),
+            "Promise.reject" => self.make_promise("rejected", a0),
+            "Promise.all" => {
+                let items = self.to_vec(&a0);
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.await_val(it)?);
+                }
+                self.make_promise("fulfilled", Val::array(out))
+            }
+            "Promise.allSettled" => {
+                let items = self.to_vec(&a0);
+                let mut out = Vec::new();
+                for it in items {
+                    let mut o = Obj::new();
+                    match self.await_val(it) {
+                        Ok(v) => {
+                            o.insert("status".into(), Val::str("fulfilled"));
+                            o.insert("value".into(), v);
+                        }
+                        Err(e) => {
+                            o.insert("status".into(), Val::str("rejected"));
+                            o.insert("reason".into(), e);
+                        }
+                    }
+                    out.push(Val::object(o));
+                }
+                self.make_promise("fulfilled", Val::array(out))
+            }
+            "Promise.race" | "Promise.any" => {
+                let items = self.to_vec(&a0);
+                let v = items.into_iter().next().unwrap_or(Val::Undef);
+                let r = self.await_val(v)?;
+                self.make_promise("fulfilled", r)
+            }
+
+            // ---- fetch ----
+            "fetch" => {
+                let url = a0.to_str();
+                self.do_fetch(&url, args.get(1).cloned())
+            }
+
+            // ---- Promise resolve/reject closures (id baked into the name) ----
+            _ if name.starts_with("__resolve:") || name.starts_with("__reject:") => {
+                let reject = name.starts_with("__reject:");
+                if let Ok(id) = name[name.find(':').unwrap() + 1..].parse::<usize>() {
+                    if let Some(cell) = self.resolvers.get(id).cloned() {
+                        *cell.borrow_mut() = (
+                            String::from(if reject { "rejected" } else { "fulfilled" }),
+                            a0,
+                        );
+                    }
+                }
+                Val::Undef
+            }
+
             _ => Val::Undef,
         })
+    }
+
+    /// Perform a synchronous fetch over the browser's HTTP stack and return a
+    /// resolved Promise of a Response (`{ ok, status, __body }`).
+    fn do_fetch(&mut self, url: &str, opts: Option<Val>) -> Val {
+        let body = opts.as_ref().and_then(|o| {
+            if let Val::Object(m) = o {
+                m.borrow().get("body").map(|v| v.to_str())
+            } else {
+                None
+            }
+        });
+        let resolved = crate::browser::js_fetch(url, body.as_deref());
+        match resolved {
+            Some((status, _ctype, data)) => {
+                let mut o = Obj::new();
+                o.insert("__body".into(), Val::str(String::from_utf8_lossy(&data).into_owned()));
+                o.insert("ok".into(), Val::Bool((200..400).contains(&status)));
+                o.insert("status".into(), Val::Num(status as f64));
+                o.insert("statusText".into(), Val::str(if status == 200 { "OK" } else { "" }));
+                o.insert("url".into(), Val::str(url.to_string()));
+                self.make_promise("fulfilled", Val::object(o))
+            }
+            None => self.make_promise("rejected", Val::str(alloc::format!("fetch failed: {url}"))),
+        }
     }
 }
 
 // ---- free helpers ----------------------------------------------------------
+
+/// Own enumerable string keys of an object (skipping engine-internal __keys),
+/// or array indices.
+fn object_keys(v: &Val) -> Vec<String> {
+    match v {
+        Val::Object(m) => m.borrow().keys().filter(|k| !k.starts_with("__")).cloned().collect(),
+        Val::Array(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn deep_clone(v: &Val) -> Val {
+    match v {
+        Val::Array(a) => Val::array(a.borrow().iter().map(deep_clone).collect()),
+        Val::Object(m) => {
+            let mut o = Obj::new();
+            for (k, val) in m.borrow().iter() {
+                o.insert(k.clone(), deep_clone(val));
+            }
+            Val::object(o)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Minimal JSON parser → Val. Tolerant; returns Null on malformed input.
+fn json_parse(s: &str) -> Val {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let v = json_value(b, &mut i);
+    v.unwrap_or(Val::Null)
+}
+
+fn json_ws(b: &[u8], i: &mut usize) {
+    while *i < b.len() && (b[*i] == b' ' || b[*i] == b'\t' || b[*i] == b'\n' || b[*i] == b'\r') {
+        *i += 1;
+    }
+}
+
+fn json_value(b: &[u8], i: &mut usize) -> Option<Val> {
+    json_ws(b, i);
+    if *i >= b.len() {
+        return None;
+    }
+    match b[*i] {
+        b'{' => {
+            *i += 1;
+            let mut o = Obj::new();
+            json_ws(b, i);
+            if *i < b.len() && b[*i] == b'}' {
+                *i += 1;
+                return Some(Val::object(o));
+            }
+            loop {
+                json_ws(b, i);
+                let key = json_string(b, i)?;
+                json_ws(b, i);
+                if *i < b.len() && b[*i] == b':' {
+                    *i += 1;
+                }
+                let val = json_value(b, i)?;
+                o.insert(key, val);
+                json_ws(b, i);
+                if *i < b.len() && b[*i] == b',' {
+                    *i += 1;
+                    continue;
+                }
+                if *i < b.len() && b[*i] == b'}' {
+                    *i += 1;
+                }
+                break;
+            }
+            Some(Val::object(o))
+        }
+        b'[' => {
+            *i += 1;
+            let mut arr = Vec::new();
+            json_ws(b, i);
+            if *i < b.len() && b[*i] == b']' {
+                *i += 1;
+                return Some(Val::array(arr));
+            }
+            loop {
+                let val = json_value(b, i)?;
+                arr.push(val);
+                json_ws(b, i);
+                if *i < b.len() && b[*i] == b',' {
+                    *i += 1;
+                    continue;
+                }
+                if *i < b.len() && b[*i] == b']' {
+                    *i += 1;
+                }
+                break;
+            }
+            Some(Val::array(arr))
+        }
+        b'"' => json_string(b, i).map(Val::str),
+        b't' => {
+            *i += 4;
+            Some(Val::Bool(true))
+        }
+        b'f' => {
+            *i += 5;
+            Some(Val::Bool(false))
+        }
+        b'n' => {
+            *i += 4;
+            Some(Val::Null)
+        }
+        _ => {
+            let start = *i;
+            while *i < b.len() && (b[*i].is_ascii_digit() || matches!(b[*i], b'-' | b'+' | b'.' | b'e' | b'E')) {
+                *i += 1;
+            }
+            core::str::from_utf8(&b[start..*i]).ok().and_then(|s| s.parse::<f64>().ok()).map(Val::Num)
+        }
+    }
+}
+
+fn json_string(b: &[u8], i: &mut usize) -> Option<String> {
+    if *i >= b.len() || b[*i] != b'"' {
+        return None;
+    }
+    *i += 1;
+    let mut s = String::new();
+    while *i < b.len() && b[*i] != b'"' {
+        if b[*i] == b'\\' && *i + 1 < b.len() {
+            *i += 1;
+            let c = match b[*i] {
+                b'n' => '\n',
+                b't' => '\t',
+                b'r' => '\r',
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'u' => {
+                    // \uXXXX
+                    if *i + 4 < b.len() {
+                        let hex = core::str::from_utf8(&b[*i + 1..*i + 5]).unwrap_or("0");
+                        let cp = u32::from_str_radix(hex, 16).unwrap_or(0);
+                        *i += 4;
+                        char::from_u32(cp).unwrap_or('?')
+                    } else {
+                        '?'
+                    }
+                }
+                other => other as char,
+            };
+            s.push(c);
+            *i += 1;
+        } else {
+            let ch_len = core::str::from_utf8(&b[*i..]).ok().and_then(|t| t.chars().next()).map(|c| c.len_utf8()).unwrap_or(1);
+            if let Ok(t) = core::str::from_utf8(&b[*i..*i + ch_len]) {
+                s.push_str(t);
+            }
+            *i += ch_len;
+        }
+    }
+    *i += 1; // closing quote
+    Some(s)
+}
+
+fn json_stringify(v: &Val, indent: usize) -> String {
+    json_str_rec(v, indent, 0)
+}
+
+fn json_str_rec(v: &Val, indent: usize, depth: usize) -> String {
+    let nl = if indent > 0 { "\n" } else { "" };
+    let pad = |n: usize| if indent > 0 { " ".repeat(indent * n) } else { String::new() };
+    match v {
+        Val::Undef => String::from("null"),
+        Val::Null => String::from("null"),
+        Val::Bool(b) => String::from(if *b { "true" } else { "false" }),
+        Val::Num(n) => {
+            if n.is_finite() {
+                num_to_str(*n)
+            } else {
+                String::from("null")
+            }
+        }
+        Val::Str(s) => json_quote(s),
+        Val::Array(a) => {
+            let b = a.borrow();
+            if b.is_empty() {
+                return String::from("[]");
+            }
+            let items: Vec<String> = b.iter().map(|x| alloc::format!("{}{}", pad(depth + 1), json_str_rec(x, indent, depth + 1))).collect();
+            alloc::format!("[{nl}{}{nl}{}]", items.join(&alloc::format!(",{nl}")), pad(depth))
+        }
+        Val::Object(m) => {
+            let b = m.borrow();
+            let entries: Vec<String> = b
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__"))
+                .map(|(k, val)| alloc::format!("{}{}:{}{}", pad(depth + 1), json_quote(k), if indent > 0 { " " } else { "" }, json_str_rec(val, indent, depth + 1)))
+                .collect();
+            if entries.is_empty() {
+                return String::from("{}");
+            }
+            alloc::format!("{{{nl}{}{nl}{}}}", entries.join(&alloc::format!(",{nl}")), pad(depth))
+        }
+        _ => String::from("null"),
+    }
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 fn rc_func(f: &Func) -> Rc<Func> {
     Rc::new(Func {
@@ -1286,6 +2412,8 @@ fn rc_func(f: &Func) -> Rc<Func> {
         body: f.body.clone(),
         expr_body: f.expr_body.clone(),
         arrow: f.arrow,
+        is_async: f.is_async,
+        is_generator: f.is_generator,
     })
 }
 

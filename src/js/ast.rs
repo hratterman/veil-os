@@ -32,6 +32,23 @@ pub enum Expr {
     New(Box<Expr>, Vec<Expr>),
     Func(Box<Func>),
     Arrow(Box<Func>),
+    /// await expr (ES2017) — unwraps a resolved Promise.
+    Await(Box<Expr>),
+    /// yield [expr] inside a generator.
+    Yield(Option<Box<Expr>>, bool /* delegate (yield*) */),
+    /// class expression / declaration.
+    Class(Box<Class>),
+    /// super(...) call or super.method — `prop` None means a super() ctor call.
+    Super(Option<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Class {
+    pub name: Option<String>,
+    pub parent: Option<Box<Expr>>,
+    pub ctor: Option<Func>,
+    /// (name, function, is_static, kind) where kind is "method"|"get"|"set".
+    pub methods: Vec<(String, Func, bool, &'static str)>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +61,11 @@ pub enum TplElem {
 pub enum PropKey {
     Ident(String),
     Computed(Box<Expr>),
+    /// `...expr` object spread; the paired value Expr is the spread source.
+    Spread,
+    /// getter/setter shorthand — value Expr is Func.
+    Getter(String),
+    Setter(String),
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +73,10 @@ pub enum Pat {
     Ident(String),
     /// array destructuring with optional rest as the last element
     Array(Vec<Pat>, Option<String>),
+    /// object destructuring: (sourceKey, bindingPattern) pairs + optional rest
+    Object(Vec<(String, Pat)>, Option<String>),
+    /// a pattern with a default value (default params, destructuring defaults)
+    Default(Box<Pat>, Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +88,10 @@ pub struct Func {
     pub expr_body: Option<Box<Expr>>,
     /// true for arrow functions (lexical `this`, no own `arguments`)
     pub arrow: bool,
+    /// async function — its return value is wrapped in a resolved Promise.
+    pub is_async: bool,
+    /// generator function (function*).
+    pub is_generator: bool,
 }
 
 #[derive(Clone, Debug)]

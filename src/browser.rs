@@ -73,7 +73,8 @@ static ZOOM: AtomicU16 = AtomicU16::new(100);
 pub const TOPBAR: usize = 20; // address-bar row height
 pub const TABBAR_H: usize = 22; // tab-strip row height (above the address bar)
 pub const CHROME: usize = TABBAR_H + TOPBAR; // total chrome; page content starts here
-const MAX_DOC_H: usize = 3000;
+const MAX_DOC_H: usize = 16000; // logical doc height cap (band rasterizer, not the buffer)
+const BAND_H: usize = 2000; // tallest rasterized band; repainted on scroll-out
 const FETCH_TIMEOUT: u64 = 500; // 10 s at the 50 Hz tick
 const BAR_BG: u32 = 0xffc8_ccd4;
 const BAR_TEXT: u32 = 0xff20_2830;
@@ -82,9 +83,16 @@ static M16_DONE: AtomicBool = AtomicBool::new(false);
 
 pub struct BrowserState {
     pub path: String,
-    page: Vec<u32>, // page_w * doc_h, the fully rendered document
+    // The document is kept as a retained display list (`items` + `imgs`) and
+    // only a *band* of it is rasterized at a time into `page` (page_w * band_h),
+    // repositioned + repainted as the user scrolls. This caps the buffer at a
+    // few MB even for 10000px+ JS pages, so the whole page stays scrollable.
+    page: Vec<u32>, // page_w * band_h, the rasterized band
     page_w: usize,
-    doc_h: usize,
+    doc_h: usize,     // full logical document height (the scroll range)
+    band_top: usize,  // document y at which the band buffer currently starts
+    items: Vec<Item>, // retained display list, painted per band
+    imgs: Vec<png::Image>, // decoded images, indexed by Item::Image.idx
     links: Vec<LinkBox>,
     scroll: usize,
     page_bg: u32,
@@ -205,6 +213,9 @@ impl BrowserState {
             page: vec![0xffff_ffff; 1],
             page_w: 1,
             doc_h: 1,
+            band_top: 0,
+            items: Vec::new(),
+            imgs: Vec::new(),
             links: Vec::new(),
             scroll: 0,
             page_bg: 0xffff_ffff,
@@ -227,72 +238,171 @@ impl BrowserState {
     }
 }
 
-/// Redraw the on-page input fields into the page buffer (value + focus ring),
-/// then repaint the view. Cheaper than a full re-layout for each keystroke.
+/// Draw the live state of the on-page form controls (value + focus ring +
+/// checkbox/radio fill) into the band buffer `pfb`, with document row
+/// `band_top` mapped to buffer row 0. Controls outside the band are skipped.
+fn paint_field_overlays(pfb: &Framebuffer, fields: &[InputField], focus: Option<usize>, band_top: isize, bh: isize) {
+    for (i, f) in fields.iter().enumerate() {
+        if f.x < 0 || f.y < 0 || f.kind == InputKind::Hidden {
+            continue;
+        }
+        let yy = f.y - band_top;
+        if yy < 0 || yy + f.h > bh {
+            continue; // not (fully) in the rasterized band
+        }
+        let (x, y, w, h) = (f.x as usize, yy as usize, f.w as usize, f.h as usize);
+        let focused = focus == Some(i);
+        let border = if focused { 0xff5b_8af0 } else { 0xff4a_5060 };
+        let frame = |pfb: &Framebuffer, bc: u32| {
+            pfb.fill_rect(x, y, w, 1, bc);
+            pfb.fill_rect(x, y + h - 1, w, 1, bc);
+            pfb.fill_rect(x, y, 1, h, bc);
+            pfb.fill_rect(x + w - 1, y, 1, h, bc);
+        };
+        match f.kind {
+            InputKind::Checkbox => {
+                pfb.fill_rect(x, y, w, h, 0xff2a_2a2a);
+                frame(pfb, 0xff8a_90a0);
+                if f.checked && w > 6 && h > 6 {
+                    pfb.fill_rect(x + 3, y + 3, w - 6, h - 6, 0xff5b_8af0);
+                }
+            }
+            InputKind::Radio => {
+                pfb.fill_rect(x, y, w, h, 0xff2a_2a2a);
+                frame(pfb, 0xff8a_90a0);
+                if f.checked && w > 8 && h > 8 {
+                    pfb.fill_rect(x + 4, y + 4, w - 8, h - 8, 0xff5b_8af0);
+                }
+            }
+            InputKind::Submit => {
+                pfb.fill_rect(x, y, w, h, if focused { 0xff4a_82c5 } else { 0xff3a_6ea5 });
+                pfb.draw_string(x + 10, y + 5, &f.value, 0xffff_ffff, None);
+            }
+            InputKind::Select => {
+                pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
+                frame(pfb, border);
+                pfb.draw_string(x + 4, y + 3, &f.value, 0xffe8_e8e8, None);
+                if w > 14 {
+                    pfb.draw_string(x + w - 12, y + 3, "v", 0xff90_98a8, None);
+                }
+            }
+            _ => {
+                pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
+                frame(pfb, border);
+                let shown = if f.kind == InputKind::Password {
+                    "*".repeat(f.value.chars().count())
+                } else {
+                    f.value.clone()
+                };
+                let txt = if focused { format!("{shown}_") } else { shown };
+                pfb.draw_string(x + 4, y + 3, &txt, 0xffe8_e8e8, None);
+            }
+        }
+    }
+}
+
+/// Repaint the current band (controls included) then the view. Used after a
+/// field state change — no re-fetch or re-layout, just re-rasterize.
 fn paint_fields(win: &mut Window) {
-    let (fields, focus, pw, dh) = {
+    repaint_band(win);
+    paint_view(win);
+}
+
+/// Rasterize the band of the document around `band_top` into the page buffer:
+/// (re)allocate it to min(doc_h, BAND_H) rows, clear it, then paint the retained
+/// display list and the field overlays offset by -band_top.
+fn repaint_band(win: &mut Window) {
+    let (view_w, doc_h, band_top, page_bg) = {
         let crate::wm::App::Browser(st) = &win.app else { return };
-        (st.fields.clone(), st.focus, st.page_w, st.doc_h)
+        (st.page_w, st.doc_h, st.band_top, st.page_bg)
     };
-    if pw != 0 && dh != 0 {
-        if let crate::wm::App::Browser(st) = &mut win.app {
-            let pfb = unsafe { Framebuffer::new(st.page.as_mut_ptr(), pw, dh, pw * 4) };
-            for (i, f) in fields.iter().enumerate() {
-                if f.x < 0 || f.y < 0 || f.kind == InputKind::Hidden {
+    if view_w == 0 || doc_h == 0 {
+        return;
+    }
+    // (Re)allocate the band buffer if its size is wrong, shrinking the height
+    // until the (fragmented) heap can give us a contiguous slab.
+    let target = doc_h.min(BAND_H).max(1);
+    {
+        let crate::wm::App::Browser(st) = &mut win.app else { return };
+        if st.page.len() != view_w * target {
+            let mut band_h = target;
+            st.page = loop {
+                let mut v: Vec<u32> = Vec::new();
+                if v.try_reserve_exact(view_w * band_h).is_ok() {
+                    v.resize(view_w * band_h, page_bg);
+                    break v;
+                }
+                if band_h <= 300 {
+                    v.resize(view_w * band_h, page_bg);
+                    break v;
+                }
+                band_h = band_h * 2 / 3;
+            };
+        }
+    }
+    let crate::wm::App::Browser(st) = &mut win.app else { return };
+    let bh = (st.page.len() / view_w.max(1)) as isize;
+    let top = band_top as isize;
+    // SAFETY: st.page is exactly view_w * bh; pfb writes through a raw pointer so
+    // the &st.items / &st.imgs reads below don't alias it as far as the model.
+    let pfb = unsafe { Framebuffer::new(st.page.as_mut_ptr(), view_w, bh as usize, view_w * 4) };
+    pfb.clear(page_bg);
+    for item in &st.items {
+        match item {
+            &Item::Rect { x, y, w, h, color } => {
+                if w <= 0 || h <= 0 {
                     continue;
                 }
-                let (x, y, w, h) = (f.x as usize, f.y as usize, f.w as usize, f.h as usize);
-                let focused = focus == Some(i);
-                let border = if focused { 0xff5b_8af0 } else { 0xff4a_5060 };
-                let frame = |pfb: &Framebuffer, bc: u32| {
-                    pfb.fill_rect(x, y, w, 1, bc);
-                    pfb.fill_rect(x, y + h - 1, w, 1, bc);
-                    pfb.fill_rect(x, y, 1, h, bc);
-                    pfb.fill_rect(x + w - 1, y, 1, h, bc);
-                };
-                match f.kind {
-                    InputKind::Checkbox => {
-                        pfb.fill_rect(x, y, w, h, 0xff2a_2a2a);
-                        frame(&pfb, 0xff8a_90a0);
-                        if f.checked && w > 6 && h > 6 {
-                            pfb.fill_rect(x + 3, y + 3, w - 6, h - 6, 0xff5b_8af0);
-                        }
-                    }
-                    InputKind::Radio => {
-                        pfb.fill_rect(x, y, w, h, 0xff2a_2a2a);
-                        frame(&pfb, 0xff8a_90a0);
-                        if f.checked && w > 8 && h > 8 {
-                            pfb.fill_rect(x + 4, y + 4, w - 8, h - 8, 0xff5b_8af0);
-                        }
-                    }
-                    InputKind::Submit => {
-                        pfb.fill_rect(x, y, w, h, if focused { 0xff4a_82c5 } else { 0xff3a_6ea5 });
-                        pfb.draw_string(x + 10, y + 5, &f.value, 0xffff_ffff, None);
-                    }
-                    InputKind::Select => {
-                        pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
-                        frame(&pfb, border);
-                        pfb.draw_string(x + 4, y + 3, &f.value, 0xffe8_e8e8, None);
-                        if w > 14 {
-                            pfb.draw_string(x + w - 12, y + 3, "v", 0xff90_98a8, None);
-                        }
-                    }
-                    _ => {
-                        pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
-                        frame(&pfb, border);
-                        let shown = if f.kind == InputKind::Password {
-                            "*".repeat(f.value.chars().count())
-                        } else {
-                            f.value.clone()
-                        };
-                        let txt = if focused { format!("{shown}_") } else { shown };
-                        pfb.draw_string(x + 4, y + 3, &txt, 0xffe8_e8e8, None);
-                    }
+                let yy = y - top;
+                if yy + h <= 0 || yy >= bh {
+                    continue;
+                }
+                let (dy, dh) = if yy < 0 { (0isize, h + yy) } else { (yy, h) };
+                if dh > 0 {
+                    pfb.fill_rect(x.max(0) as usize, dy as usize, w as usize, dh as usize, color);
+                }
+            }
+            Item::Text { x, y, s, color, font, .. } => {
+                let yy = *y - top;
+                if *y >= 0 && yy >= 0 && yy < bh {
+                    let color = readable(*color, page_bg);
+                    pfb.draw_text((*x).max(0) as usize, yy as usize, s, font.id, font.px, color);
+                }
+            }
+            &Item::Image { x, y, idx } => {
+                if let Some(img) = st.imgs.get(idx) {
+                    pfb.blit(x, y - top, &img.pixels, img.w, img.h);
                 }
             }
         }
     }
-    paint_view(win);
+    let (fields, focus) = (st.fields.clone(), st.focus);
+    paint_field_overlays(&pfb, &fields, focus, top, bh);
+    kprintln!("BROWSER: band rasterized top={band_top} h={bh} (doc {doc_h})");
+}
+
+/// Make sure the rasterized band covers the current scroll window; if not,
+/// re-center the band on the viewport and repaint it.
+fn ensure_band(win: &mut Window, view_h: usize) {
+    let (scroll, doc_h, band_top, view_w, plen) = {
+        let crate::wm::App::Browser(st) = &win.app else { return };
+        (st.scroll, st.doc_h, st.band_top, st.page_w, st.page.len())
+    };
+    if view_w == 0 || doc_h == 0 {
+        return;
+    }
+    let bh = plen / view_w;
+    if bh > 1 && scroll >= band_top && scroll + view_h <= band_top + bh {
+        return; // viewport already inside the band
+    }
+    let target_bh = doc_h.min(BAND_H);
+    let new_top = scroll
+        .saturating_sub(target_bh.saturating_sub(view_h) / 2)
+        .min(doc_h.saturating_sub(target_bh));
+    if let crate::wm::App::Browser(st) = &mut win.app {
+        st.band_top = new_top;
+    }
+    repaint_band(win);
 }
 
 /// Click in the chrome (topbar): focus the address bar for editing if the
@@ -2742,53 +2852,23 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     if let crate::wm::App::Browser(st) = &mut win.app {
         st.page = Vec::new();
     }
-    // Page-buffer height: the document, capped at MAX_DOC_H. A JS-rendered page
-    // can be 10000+ px tall, and the multi-MB contiguous buffer may not fit the
-    // (fragmented) 16 MB heap — so allocate with try_reserve and shrink doc_h on
-    // failure until it fits. fill_rect/blit clip to the buffer, so content below
-    // the chosen height is simply not painted (the user can't scroll past it).
-    let want_h = (end_y.max(1) as usize).min(MAX_DOC_H);
-    let mut doc_h = want_h;
-    let mut page: Vec<u32> = loop {
-        let mut v: Vec<u32> = Vec::new();
-        if v.try_reserve_exact(view_w * doc_h).is_ok() {
-            v.resize(view_w * doc_h, page_bg);
-            break v;
-        }
-        if doc_h <= 400 {
-            v.resize(view_w * doc_h, page_bg); // last-ditch tiny buffer
-            break v;
-        }
-        doc_h = doc_h * 2 / 3; // shrink and retry
-    };
-    if end_y as usize > doc_h {
-        kprintln!("BROWSER: document clipped to {doc_h}px (was {end_y})");
-    }
+    // The document is kept as a retained display list and rasterized one band at
+    // a time (see repaint_band), so its full logical height — capped only at
+    // MAX_DOC_H — stays scrollable even when it's 10000+ px tall.
+    let doc_h = (end_y.max(1) as usize).min(MAX_DOC_H);
 
-    // Paint the whole document into the page buffer.
+    // Measure the text runs (for find-in-page) and gather all visible text over
+    // the whole document, independent of which band is currently rasterized.
     let mut text_runs: Vec<(isize, isize, isize, String)> = Vec::new();
-    let pfb = unsafe { Framebuffer::new(page.as_mut_ptr(), view_w, doc_h, view_w * 4) };
-    for item in &ctx.items {
-        match item {
-            &Item::Rect { x, y, w, h, color } => {
-                if w > 0 && h > 0 {
-                    pfb.fill_rect(x.max(0) as usize, y.max(0) as usize, w as usize, h as usize, color);
-                }
-            }
-            Item::Text { x, y, s, color, scale, font } => {
+    {
+        let mut dummy = [0u32; 1];
+        let mfb = unsafe { Framebuffer::new(dummy.as_mut_ptr(), 1, 1, 4) };
+        for item in &ctx.items {
+            if let Item::Text { x, y, s, font, .. } = item {
                 if *y >= 0 {
-                    // Keep text legible against the page: the site's colors
-                    // assume light section backgrounds we don't paint.
-                    let color = readable(*color, page_bg);
-                    let _ = scale;
-                    pfb.draw_text((*x).max(0) as usize, *y as usize, s, font.id, font.px, color);
-                    let rw = pfb.measure_text(s, font.id, font.px).0 as isize;
+                    let rw = mfb.measure_text(s, font.id, font.px).0 as isize;
                     text_runs.push((*x, *y, rw, s.to_lowercase()));
                 }
-            }
-            &Item::Image { x, y, idx } => {
-                let img = &imgs[idx].1;
-                pfb.blit(x, y, &img.pixels, img.w, img.h);
             }
         }
     }
@@ -2824,14 +2904,16 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
         st.tabs[a].path = path.clone();
         st.tabs[a].title = tab_title(&path);
     }
-    st.page = page;
+    st.items = ctx.items;
+    st.imgs = imgs.iter().map(|(_, img)| img.clone()).collect();
     st.page_w = view_w;
     st.doc_h = doc_h;
+    st.band_top = 0;
     st.links = ctx.links;
     st.fields = ctx.fields;
     st.forms = ctx.forms;
     let mut text = String::new();
-    for it in &ctx.items {
+    for it in &st.items {
         if let Item::Text { s, .. } = it {
             text.push_str(s);
             text.push(' ');
@@ -2893,14 +2975,26 @@ fn render_message(win: &mut Window, path: &str, msg: &str) {
     let (cw, text) = (win.cw, format!("veil browser: {msg}"));
     let crate::wm::App::Browser(st) = &mut win.app else { return };
     st.path = String::from(path);
-    st.page = vec![0xffff_ffff; cw * 64];
+    st.page = Vec::new();
     st.page_w = cw;
     st.doc_h = 64;
+    st.band_top = 0;
+    st.imgs = Vec::new();
+    st.items = alloc::vec![Item::Text {
+        x: 8,
+        y: 8,
+        s: text,
+        color: 0xffa0_2020,
+        scale: 1,
+        font: Font { id: crate::freetype::FontId::Ui, px: 15 },
+    }];
     st.links = Vec::new();
+    st.fields = Vec::new();
+    st.forms = Vec::new();
+    st.text_runs = Vec::new();
     st.scroll = 0;
     st.page_bg = 0xffff_ffff;
-    let pfb = unsafe { Framebuffer::new(st.page.as_mut_ptr(), cw, 64, cw * 4) };
-    pfb.draw_string(8, 8, &text, 0xffa0_2020, None);
+    repaint_band(win);
     paint_view(win);
 }
 
@@ -2910,13 +3004,17 @@ fn render_message(win: &mut Window, path: &str, msg: &str) {
 pub fn paint_view(win: &mut Window) {
     let (cw, ch) = (win.cw, win.ch);
     let view_h = ch - CHROME;
+    // Make sure the rasterized band covers the scroll window before blitting.
+    ensure_band(win, view_h);
     let bar = {
         let crate::wm::App::Browser(st) = &mut win.app else { return };
+        let bh = if st.page_w == 0 { 0 } else { st.page.len() / st.page_w };
         for row in 0..view_h {
             let sy = st.scroll + row;
+            let by = sy.wrapping_sub(st.band_top); // band-relative row
             let dst = &mut win.canvas[(CHROME + row) * cw..(CHROME + row) * cw + cw];
-            if sy < st.doc_h && st.page_w == cw {
-                dst.copy_from_slice(&st.page[sy * cw..sy * cw + cw]);
+            if sy < st.doc_h && st.page_w == cw && by < bh {
+                dst.copy_from_slice(&st.page[by * cw..by * cw + cw]);
             } else {
                 dst.fill(st.page_bg);
             }

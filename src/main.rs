@@ -141,6 +141,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::canvas_selftest(); // M41: from-scratch <canvas> 2D rendering context
         js::indexeddb_selftest(); // M41: IndexedDB polyfill round-trip
         js::dom_api_selftest(); // M42 step 1: full DOM API + engine fixes (React parses/loads/runs)
+        js::webaudio_selftest(); // M42 step 2: Web Audio API -> 440Hz oscillator -> virtio-sound
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
         shell::selftest(); // M41: bash-subset shell interpreter
         shell::coreutils_selftest(); // M41: grep(regex)/sed/awk/cut/tr standalone tools

@@ -428,6 +428,55 @@ fn node_text_by_tag(tree: &Node, tag: &str) -> String {
     s
 }
 
+/// Web Audio self-test (M42 step 2): load the Web Audio polyfill, build an
+/// oscillator->gain->destination graph at 440 Hz, start it, and verify the
+/// rendered PCM is a 440 Hz tone at the gain-scaled amplitude. The samples are
+/// also handed to the virtio-sound driver (audible when a device is present).
+pub const WEBAUDIO_POLYFILL: &str = include_str!("../../assets/js/webaudio.js");
+
+pub fn webaudio_selftest() {
+    let skeleton = "<html><body><div id=out></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let app = r#"
+        var ctx = new AudioContext();
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        osc.frequency.value = 440;
+        osc.type = 'sine';
+        gain.gain.value = 0.5;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.25);
+        var r = ctx._rendered || [];
+        var crossings = 0;
+        for (var i = 1; i < r.length; i++) { if ((r[i-1] < 0) !== (r[i] < 0)) crossings++; }
+        var peak = 0;
+        for (var j = 0; j < r.length; j++) { var a = Math.abs(r[j]); if (a > peak) peak = a; }
+        var freq = Math.round(crossings / (2 * 0.25));
+        document.getElementById('out').textContent =
+          'samples=' + r.length + ' freq=' + freq + ' peak=' + peak.toFixed(2) +
+          ' rate=' + ctx.sampleRate + ' state=' + ctx.state;
+    "#;
+    let res = run(&tree, &[String::from(WEBAUDIO_POLYFILL), String::from(app)]);
+    let out = node_text_by_id(&res.tree, "out");
+    crate::kprintln!("JS_WEBAUDIO: {out}");
+    if !res.errors.is_empty() {
+        crate::kprintln!("JS_WEBAUDIO: {} issue(s); first: {}", res.errors.len(), truncate(&res.errors[0], 160));
+    }
+    // 440 Hz over 0.25 s at 44.1 kHz -> ~11025 samples, ~220 zero crossings,
+    // peak ≈ 0.5 (the gain). The zero-crossing frequency estimate quantises by
+    // a few Hz over a finite window, so accept 436–444 Hz.
+    let freq_ok = (436..=444).any(|f| out.contains(&alloc::format!("freq={f}")));
+    let peak_ok = out.contains("peak=0.50") || out.contains("peak=0.49") || out.contains("peak=0.51");
+    let samples_ok = out.contains("samples=11025");
+    if freq_ok && peak_ok && samples_ok && out.contains("rate=44100") {
+        crate::kprintln!("WEBAUDIO_OK: AudioContext -> OscillatorNode(440Hz) -> GainNode(0.5) -> destination rendered a 440 Hz tone to virtio-sound");
+    } else {
+        crate::kprintln!("WEBAUDIO_FAIL: {out}");
+    }
+}
+
 pub fn dom_api_selftest() {
     let skeleton = "<html><body><div id=app></div><div id=out></div></body></html>";
     let tree = crate::html::parse(skeleton);

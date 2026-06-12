@@ -120,6 +120,7 @@ impl Interp {
                   "isFinite", "String", "Number", "Boolean", "Array", "Object", "JSON",
                   "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
                   "alert", "fetch", "addEventListener", "structuredClone", "queueMicrotask",
+                  "__webaudio_play", "__webaudio_decode",
                   // ES6 constructors / namespaces (callable + member access via
                   // get_member returning "Name.prop" natives).
                   "Promise", "Map", "Set", "WeakMap", "WeakSet", "Symbol", "Date",
@@ -1878,6 +1879,32 @@ impl Interp {
     fn builtin_method(&mut self, recv: &Val, name: &str, args: &[Val]) -> Result<Option<Val>, Val> {
         let a0 = || args.first().cloned().unwrap_or(Val::Undef);
         match recv {
+            // Function.prototype.call / apply / bind.
+            Val::Func(..) if matches!(name, "call" | "apply" | "bind") => {
+                let this_arg = args.first().cloned().unwrap_or(Val::Undef);
+                match name {
+                    "call" => {
+                        let rest: Vec<Val> = args.iter().skip(1).cloned().collect();
+                        Ok(Some(self.call(recv.clone(), this_arg, rest)?))
+                    }
+                    "apply" => {
+                        let rest = match args.get(1) {
+                            Some(Val::Array(a)) => a.borrow().clone(),
+                            _ => Vec::new(),
+                        };
+                        Ok(Some(self.call(recv.clone(), this_arg, rest)?))
+                    }
+                    // bind: return a native closure capturing (func, this, preargs).
+                    _ => {
+                        let pre: Vec<Val> = args.iter().skip(1).cloned().collect();
+                        let mut o = Obj::new();
+                        o.insert("__bound_fn".into(), recv.clone());
+                        o.insert("__bound_this".into(), this_arg);
+                        o.insert("__bound_args".into(), Val::array(pre));
+                        Ok(Some(Val::object(o)))
+                    }
+                }
+            }
             Val::Host(Host::Document) => Ok(Some(self.document_method(name, args)?)),
             Val::Host(Host::Window) => Ok(Some(self.window_method(name, args)?)),
             Val::Host(Host::Console) => {
@@ -2552,6 +2579,27 @@ impl Interp {
             "Object" => if matches!(a0, Val::Object(_)) { a0 } else { Val::object(Obj::new()) },
             "Symbol" => Val::str(alloc::format!("Symbol({})", a0.to_str())),
             "structuredClone" => deep_clone(&a0),
+
+            // ---- Web Audio sink: float samples [-1,1] -> i16 PCM -> virtio-sound ----
+            "__webaudio_play" => {
+                if let Val::Array(a) = &a0 {
+                    let samples = a.borrow();
+                    let mut pcm: Vec<u8> = Vec::with_capacity(samples.len() * 4);
+                    for v in samples.iter() {
+                        let s = (v.as_num().clamp(-1.0, 1.0) * 32767.0) as i16;
+                        let b = s.to_le_bytes();
+                        pcm.extend_from_slice(&b); // left
+                        pcm.extend_from_slice(&b); // right (mono -> stereo)
+                    }
+                    crate::kprintln!("WEBAUDIO: rendered {} samples -> {} PCM bytes", samples.len(), pcm.len());
+                    if crate::snd::available() && !pcm.is_empty() {
+                        crate::snd::play(&pcm);
+                    }
+                }
+                Val::Undef
+            }
+            // decodeAudioData backend — not yet wired to the MP3/WAV decoders.
+            "__webaudio_decode" => Val::array(Vec::new()),
             "queueMicrotask" => {
                 if let Some(f) = args.first() {
                     self.deferred.push((f.clone(), Vec::new()));
@@ -2615,11 +2663,12 @@ impl Interp {
             }
             "Object.freeze" | "Object.seal" | "Object.preventExtensions" => a0,
             "Object.create" => {
+                // Link the new object to `proto` via the hidden __proto__ so
+                // member lookups inherit dynamically (multi-level prototype
+                // chains, e.g. Web Audio's OscillatorNode -> AudioNode).
                 let mut o = Obj::new();
-                if let Val::Object(proto) = &a0 {
-                    for (k, v) in proto.borrow().iter() {
-                        o.insert(k.clone(), v.clone());
-                    }
+                if matches!(&a0, Val::Object(_)) {
+                    o.insert("__proto__".into(), a0.clone());
                 }
                 Val::object(o)
             }
@@ -3187,8 +3236,57 @@ fn math_method(name: &str, args: &[Val]) -> Val {
         // priority math is `31 - clz32(lanes)`; without it the reconciler loops.
         "clz32" => (a0 as i64 as u32).leading_zeros() as f64,
         "max_safe" => 9007199254740991.0,
+        // Trigonometry (no_std, from src/js/mathf.rs) — used by Web Audio
+        // oscillators, Canvas transforms, and general page scripts.
+        "sin" => mathf::sin(a0),
+        "cos" => mathf::cos(a0),
+        "tan" => mathf::sin(a0) / mathf::cos(a0),
+        "atan2" => atan2(a0, a1),
+        "atan" => atan2(a0, 1.0),
+        "asin" => atan2(a0, mathf::sqrt((1.0 - a0 * a0).max(0.0))),
+        "acos" => core::f64::consts::FRAC_PI_2 - atan2(a0, mathf::sqrt((1.0 - a0 * a0).max(0.0))),
+        "exp" => libm_pow(core::f64::consts::E, a0),
+        "log" => ln(a0),
+        "log2" => ln(a0) / core::f64::consts::LN_2,
+        "log10" => ln(a0) / core::f64::consts::LN_10,
+        "cbrt" => libm_pow(a0, 1.0 / 3.0),
         _ => f64::NAN,
     })
+}
+
+/// natural log via ln(m·2^e) = e·ln2 + ln(m), m in [1,2) by a short series.
+fn ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return if x == 0.0 { f64::NEG_INFINITY } else { f64::NAN };
+    }
+    // Decompose x = m * 2^e with m in [1, 2).
+    let bits = x.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    // ln(m) via atanh series: ln(m) = 2·(t + t³/3 + t⁵/5 + …), t=(m-1)/(m+1).
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let series = t * (1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 / 9.0))));
+    (e as f64) * core::f64::consts::LN_2 + 2.0 * series
+}
+
+/// atan2 via an atan polynomial with argument reduction + quadrant handling.
+fn atan2(y: f64, x: f64) -> f64 {
+    if x == 0.0 && y == 0.0 {
+        return 0.0;
+    }
+    let ax = x.abs();
+    let ay = y.abs();
+    // atan(z) for z in [0,1] via a minimax-ish odd polynomial; reduce z>1 to 1/z.
+    let (z, swap) = if ay > ax { (ax / ay, true) } else { (ay / ax, false) };
+    let z2 = z * z;
+    let mut a = z * (0.9998660 + z2 * (-0.3302995 + z2 * (0.1801410 + z2 * (-0.0851330 + z2 * 0.0208351))));
+    if swap {
+        a = core::f64::consts::FRAC_PI_2 - a;
+    }
+    // place into the correct quadrant
+    let r = if x < 0.0 { core::f64::consts::PI - a } else { a };
+    if y < 0.0 { -r } else { r }
 }
 
 fn num_method(n: f64, name: &str, args: &[Val]) -> Val {

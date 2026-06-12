@@ -168,6 +168,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         pkg::selftest(); // M42 step 9: .veil package format + pkg manager (install/list/remove)
         pkg::sdk_app_selftest(); // M42 step 12: external SDK app (Calculator) -> .veil -> run in Veil
         wm::multiplayer_selftest(); // M42 step 10: shared-desktop multi-cursor + peer registry
+        wm::window_anim_selftest(); // M42 step 13: window animations (easing/tween) + Expose grid
     }
     if milestone12(&fdt) {
         // M14/M15 services (tcp echo, http) as a preemptible kernel task.

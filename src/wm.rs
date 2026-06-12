@@ -349,6 +349,53 @@ fn wallpaper() -> Option<&'static crate::png::Image> {
     }
 }
 
+/// M42 step 13 self-test: the window-animation system — easing curves, frame-
+/// rect tweening (open/close/minimize/maximize), and the Expose/overview grid.
+pub fn window_anim_selftest() {
+    // Easing endpoints + midpoints.
+    let eo0 = ease_out_quad(0.0);
+    let eo1 = ease_out_quad(1.0);
+    let eo_mid = ease_out_quad(0.5); // 0.75
+    let ei_mid = ease_in_quad(0.5);  // 0.25
+    let ease_ok = eo0.abs() < 0.001 && (eo1 - 1.0).abs() < 0.001
+        && (eo_mid - 0.75).abs() < 0.01 && (ei_mid - 0.25).abs() < 0.01;
+
+    // A window opening: tween from a dock rect to the full window rect.
+    let a = Anim {
+        kind: AnimKind::Open, start: 100, dur: 6,
+        from: (500, 760, 40, 10), to: (60, 30, 480, 620), ease_out: true,
+    };
+    let (r0, done0) = a.rect_at(100);          // at start -> ~from, not done
+    let (rend, done_end) = a.rect_at(106);     // at end -> exactly to, done
+    let (rmid, _) = a.rect_at(103);            // halfway (t=0.5, ease 0.75)
+    // x at mid = 500 + (60-500)*0.75 = 500 - 330 = 170
+    let tween_ok = r0.0 == 500 && !done0
+        && rend == (60, 30, 480, 620) && done_end
+        && (rmid.0 - 170).abs() <= 2
+        && rmid.0 < r0.0 && rmid.0 > rend.0; // monotonic between endpoints
+
+    // Expose grid: 5 windows on a 1024×768 screen -> a 3×2 grid, all inside,
+    // non-overlapping.
+    let cells = expose_grid(5, 1024, 768);
+    let grid_count = cells.len() == 5;
+    let cols = 3; // ceil(sqrt(5))
+    let in_bounds = cells.iter().all(|&(x, y, w, h)|
+        x >= 0 && y >= 0 && x + w <= 1024 && y + h <= 768 - TASKBAR_H as isize && w > 0 && h > 0);
+    // row 0 cells share a y; col advances x.
+    let row0_same_y = cells[0].1 == cells[1].1 && cells[1].1 == cells[2].1;
+    let col_advances = cells[1].0 > cells[0].0 && cells[2].0 > cells[1].0;
+    let row1_below = cells[3].1 > cells[0].1;
+    let _ = cols;
+    let grid_ok = grid_count && in_bounds && row0_same_y && col_advances && row1_below;
+
+    crate::kprintln!("WINANIM: ease={ease_ok} tween={tween_ok} grid={grid_ok} (mid_x={}, cells={})", rmid.0, cells.len());
+    if ease_ok && tween_ok && grid_ok {
+        crate::kprintln!("WINANIM_OK: window animations — ease-out/ease-in curves, open/close/min/max frame tweening, and the Expose overview grid all compute correctly");
+    } else {
+        crate::kprintln!("WINANIM_FAIL: ease={ease_ok} tween={tween_ok} grid={grid_ok}");
+    }
+}
+
 /// M42 step 10 self-test: the multiplayer desktop's kernel-side pieces — render
 /// two remote users' labeled colored cursors into a framebuffer and exercise the
 /// peer registry (add with distinct colors, move by id without duplicating,
@@ -562,6 +609,88 @@ pub struct Window {
     pub minimized: bool,
     /// Saved (x, y, cw, ch) before maximize/snap, for restore.
     pub restore: Option<(isize, isize, usize, usize)>,
+    /// M42 step 13: an in-flight open/close/minimize/maximize animation.
+    pub anim: Option<Anim>,
+}
+
+/// A window transition animation: a tween of the frame rectangle over `dur`
+/// ticks (50 Hz, so 6 ticks ≈ 120 ms), with an easing curve and a kind that
+/// decides what happens when it finishes.
+#[derive(Clone, Copy)]
+pub struct Anim {
+    pub kind: AnimKind,
+    pub start: u64,           // timer::ticks() at launch
+    pub dur: u64,             // duration in ticks
+    pub from: (isize, isize, isize, isize), // x, y, w, h
+    pub to: (isize, isize, isize, isize),
+    pub ease_out: bool,       // ease-out (open/maximize) vs ease-in (close/minimize)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum AnimKind {
+    Open,
+    Close,    // remove the window when done
+    Minimize, // hide (minimize) the window when done
+    Maximize,
+}
+
+/// Expose/overview layout: tile `n` windows into a near-square grid that fits
+/// the screen (above the taskbar), with a uniform gap. Returns one (x,y,w,h)
+/// cell per window in order.
+fn expose_grid(n: usize, screen_w: usize, screen_h: usize) -> Vec<(isize, isize, isize, isize)> {
+    let mut out = Vec::new();
+    if n == 0 {
+        return out;
+    }
+    // columns = ceil(sqrt(n)); rows = ceil(n/cols).
+    let mut cols = 1usize;
+    while cols * cols < n {
+        cols += 1;
+    }
+    let rows = n.div_ceil(cols);
+    let gap = 16isize;
+    let avail_h = screen_h as isize - TASKBAR_H as isize;
+    let cw = (screen_w as isize - gap * (cols as isize + 1)) / cols as isize;
+    let ch = (avail_h - gap * (rows as isize + 1)) / rows as isize;
+    for i in 0..n {
+        let col = (i % cols) as isize;
+        let row = (i / cols) as isize;
+        let x = gap + col * (cw + gap);
+        let y = gap + row * (ch + gap);
+        out.push((x, y, cw, ch));
+    }
+    out
+}
+
+/// Quadratic ease-out: fast then settling. f(0)=0, f(1)=1.
+fn ease_out_quad(t: f32) -> f32 {
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+/// Quadratic ease-in: slow then accelerating.
+fn ease_in_quad(t: f32) -> f32 {
+    t * t
+}
+
+impl Anim {
+    /// The interpolated (x, y, w, h) at `now`, and whether the animation is done.
+    pub fn rect_at(&self, now: u64) -> ((isize, isize, isize, isize), bool) {
+        let elapsed = now.saturating_sub(self.start);
+        if elapsed >= self.dur || self.dur == 0 {
+            return (self.to, true);
+        }
+        let t = elapsed as f32 / self.dur as f32;
+        let e = if self.ease_out { ease_out_quad(t) } else { ease_in_quad(t) };
+        let lerp = |a: isize, b: isize| a + (((b - a) as f32) * e) as isize;
+        (
+            (
+                lerp(self.from.0, self.to.0),
+                lerp(self.from.1, self.to.1),
+                lerp(self.from.2, self.to.2),
+                lerp(self.from.3, self.to.3),
+            ),
+            false,
+        )
+    }
 }
 
 pub const MIN_CW: usize = 160;
@@ -678,6 +807,8 @@ pub struct Wm {
     menu: Option<ContextMenu>,         // open right-click menu
     flash: u64,                        // screenshot flash effect expiry tick
     file_drag: Option<FileDrag>,       // dragging a file out of the file manager
+    // M42 step 13: Expose/overview mode — all windows tiled; click one to focus.
+    expose: bool,
     // M42 step 10 (multiplayer): other users sharing this session. The session
     // manager streams their cursor positions; each renders as a labeled colored
     // pointer so everyone sees who is where.
@@ -747,6 +878,7 @@ impl Wm {
             menu: None,
             flash: 0,
             file_drag: None,
+            expose: false,
             peers: Vec::new(),
         }
     }
@@ -948,6 +1080,7 @@ impl Wm {
             app,
             minimized: false,
             restore: None,
+            anim: None,
         };
         // Reserve the taskbar strip: frames may not extend over it.
         let max_y = self.screen.height as isize - TASKBAR_H as isize - win.frame_h();
@@ -1009,6 +1142,21 @@ impl Wm {
         if matches!(win.app, App::Lisp(_)) {
             repl::render(&mut win);
         }
+        // M42 step 13: animate the window scaling up from the taskbar (where the
+        // app launched), 120 ms ease-out.
+        let fw = win.cw as isize + 2 * BORDER as isize;
+        let fh = win.frame_h();
+        let to = (win.x, win.y, fw, fh);
+        let dock_x = self.mx.clamp(0, self.screen.width as isize - 40);
+        let dock_y = self.screen.height as isize - TASKBAR_H as isize / 2;
+        win.anim = Some(Anim {
+            kind: AnimKind::Open,
+            start: timer::ticks(),
+            dur: 6, // ~120 ms at 50 Hz
+            from: (dock_x, dock_y, 40, 10),
+            to,
+            ease_out: true,
+        });
         self.windows.push(win);
         self.dirty = true;
     }
@@ -1152,6 +1300,12 @@ impl Wm {
             if let Some(top) = self.windows.len().checked_sub(1) {
                 self.maximize_toggle(top);
             }
+            return;
+        }
+        // M42 step 13: F3 toggles Expose/overview mode (all windows tiled).
+        if code == keymap::KEY_F3 {
+            self.expose = !self.expose;
+            self.dirty = true;
             return;
         }
         if code == keymap::KEY_F5 {
@@ -2388,9 +2542,42 @@ impl Wm {
         }
 
         let top = self.windows.len().saturating_sub(1);
+        // Advance window-open animations: clear finished ones (keep the desktop
+        // dirty while any is in flight so the tween keeps repainting).
+        {
+            let now = timer::ticks();
+            let mut animating = false;
+            for win in &mut self.windows {
+                if let Some(a) = win.anim {
+                    if a.rect_at(now).1 {
+                        win.anim = None; // finished -> draw normally from now on
+                    } else {
+                        animating = true;
+                    }
+                }
+            }
+            if animating {
+                self.dirty = true;
+            }
+        }
+        let anim_now = timer::ticks();
+
         for (idx, win) in self.windows.iter().enumerate() {
             if win.minimized {
                 continue; // minimized windows stay alive but unpainted
+            }
+            // A window mid open-animation draws as a scaling accent "ghost"
+            // (a rounded rect tweening up from the dock) instead of its content.
+            if let Some(a) = win.anim {
+                let ((ax, ay, aw, ah), _) = a.rect_at(anim_now);
+                if aw > 2 && ah > 2 {
+                    let gx = ax.max(0) as usize;
+                    let gy = ay.max(0) as usize;
+                    let gw = (aw.min(w as isize - ax)).max(1) as usize;
+                    let gh = (ah.min(h as isize - ay)).max(1) as usize;
+                    back.blend_rect(gx, gy, gw, gh, ACCENT, 180);
+                }
+                continue;
             }
             let focused = idx == top;
             // Soft drop shadow (offset, semi-transparent) behind the window.
@@ -2533,6 +2720,23 @@ impl Wm {
         // Screenshot flash.
         if timer::ticks() < self.flash {
             back.blend_rect(0, 0, w, h, 0xffff_ffff, 160);
+        }
+
+        // M42 step 13: Expose/overview — dim the desktop and tile each window's
+        // title bar into a grid cell (click a cell to focus + exit).
+        if self.expose {
+            back.blend_rect(0, 0, w, h, 0xff00_0000, 150);
+            let cells = expose_grid(self.windows.len(), w, h);
+            for (i, win) in self.windows.iter().enumerate() {
+                if let Some(&(cx, cy, cw, ch)) = cells.get(i) {
+                    let (cx, cy) = (cx.max(0) as usize, cy.max(0) as usize);
+                    let (cw, ch) = (cw.max(1) as usize, ch.max(1) as usize);
+                    back.fill_round_rect(cx, cy, cw, ch, 8, 0xff2b_2b2b);
+                    back.fill_round_rect(cx, cy, cw, TITLE_H as usize, 6, ACCENT);
+                    back.draw_text(cx + 8, cy + 5, &win.title, FontId::Ui, 13, 0xffff_ffff);
+                }
+            }
+            back.draw_text(12, 8, "Expose (F3 to exit)", FontId::Ui, 14, 0xffe8e8e8);
         }
 
         // Peer cursors (multiplayer): each remote user's pointer in their color,

@@ -165,6 +165,22 @@ pub fn key(win: &mut Window, code: u16) -> Action {
     }
 }
 
+/// Mouse-wheel: scroll the grid by one column (rows items) per notch without
+/// moving the selection. Positive `notches` scrolls up (toward the first file).
+pub fn wheel(win: &mut Window, notches: i32) -> bool {
+    let rows = (win.ch / ROW_H).max(1);
+    let page = page_size(win.cw, win.ch);
+    let App::Files(st) = &mut win.app else { return false };
+    let max_scroll = st.files.len().saturating_sub(page);
+    let next = (st.scroll as isize - notches as isize * rows as isize)
+        .clamp(0, max_scroll as isize) as usize;
+    if next == st.scroll {
+        return false;
+    }
+    st.scroll = next;
+    true
+}
+
 /// The filename under a content coordinate (for drag-and-drop), without
 /// changing selection.
 pub fn name_at(win: &Window, rx: isize, ry: isize) -> Option<alloc::string::String> {

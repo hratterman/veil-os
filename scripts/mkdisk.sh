@@ -43,6 +43,9 @@ python3 scripts/mksite.py
 for f in site/*; do
     cp "$f" "$MNT/$(basename "$f" | tr a-z A-Z)"
 done
+# A long text file for the editor's mouse-wheel scroll test (M40 step 4).
+awk 'BEGIN { for (i = 1; i <= 250; i++) printf "line %03d: the quick brown fox jumps\n", i }' \
+    > "$MNT/BIG.TXT"
 # Real photos for the M23 image viewer (PNG + M35 JPEG, baseline + progressive)
 for f in assets/photos/*.png assets/photos/*.jpg; do
     [ -e "$f" ] || continue

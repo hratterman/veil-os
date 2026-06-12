@@ -256,6 +256,18 @@ pub fn key(win: &mut Window, code: u16) -> bool {
     true
 }
 
+/// Mouse-wheel over the REPL: scroll the output by ~3 lines per notch.
+/// Positive `notches` scrolls up (toward older output).
+pub fn wheel(win: &mut Window, notches: i32) -> bool {
+    let vis = visible_rows(win.ch);
+    let App::Lisp(st) = &mut win.app else { return false };
+    let max = st.output.len().saturating_sub(vis);
+    let top = st.scroll_top(vis);
+    let next = (top as isize - notches as isize * 3).clamp(0, max as isize) as usize;
+    st.scroll = if next >= max { usize::MAX } else { next };
+    true
+}
+
 /// A typed character: Enter evaluates, Backspace deletes, printables append.
 pub fn char_input(win: &mut Window, ch: char) {
     let App::Lisp(st) = &mut win.app else { return };

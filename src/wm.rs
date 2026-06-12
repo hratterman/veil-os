@@ -407,13 +407,14 @@ pub struct EditorState {
     file: String,   // 8.3 FAT name, e.g. NOTE.TXT
     text: String,   // the buffer; insertion point is always the end
     status: String, // last action, shown in the toolbar
+    scroll: usize,  // top visible row; usize::MAX = follow the cursor (bottom)
 }
 
 pub enum App {
     Echo { text: String },
     Static,
     Paint(PaintState),
-    Shell { input: String, lines: Vec<String>, history: Vec<String>, hist: usize },
+    Shell { input: String, lines: Vec<String>, history: Vec<String>, hist: usize, scroll: usize },
     Browser(browser::BrowserState),
     Editor(EditorState),
     Clock(clock::ClockState),
@@ -704,7 +705,7 @@ impl Wm {
                 430,
                 420,
                 280,
-                App::Shell { input: String::new(), lines: Vec::new(), history: Vec::new(), hist: 0 },
+                App::Shell { input: String::new(), lines: Vec::new(), history: Vec::new(), hist: 0, scroll: usize::MAX },
             ),
             "edit" => {
                 self.add_window("edit", 40, 40, 420, 300, App::Editor(EditorState::open("NOTE.TXT")));
@@ -948,9 +949,18 @@ impl Wm {
                 }
             }
             keymap::EV_REL if code == keymap::REL_WHEEL => {
-                // Mouse-wheel scroll, routed to the focused browser window.
+                // Mouse-wheel scroll, routed to the focused window's app.
+                let dy = value as i32;
                 if let Some(win) = self.windows.last_mut() {
-                    if matches!(win.app, App::Browser(_)) && browser::wheel(win, value as i32) {
+                    let handled = match &win.app {
+                        App::Browser(_) => browser::wheel(win, dy),
+                        App::Editor(_) => editor_wheel(win, dy),
+                        App::Shell { .. } => shell_wheel(win, dy),
+                        App::Files(_) => files::wheel(win, dy),
+                        App::Lisp(_) => repl::wheel(win, dy),
+                        _ => false,
+                    };
+                    if handled {
                         self.dirty = true;
                     }
                 }
@@ -2291,9 +2301,10 @@ const SHELL_PROMPT: u32 = 0xff80_c080;
 
 /// Returns the completed command line on Enter.
 fn shell_key(win: &mut Window, ch: char) -> Option<String> {
-    let App::Shell { input, lines, history, hist } = &mut win.app else {
+    let App::Shell { input, lines, history, hist, scroll } = &mut win.app else {
         return None;
     };
+    *scroll = usize::MAX; // typing/output pins the view to the bottom
     let mut command = None;
     match ch {
         '\u{8}' => {
@@ -2360,9 +2371,11 @@ fn render_shell(win: &mut Window) {
     const SH: u16 = 14; // JetBrains Mono px size
     let lh = 17usize;
     let (input, visible) = {
-        let App::Shell { input, lines, .. } = &win.app else { return };
+        let App::Shell { input, lines, scroll, .. } = &win.app else { return };
         let rows = win.ch.saturating_sub(lh + 8) / lh;
-        let skip = lines.len().saturating_sub(rows);
+        let max_skip = lines.len().saturating_sub(rows);
+        // Pin to the bottom unless the user scrolled up with the wheel.
+        let skip = if *scroll == usize::MAX { max_skip } else { (*scroll).min(max_skip) };
         (input.clone(), lines[skip..].to_vec())
     };
     let fb = win.canvas_fb();
@@ -2383,6 +2396,23 @@ fn render_shell(win: &mut Window) {
     let py = win.ch.saturating_sub(lh + 2);
     fb.draw_text(6, py, ">", FontId::Mono, SH, ACCENT);
     fb.draw_text(6 + chev, py, &format!("{input}_"), FontId::Mono, SH, 0xffff_ffff);
+}
+
+/// Mouse-wheel over the shell: scroll the output scrollback ~3 lines per notch.
+/// Positive `notches` scrolls up (toward older output).
+fn shell_wheel(win: &mut Window, notches: i32) -> bool {
+    let lh = 17usize;
+    let rows = win.ch.saturating_sub(lh + 8) / lh;
+    let App::Shell { lines, scroll, .. } = &mut win.app else { return false };
+    let max_skip = lines.len().saturating_sub(rows);
+    if max_skip == 0 {
+        return false;
+    }
+    let cur = if *scroll == usize::MAX { max_skip } else { (*scroll).min(max_skip) };
+    let next = (cur as isize - notches as isize * 3).clamp(0, max_skip as isize) as usize;
+    *scroll = if next >= max_skip { usize::MAX } else { next };
+    kprintln!("SHELL: scroll top={next} (max={max_skip})");
+    true
 }
 
 // --- paint app (M8) ---------------------------------------------------------
@@ -2994,8 +3024,30 @@ impl EditorState {
                 (String::new(), String::from(status))
             }
         };
-        EditorState { file: String::from(file), text, status }
+        EditorState { file: String::from(file), text, status, scroll: usize::MAX }
     }
+}
+
+/// Rows of text that fit in an editor window of canvas height `ch`.
+fn editor_rows(ch: usize) -> usize {
+    const LH: usize = 17;
+    (ch.saturating_sub(TOOLBAR_H as usize + 4)) / LH
+}
+
+/// Mouse-wheel in the editor: scroll the view by ~3 lines per notch. Positive
+/// `notches` scrolls up (toward the top of the file).
+fn editor_wheel(win: &mut Window, notches: i32) -> bool {
+    let ch = win.ch;
+    let App::Editor(st) = &mut win.app else { return false };
+    let nlines = if st.text.is_empty() { 1 } else { st.text.split('\n').count() };
+    let rows = editor_rows(ch);
+    let max_scroll = nlines.saturating_sub(rows);
+    let cur = if st.scroll == usize::MAX { max_scroll } else { st.scroll.min(max_scroll) };
+    let next = (cur as isize - notches as isize * 3).clamp(0, max_scroll as isize) as usize;
+    // Snapping back to the bottom re-enables cursor-follow.
+    st.scroll = if next >= max_scroll { usize::MAX } else { next };
+    kprintln!("EDITOR: scroll top={next} (max={max_scroll})");
+    true
 }
 
 fn render_editor_toolbar(fb: &Framebuffer, cw: usize, file: &str, status: &str) {
@@ -3118,9 +3170,9 @@ fn byte_at(s: &str, char_idx: usize) -> usize {
 }
 
 fn render_editor(win: &mut Window) {
-    let (file, status, text) = {
+    let (file, status, text, user_scroll) = {
         let App::Editor(st) = &win.app else { return };
-        (st.file.clone(), st.status.clone(), st.text.clone())
+        (st.file.clone(), st.status.clone(), st.text.clone(), st.scroll)
     };
     let lang = editor_lang(&file);
     let (cw, ch) = (win.cw, win.ch);
@@ -3135,7 +3187,9 @@ fn render_editor(win: &mut Window) {
     let cur_line = nlines; // cursor is at the end (1-based last line)
     let cur_col = src_lines.last().map(|l| l.chars().count()).unwrap_or(0) + 1;
     let total_rows = src_lines.len();
-    let scroll = total_rows.saturating_sub(rows); // keep the cursor (end) in view
+    let max_scroll = total_rows.saturating_sub(rows);
+    // Follow the cursor (bottom) unless the user has scrolled up with the wheel.
+    let scroll = if user_scroll == usize::MAX { max_scroll } else { user_scroll.min(max_scroll) };
 
     let fb = win.canvas_fb();
     fb.fill_rect(0, top, cw, ch - top, ED_BG);
@@ -3176,6 +3230,7 @@ fn editor_key(win: &mut Window, ch: char) {
             c if st.text.len() < EDITOR_MAX => st.text.push(c),
             _ => {}
         }
+        st.scroll = usize::MAX; // typing jumps back to the cursor
         st.status = String::from("edited");
     }
     render_editor(win);

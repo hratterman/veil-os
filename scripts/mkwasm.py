@@ -213,9 +213,28 @@ def netget():
             + section(11, data_sec))
 
 
+def evil():
+    # A malicious app: _start reads an address far past its own 1-page linear
+    # memory (reaching for kernel RAM). The WASM sandbox blocks the access and
+    # the app is killed cleanly — the OS never sees the address.
+    types = vec([bytes([0x60]) + vec([]) + vec([])])  # ()->()
+    funcs = vec([uleb(0)])
+    mems = vec([bytes([0x00]) + uleb(1)])              # 1 page (64 KiB)
+    exports = vec([name("_start") + bytes([0x00]) + uleb(0)])
+    body = (i32c(0x1000_0000)                          # addr = 256 MiB (out of bounds)
+            + bytes([0x28]) + uleb(2) + uleb(0)         # i32.load align=2 off=0  -> traps
+            + bytes([DROP, END]))
+    code_entry = uleb(0) + body
+    code = vec([uleb(len(code_entry)) + code_entry])
+    return (b"\0asm" + struct.pack("<I", 1)
+            + section(1, types) + section(3, funcs) + section(5, mems)
+            + section(7, exports) + section(10, code))
+
+
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "assets"
     open(f"{out}/hello.wasm", "wb").write(hello())
     open(f"{out}/compute.wasm", "wb").write(compute())
     open(f"{out}/netget.wasm", "wb").write(netget())
+    open(f"{out}/evil.wasm", "wb").write(evil())
     print(f"wrote {out}/hello.wasm ({len(hello())} B), {out}/compute.wasm ({len(compute())} B)")

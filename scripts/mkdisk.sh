@@ -53,7 +53,7 @@ n=$(wc -l < out.txt)
 echo "lines=$n"
 if [ $n -eq 3 ]; then echo RESULT_OK; else echo RESULT_BAD; fi
 VEILSH
-for bin in hello ls cat echo spin; do
+for bin in hello ls cat echo spin evil; do
     cp "user/target/aarch64-unknown-none/release/$bin.bin" \
        "$MNT/$(echo "$bin" | tr a-z A-Z).BIN"
 done
@@ -80,6 +80,8 @@ cp assets/compute.wasm "$MNT/COMPUTE.WSM" 2>/dev/null || true
 cp assets/netget.wasm "$MNT/NETGET.WSM" 2>/dev/null || true
 # M41 step 12: the SDK "Hello, Veil" example app (graphical: render + on_click).
 cp assets/helloapp.wasm "$MNT/HELLOAPP.WSM" 2>/dev/null || true
+# M41 step 15: a malicious app that tries to read out-of-sandbox (kernel) memory.
+cp assets/evil.wasm "$MNT/EVIL.WSM" 2>/dev/null || true
 # M24 audio: a 3-second 440 Hz sine test tone (16-bit stereo 44.1 kHz).
 python3 scripts/mkwav.py "$MNT/TONE.WAV" 3 >/dev/null
 # M37 codecs: a from-scratch-decoded MP3 (Layer III) and H.264 baseline MP4.

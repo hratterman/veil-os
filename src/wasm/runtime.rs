@@ -288,6 +288,17 @@ impl<'a> Instance<'a> {
 
     fn load(&self, op: u8, addr: usize) -> Option<i64> {
         let m = &self.mem;
+        // Sandbox: every guest address is an index into this app's own linear
+        // memory. An access past it (an app reaching for kernel/other-app RAM)
+        // is rejected here — the app can physically never name kernel memory.
+        let size = mem_size(op);
+        if addr.checked_add(size).map_or(true, |e| e > m.len()) {
+            crate::kprintln!(
+                "WASM_SANDBOX: blocked out-of-bounds load at {addr:#x} (app memory is {} bytes)",
+                m.len()
+            );
+            return None;
+        }
         Some(match op {
             0x28 => i32::from_le_bytes(m.get(addr..addr + 4)?.try_into().ok()?) as i64, // i32.load
             0x29 => i64::from_le_bytes(m.get(addr..addr + 8)?.try_into().ok()?), // i64.load
@@ -301,6 +312,14 @@ impl<'a> Instance<'a> {
 
     fn store(&mut self, op: u8, addr: usize, val: i64) -> Option<()> {
         let m = &mut self.mem;
+        let size = mem_size(op);
+        if addr.checked_add(size).map_or(true, |e| e > m.len()) {
+            crate::kprintln!(
+                "WASM_SANDBOX: blocked out-of-bounds store at {addr:#x} (app memory is {} bytes)",
+                m.len()
+            );
+            return None;
+        }
         match op {
             0x36 => m.get_mut(addr..addr + 4)?.copy_from_slice(&(val as i32).to_le_bytes()),
             0x37 => m.get_mut(addr..addr + 8)?.copy_from_slice(&val.to_le_bytes()),
@@ -503,6 +522,16 @@ impl<'a> Instance<'a> {
 
 fn pop(st: &mut Vec<i64>) -> Option<i64> {
     st.pop()
+}
+
+/// Byte width of a load/store opcode (for the sandbox bounds check).
+fn mem_size(op: u8) -> usize {
+    match op {
+        0x29 | 0x37 => 8,                              // i64 load/store
+        0x2c | 0x2d | 0x3a => 1,                       // 8-bit
+        0x2e | 0x2f | 0x3b => 2,                       // 16-bit
+        _ => 4,                                        // i32 (and the rest)
+    }
 }
 
 fn do_branch(stack: &mut Vec<i64>, ctrl: &mut Vec<Ctrl>, pc: &mut usize, l: usize) -> Option<()> {

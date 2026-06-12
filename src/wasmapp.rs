@@ -74,7 +74,12 @@ impl WasmState {
                     if e.contains("_start") {
                         ran = Self::run_compute(&data, &mut lines, name);
                     } else {
-                        lines.push((format!("error: {e}"), 0xffd0_5a4a));
+                        // The app trapped (e.g. a sandbox violation). It is
+                        // killed cleanly — only its window shows the error; the
+                        // OS and every other app keep running.
+                        lines.push((format!("app trapped: {e}"), 0xffd0_5a4a));
+                        lines.push((String::from("the app was killed; the OS is unaffected"), MUTED));
+                        kprintln!("WASM_KILLED: {name} trapped cleanly ({e}); OS and other apps unaffected");
                         ran = true;
                     }
                 }

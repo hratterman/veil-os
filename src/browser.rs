@@ -1094,6 +1094,34 @@ pub fn hsts_selftest() {
     }
 }
 
+/// Prove the address-bar fix: bare hosts become absolute https:// URLs (not
+/// paths relative to the current page), and dotless input becomes a search.
+pub fn addrbar_selftest() {
+    // The reported bug: on henryratterman.com, typing "google.com" must go to
+    // https://google.com — NOT henryratterman.com/google.com.
+    set_page_base(Some(String::from("https://henryratterman.com/")));
+    let host = address_bar_url("google.com");
+    let with_path = address_bar_url("github.com/hratterman");
+    let already = address_bar_url("https://example.com/x");
+    let search = address_bar_url("hello world");
+    let search1 = address_bar_url("veil");
+    set_page_base(None);
+    let resolved = resolve_href(&host); // a click-style resolve must leave it alone
+    if host == "https://google.com"
+        && with_path == "https://github.com/hratterman"
+        && already == "https://example.com/x"
+        && search == "https://google.com/search?q=hello+world"
+        && search1 == "https://google.com/search?q=veil"
+        && resolved == "https://google.com"
+    {
+        kprintln!("ADDRBAR_OK: bare host -> absolute https:// (not relative); dotless -> search");
+    } else {
+        kprintln!(
+            "ADDRBAR_FAIL: host={host} path={with_path} abs={already} q={search} q1={search1} r={resolved}"
+        );
+    }
+}
+
 /// If `url` is http:// to an HSTS host, upgrade it to https://.
 fn hsts_upgrade(url: &str) -> String {
     if let Some(rest) = url.strip_prefix("http://") {
@@ -1459,6 +1487,53 @@ fn resolve_href(href: &str) -> String {
     } else {
         format!("/{href}")
     }
+}
+
+/// Canonicalise raw text typed into the address bar into a URL to navigate to.
+/// Unlike a clicked link (which may legitimately be a relative path), bare
+/// address-bar text is the user's intent to go somewhere new, so it must NOT be
+/// resolved against the current page's host. Rules:
+///   * already has a scheme (http://, https://, ws://, …) -> use as-is
+///   * starts with '/' -> an absolute path on the current site -> as-is
+///   * contains a '.' and no leading slash -> a bare host -> prepend https://
+///   * otherwise (no dot, no slash) -> a search term -> google it
+fn address_bar_url(input: &str) -> String {
+    let s = input.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // Any explicit scheme ("scheme://…") is taken verbatim.
+    if let Some(i) = s.find("://") {
+        if i > 0 && s[..i].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-') {
+            return String::from(s);
+        }
+    }
+    // An absolute path stays a path on the current site (relative resolution).
+    if s.starts_with('/') {
+        return String::from(s);
+    }
+    // A bare host (has a dot, no leading slash) is an absolute URL over https.
+    if s.contains('.') {
+        return format!("https://{s}");
+    }
+    // No dots, no slashes: treat the whole thing as a web search.
+    let mut q = String::new();
+    for ch in s.chars() {
+        match ch {
+            ' ' => q.push('+'),
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => q.push(ch),
+            _ => {
+                // percent-encode any other byte(s)
+                let mut buf = [0u8; 4];
+                for b in ch.encode_utf8(&mut buf).bytes() {
+                    q.push('%');
+                    q.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                    q.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+                }
+            }
+        }
+    }
+    format!("https://google.com/search?q={q}")
 }
 
 /// Fetch + decode the image in slot `i`, updating its laid-out size to the
@@ -4429,8 +4504,9 @@ pub fn key(win: &mut Window, code: u16) -> bool {
                 } else {
                     return true;
                 };
-                kprintln!("BROWSER: address bar -> {url}");
-                navigate(win, url.trim(), true);
+                let dest = address_bar_url(&url);
+                kprintln!("BROWSER: address bar '{}' -> {dest}", url.trim());
+                navigate(win, &dest, true);
                 return true;
             }
             KEY_ESC => {

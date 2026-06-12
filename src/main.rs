@@ -129,6 +129,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::indexeddb_selftest(); // M41: IndexedDB polyfill round-trip
         websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
         shell::selftest(); // M41: bash-subset shell interpreter
+        shell::coreutils_selftest(); // M41: grep(regex)/sed/awk/cut/tr standalone tools
     }
     milestone9();
     milestone10(&fdt);

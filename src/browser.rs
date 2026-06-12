@@ -1075,6 +1075,18 @@ pub fn js_fetch(url: &str, body: Option<&str>) -> Option<(u32, String, Vec<u8>)>
     http_request(&resolved, body.map(|b| b.as_bytes()))
 }
 
+/// Shell `curl`: fetch `url` (https://, http:// external, or a `/local` path)
+/// over the kernel HTTP/TLS stack. Returns (status, body bytes). `body` non-None
+/// makes it a POST. Resets the page base so a prior browser navigation doesn't
+/// rewrite a bare path onto an external host.
+pub fn shell_fetch(url: &str, body: Option<&[u8]>) -> Option<(u32, Vec<u8>)> {
+    let prev = page_base();
+    set_page_base(None);
+    let r = http_request(url, body);
+    set_page_base(prev);
+    r.map(|(st, _ct, data)| (st, data))
+}
+
 // --- JS WebSocket bindings --------------------------------------------------
 // A registry of open WebSocket connections, indexed by the id the JS WebSocket
 // object holds. `ws://veil/...` resolves to loopback.

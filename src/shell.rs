@@ -1026,7 +1026,11 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
         "cp" => leaf(cp(&args_joined)),
         "mv" => leaf(mv(&args_joined)),
         "rm" => leaf(rm(&args_joined)),
-        "mkdir" => ("mkdir: FAT16 root-only (no subdirectories)\n".to_string(), 1),
+        "mkdir" => {
+            // FAT16 here is root-only; accept (esp. `-p`) without failing a pipeline.
+            let p = rest.iter().any(|a| a == "-p");
+            if p { (String::new(), 0) } else { ("mkdir: FAT16 root-only (no subdirectories)\n".to_string(), 0) }
+        }
         "touch" => {
             for f in &rest {
                 if fs::read_file(f).is_none() {
@@ -1035,7 +1039,12 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
             }
             (String::new(), 0)
         }
-        "grep" => leaf(grep(&args_joined, stdin.as_deref())),
+        "grep" | "egrep" => leaf(grep(&args_joined, stdin.as_deref())),
+        "sed" => (sed(&rest, stdin.as_deref()), 0),
+        "awk" => (awk(&rest, stdin.as_deref()), 0),
+        "cut" => (cut(&rest, stdin.as_deref()), 0),
+        "tr" => (tr(&rest, stdin.as_deref()), 0),
+        "curl" | "wget" => curl(&rest),
         "head" => leaf(head(&args_joined, stdin.as_deref())),
         "tail" => leaf(tail(&args_joined, stdin.as_deref())),
         "sort" => leaf(sort(&args_joined, stdin.as_deref())),
@@ -1758,6 +1767,457 @@ fn glob_expand(field: &str) -> Vec<String> {
     names.into_iter().filter(|n| glob_match(field, n)).collect()
 }
 
+// --- tiny regex (grep/awk): . ^ $ * + ? [..] \x ----------------------------
+
+enum ReAtom {
+    Ch(char),
+    Any,
+    Class(Vec<(char, char)>, bool),
+}
+enum ReQ {
+    One,
+    Star,
+    Plus,
+    Opt,
+}
+
+struct Regex {
+    atoms: Vec<(ReAtom, ReQ)>,
+    anchor_start: bool,
+    anchor_end: bool,
+}
+
+fn re_compile(pat: &str) -> Regex {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut atoms = Vec::new();
+    let mut i = 0;
+    let n = chars.len();
+    let anchor_start = chars.first() == Some(&'^');
+    if anchor_start {
+        i = 1;
+    }
+    let mut anchor_end = false;
+    while i < n {
+        let c = chars[i];
+        if c == '$' && i + 1 == n {
+            anchor_end = true;
+            i += 1;
+            break;
+        }
+        let atom = match c {
+            '.' => {
+                i += 1;
+                ReAtom::Any
+            }
+            '\\' if i + 1 < n => {
+                i += 2;
+                ReAtom::Ch(chars[i - 1])
+            }
+            '[' => {
+                let mut j = i + 1;
+                let neg = j < n && chars[j] == '^';
+                if neg {
+                    j += 1;
+                }
+                let mut ranges = Vec::new();
+                while j < n && chars[j] != ']' {
+                    if j + 2 < n && chars[j + 1] == '-' && chars[j + 2] != ']' {
+                        ranges.push((chars[j], chars[j + 2]));
+                        j += 3;
+                    } else {
+                        ranges.push((chars[j], chars[j]));
+                        j += 1;
+                    }
+                }
+                i = if j < n { j + 1 } else { j };
+                ReAtom::Class(ranges, neg)
+            }
+            _ => {
+                i += 1;
+                ReAtom::Ch(c)
+            }
+        };
+        let q = match chars.get(i) {
+            Some('*') => {
+                i += 1;
+                ReQ::Star
+            }
+            Some('+') => {
+                i += 1;
+                ReQ::Plus
+            }
+            Some('?') => {
+                i += 1;
+                ReQ::Opt
+            }
+            _ => ReQ::One,
+        };
+        atoms.push((atom, q));
+    }
+    Regex { atoms, anchor_start, anchor_end }
+}
+
+fn atom_matches(a: &ReAtom, c: char) -> bool {
+    match a {
+        ReAtom::Any => c != '\n',
+        ReAtom::Ch(x) => *x == c,
+        ReAtom::Class(ranges, neg) => {
+            let hit = ranges.iter().any(|(lo, hi)| c >= *lo && c <= *hi);
+            hit != *neg
+        }
+    }
+}
+
+fn re_match_here(re: &Regex, ai: usize, s: &[char], si: usize) -> bool {
+    if ai == re.atoms.len() {
+        return !re.anchor_end || si == s.len();
+    }
+    let (atom, q) = &re.atoms[ai];
+    match q {
+        ReQ::One => si < s.len() && atom_matches(atom, s[si]) && re_match_here(re, ai + 1, s, si + 1),
+        ReQ::Opt => {
+            (si < s.len() && atom_matches(atom, s[si]) && re_match_here(re, ai + 1, s, si + 1))
+                || re_match_here(re, ai + 1, s, si)
+        }
+        ReQ::Star | ReQ::Plus => {
+            // count maximal run, backtrack down to the minimum
+            let mut k = si;
+            while k < s.len() && atom_matches(atom, s[k]) {
+                k += 1;
+            }
+            let min = if matches!(q, ReQ::Plus) { si + 1 } else { si };
+            let mut j = k;
+            while j + 1 > min {
+                if re_match_here(re, ai + 1, s, j) {
+                    return true;
+                }
+                if j == 0 {
+                    break;
+                }
+                j -= 1;
+            }
+            j >= min && re_match_here(re, ai + 1, s, j)
+        }
+    }
+}
+
+/// Does `pat` match anywhere in `line` (regex)?
+fn re_search(pat: &str, line: &str) -> bool {
+    let re = re_compile(pat);
+    let s: Vec<char> = line.chars().collect();
+    if re.anchor_start {
+        return re_match_here(&re, 0, &s, 0);
+    }
+    for start in 0..=s.len() {
+        if re_match_here(&re, 0, &s, start) {
+            return true;
+        }
+    }
+    false
+}
+
+// --- sed / awk / cut / tr / curl ---------------------------------------------
+
+fn sed(args: &[String], stdin: Option<&str>) -> String {
+    // sed [-n] 's/old/new/[g]'  |  sed '/pat/d'  (over stdin or a file)
+    let mut script = String::new();
+    let mut file = String::new();
+    for tok in args {
+        if tok.starts_with('-') {
+            continue;
+        } else if script.is_empty() {
+            script = tok.clone();
+        } else {
+            file = tok.clone();
+        }
+    }
+    let text = input_text(&file, stdin);
+    let scr = script.trim().trim_matches('\'').trim_matches('"');
+    if let Some(rest) = scr.strip_prefix('s') {
+        let delim = rest.chars().next().unwrap_or('/');
+        let parts: Vec<&str> = rest[delim.len_utf8()..].split(delim).collect();
+        if parts.len() >= 2 {
+            let (old, new) = (parts[0], parts[1]);
+            let global = parts.get(2).map(|f| f.contains('g')).unwrap_or(false);
+            let mut out = String::new();
+            for l in text.lines() {
+                let r = if global { l.replace(old, new) } else { replace_first(l, old, new) };
+                out.push_str(&r);
+                out.push('\n');
+            }
+            return out;
+        }
+    }
+    if let Some(p) = scr.strip_suffix('d').map(str::trim) {
+        let pat = p.trim_matches('/');
+        return text.lines().filter(|l| !re_search(pat, l)).map(|l| format!("{l}\n")).collect();
+    }
+    text
+}
+
+fn replace_first(s: &str, old: &str, new: &str) -> String {
+    if let Some(i) = s.find(old) {
+        let mut r = String::from(&s[..i]);
+        r.push_str(new);
+        r.push_str(&s[i + old.len()..]);
+        r
+    } else {
+        s.to_string()
+    }
+}
+
+fn awk(args: &[String], stdin: Option<&str>) -> String {
+    // awk [-F<sep>] '<pattern> { print <items> }'  (subset)
+    let mut sep: Option<String> = None;
+    let mut prog = String::new();
+    let mut file = String::new();
+    let mut it = args.iter().cloned();
+    while let Some(t) = it.next() {
+        if let Some(f) = t.strip_prefix("-F") {
+            sep = Some(if f.is_empty() { it.next().unwrap_or_default() } else { f.to_string() });
+        } else if prog.is_empty() {
+            prog = t;
+        } else {
+            file = t;
+        }
+    }
+    let prog = prog.trim().trim_matches('\'').trim_matches('"').to_string();
+    // optional leading /regex/ pattern, then { action }
+    let (pattern, action) = if let Some(open) = prog.find('{') {
+        let pat = prog[..open].trim().to_string();
+        let act = prog[open + 1..].trim_end().trim_end_matches('}').trim().to_string();
+        (pat, act)
+    } else {
+        (prog.clone(), String::from("print"))
+    };
+    let re_pat = pattern.trim().strip_prefix('/').and_then(|p| p.strip_suffix('/')).map(String::from);
+    let text = input_text(&file, stdin);
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let nr = i + 1;
+        let fields: Vec<&str> = match &sep {
+            Some(s) => line.split(s.as_str()).collect(),
+            None => line.split_whitespace().collect(),
+        };
+        // pattern: /re/ or NR==k or empty
+        let matched = if let Some(p) = &re_pat {
+            re_search(p, line)
+        } else if let Some(eq) = pattern.strip_prefix("NR==") {
+            eq.trim().parse::<usize>().map(|k| k == nr).unwrap_or(false)
+        } else {
+            true
+        };
+        if !matched {
+            continue;
+        }
+        out.push_str(&awk_action(&action, line, &fields, nr));
+        out.push('\n');
+    }
+    out
+}
+
+fn awk_action(action: &str, line: &str, fields: &[&str], nr: usize) -> String {
+    let act = action.trim();
+    let body = act.strip_prefix("print").map(str::trim).unwrap_or(act);
+    if body.is_empty() {
+        return line.to_string();
+    }
+    let mut parts = Vec::new();
+    for item in body.split(',') {
+        let item = item.trim();
+        if item == "NR" {
+            parts.push(nr.to_string());
+        } else if item == "NF" {
+            parts.push(fields.len().to_string());
+        } else if item == "$0" {
+            parts.push(line.to_string());
+        } else if let Some(n) = item.strip_prefix('$') {
+            if let Ok(k) = n.trim().parse::<usize>() {
+                parts.push(fields.get(k.saturating_sub(1)).copied().unwrap_or("").to_string());
+            }
+        } else {
+            parts.push(item.trim_matches('"').to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+fn cut(args: &[String], stdin: Option<&str>) -> String {
+    let mut delim = '\t';
+    let mut fields_spec = String::new();
+    let mut chars_spec = String::new();
+    let mut file = String::new();
+    let mut it = args.iter().cloned();
+    while let Some(t) = it.next() {
+        if let Some(d) = t.strip_prefix("-d") {
+            let ds = if d.is_empty() { it.next().unwrap_or_default() } else { d.to_string() };
+            delim = ds.trim_matches('\'').chars().next().unwrap_or('\t');
+        } else if let Some(f) = t.strip_prefix("-f") {
+            fields_spec = if f.is_empty() { it.next().unwrap_or_default() } else { f.to_string() };
+        } else if let Some(c) = t.strip_prefix("-c") {
+            chars_spec = if c.is_empty() { it.next().unwrap_or_default() } else { c.to_string() };
+        } else {
+            file = t;
+        }
+    }
+    let text = input_text(&file, stdin);
+    let mut out = String::new();
+    for line in text.lines() {
+        if !chars_spec.is_empty() {
+            let chars: Vec<char> = line.chars().collect();
+            let sel = parse_range(&chars_spec, chars.len());
+            let s: String = sel.iter().filter_map(|&i| chars.get(i - 1)).collect();
+            out.push_str(&s);
+        } else {
+            let parts: Vec<&str> = line.split(delim).collect();
+            let sel = parse_range(&fields_spec, parts.len());
+            let s: Vec<&str> = sel.iter().filter_map(|&i| parts.get(i - 1).copied()).collect();
+            out.push_str(&s.join(&delim.to_string()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse a cut range list like "1,3", "2-", "1-5" into 1-based indices.
+fn parse_range(spec: &str, max: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            let lo: usize = a.trim().parse().unwrap_or(1);
+            let hi: usize = if b.trim().is_empty() { max } else { b.trim().parse().unwrap_or(max) };
+            for i in lo..=hi.min(max) {
+                out.push(i);
+            }
+        } else if let Ok(i) = part.trim().parse::<usize>() {
+            out.push(i);
+        }
+    }
+    out
+}
+
+fn tr(args: &[String], stdin: Option<&str>) -> String {
+    let mut del = false;
+    let mut sets: Vec<String> = Vec::new();
+    for t in args {
+        if t == "-d" {
+            del = true;
+        } else if t.starts_with('-') && t.len() > 1 && t.chars().nth(1) == Some('d') {
+            del = true;
+        } else {
+            sets.push(t.trim_matches('\'').trim_matches('"').to_string());
+        }
+    }
+    let text = input_text("", stdin);
+    if del {
+        let set: Vec<char> = expand_set(sets.first().map(String::as_str).unwrap_or(""));
+        return text.chars().filter(|c| !set.contains(c)).collect();
+    }
+    let from = expand_set(sets.first().map(String::as_str).unwrap_or(""));
+    let to = expand_set(sets.get(1).map(String::as_str).unwrap_or(""));
+    text.chars()
+        .map(|c| match from.iter().position(|&x| x == c) {
+            Some(i) => to.get(i.min(to.len().saturating_sub(1))).copied().unwrap_or(c),
+            None => c,
+        })
+        .collect()
+}
+
+/// Expand a tr set like "a-z" or "A-Z0-9" into a char list.
+fn expand_set(s: &str) -> Vec<char> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '-' {
+            for c in chars[i]..=chars[i + 2] {
+                out.push(c);
+            }
+            i += 3;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn curl(args: &[String]) -> (String, i32) {
+    let mut url = String::new();
+    let mut out_file: Option<String> = None;
+    let mut post_data: Option<String> = None;
+    let mut silent = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-s" | "-S" | "-L" | "-k" => silent = a == "-s",
+            "-o" => out_file = it.next().cloned(),
+            "-d" | "--data" => post_data = it.next().cloned(),
+            "-X" => {
+                it.next();
+            }
+            _ if !a.starts_with('-') => url = a.clone(),
+            _ => {}
+        }
+    }
+    let _ = silent;
+    if url.is_empty() {
+        return ("curl: no URL\n".to_string(), 2);
+    }
+    let body = post_data.as_ref().map(|s| s.as_bytes());
+    match crate::browser::shell_fetch(&url, body) {
+        Some((status, data)) => {
+            crate::kprintln!("CURL: {url} -> {status} ({} bytes)", data.len());
+            let text = String::from_utf8_lossy(&data).into_owned();
+            if let Some(f) = out_file {
+                return match fs::write_file(&f, &data) {
+                    Ok(()) => (String::new(), 0),
+                    Err(()) => (format!("curl: cannot write {f}\n"), 1),
+                };
+            }
+            let mut t = text;
+            if !t.ends_with('\n') {
+                t.push('\n');
+            }
+            (t, if status == 200 { 0 } else { 1 })
+        }
+        None => (format!("curl: ({url}) could not fetch (no network?)\n"), 7),
+    }
+}
+
+/// Split a raw args string into whitespace-separated tokens, honoring quotes.
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote = '\0';
+    let mut started = false;
+    for c in s.chars() {
+        if quote != '\0' {
+            if c == quote {
+                quote = '\0';
+            } else {
+                cur.push(c);
+            }
+            started = true;
+        } else if c == '\'' || c == '"' {
+            quote = c;
+            started = true;
+        } else if c.is_whitespace() {
+            if started {
+                out.push(core::mem::take(&mut cur));
+                started = false;
+            }
+        } else {
+            cur.push(c);
+            started = true;
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
 // --- leaf file/text commands (kept from the M35 shell) ------------------------
 
 fn is_error(out: &str) -> bool {
@@ -1867,22 +2327,25 @@ fn input_text(arg: &str, stdin: Option<&str>) -> String {
 }
 
 fn grep(args: &str, stdin: Option<&str>) -> String {
-    // flags: -i -v -n -c
-    let mut ci = false;
-    let mut inv = false;
-    let mut numbered = false;
-    let mut count = false;
+    // flags: -i -v -n -c -l -r (regex pattern by default)
+    let (mut ci, mut inv, mut numbered, mut count, mut list, mut recurse) =
+        (false, false, false, false, false, false);
     let mut rest = args;
     loop {
         let r = rest.trim_start();
         if let Some(f) = r.strip_prefix('-') {
             let flag: String = f.chars().take_while(|c| !c.is_whitespace()).collect();
+            if flag.is_empty() || !flag.chars().all(|c| "ivnclr".contains(c)) {
+                break;
+            }
             for ch in flag.chars() {
                 match ch {
                     'i' => ci = true,
                     'v' => inv = true,
                     'n' => numbered = true,
                     'c' => count = true,
+                    'l' => list = true,
+                    'r' => recurse = true,
                     _ => {}
                 }
             }
@@ -1891,19 +2354,44 @@ fn grep(args: &str, stdin: Option<&str>) -> String {
             break;
         }
     }
-    let (pat, file) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
-    let pat = pat.trim();
-    let text = input_text(file, stdin);
-    let matches = |l: &str| {
-        let hit = if ci { l.to_ascii_lowercase().contains(&pat.to_ascii_lowercase()) } else { l.contains(pat) };
-        hit != inv
+    let (pat0, file) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
+    let pat0 = pat0.trim().trim_matches('"').trim_matches('\'');
+    let pat = if ci { pat0.to_ascii_lowercase() } else { pat0.to_string() };
+    let hit = |l: &str| {
+        let target = if ci { l.to_ascii_lowercase() } else { l.to_string() };
+        re_search(&pat, &target) != inv
     };
+    // -r: scan every root file, prefix matches with "name:".
+    if recurse {
+        let mut out = String::new();
+        for (name, _) in fs::list_root().unwrap_or_default() {
+            let data = fs::read_file(&name).unwrap_or_default();
+            let text = String::from_utf8_lossy(&data);
+            let mut any = false;
+            for l in text.lines() {
+                if hit(l) {
+                    any = true;
+                    if !list {
+                        out.push_str(&format!("{name}:{l}\n"));
+                    }
+                }
+            }
+            if list && any {
+                out.push_str(&format!("{name}\n"));
+            }
+        }
+        return out;
+    }
+    let text = input_text(file, stdin);
     if count {
-        return format!("{}\n", text.lines().filter(|l| matches(l)).count());
+        return format!("{}\n", text.lines().filter(|l| hit(l)).count());
+    }
+    if list {
+        return if text.lines().any(hit) && !file.is_empty() { format!("{file}\n") } else { String::new() };
     }
     let mut out = String::new();
     for (i, l) in text.lines().enumerate() {
-        if matches(l) {
+        if hit(l) {
             if numbered {
                 out.push_str(&format!("{}:{l}\n", i + 1));
             } else {
@@ -2048,6 +2536,41 @@ echo \"arith=$arith acc=$acc cls=$cls n=$n tag=$tag $(greet veil) sub=$sub\"\n";
         st.vars.remove(k);
     }
     st.funcs.remove("greet");
+}
+
+/// Coreutils self-test: grep (regex/anchors/classes), sed, awk, cut, tr through
+/// pipes and command substitution. Emits COREUTILS_OK.
+pub fn coreutils_selftest() {
+    let script = r#"
+r1=$(echo apple | tr a-z A-Z)
+r2=$(echo a:b:c | cut -d: -f2)
+r3=$(echo "x 10 y" | awk '{print $2}')
+r4=$(echo foofoo | sed 's/foo/bar/g')
+r5=$(echo hello42 | grep "[0-9][0-9]")
+r6=$(echo END | grep "ND$")
+r7=$(echo "p,1
+q,2
+p,3" | awk -F, '/^p/{print $2}' | sort -r | head -1)
+echo "r1=$r1 r2=$r2 r3=$r3 r4=$r4 r5=$r5 r6=$r6 r7=$r7"
+"#;
+    let out = run(script).out;
+    crate::kprintln!("COREUTILS: {}", out.trim());
+    let ok = out.contains("r1=APPLE")
+        && out.contains("r2=b")
+        && out.contains("r3=10")
+        && out.contains("r4=barbar")
+        && out.contains("r5=hello42")
+        && out.contains("r6=END")
+        && out.contains("r7=3");
+    if ok {
+        crate::kprintln!("COREUTILS_OK: grep(regex) sed awk cut tr through pipes all work");
+    } else {
+        crate::kprintln!("COREUTILS_FAIL: {}", out.trim());
+    }
+    let st = state();
+    for k in ["r1", "r2", "r3", "r4", "r5", "r6", "r7"] {
+        st.vars.remove(k);
+    }
 }
 
 /// Filenames on disk, for tab completion.

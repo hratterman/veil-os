@@ -153,6 +153,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         rsa::selftest(); // M41: from-scratch RSA modexp for X.509 validation
         x509::selftest(); // M41: X.509 parse + chain validation (self-signed/expired/hostname)
         cc::selftest(); // M41 step 21: compile + run a C program inside Veil
+        cc::selftest2(); // M42 step 8: pointers/arrays/char/malloc/preprocessor/stdlib
         browser::addrbar_selftest(); // address bar: bare host -> https://, dotless -> search
         browser::hsts_selftest(); // M41: HSTS record + http->https upgrade
     }

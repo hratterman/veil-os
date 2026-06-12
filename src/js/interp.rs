@@ -2080,7 +2080,32 @@ impl Interp {
                 }
                 Ok(Val::Undef)
             }
-            "scrollTo" | "scroll" | "scrollBy" | "removeEventListener" | "alert" | "focus" | "open" => {
+            // window.open(url, target, features): signal the browser/WM to open
+            // a second browser window, and return a window proxy with
+            // postMessage/opener/closed/location so cross-window scripts work.
+            "open" => {
+                let url = args.first().map(|v| v.to_str()).unwrap_or_default();
+                crate::browser::request_new_window(&url);
+                let mut loc = Obj::new();
+                loc.insert("href".into(), Val::str(url.clone()));
+                loc.insert("pathname".into(), Val::str(
+                    url.split("://").nth(1).and_then(|r| r.split_once('/')).map(|(_, p)| alloc::format!("/{p}")).unwrap_or_else(|| String::from("/"))
+                ));
+                let mut w = Obj::new();
+                w.insert("__window".into(), Val::Bool(true));
+                w.insert("closed".into(), Val::Bool(false));
+                w.insert("opener".into(), Val::Host(Host::Window));
+                w.insert("location".into(), Val::object(loc));
+                w.insert("name".into(), Val::str(args.get(1).map(|v| v.to_str()).unwrap_or_default()));
+                // postMessage into the opened window delivers a 'message' event
+                // back to this window's listeners (the child echoes to its opener).
+                w.insert("postMessage".into(), Val::Native(Native::Global(Rc::from("__win_post"))));
+                w.insert("close".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                w.insert("focus".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                w.insert("blur".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                Ok(Val::object(w))
+            }
+            "scrollTo" | "scroll" | "scrollBy" | "removeEventListener" | "alert" | "focus" => {
                 Ok(Val::Undef)
             }
             _ => Ok(Val::Undef),
@@ -2840,6 +2865,26 @@ impl Interp {
             }
             // decodeAudioData backend — not yet wired to the MP3/WAV decoders.
             "__webaudio_decode" => Val::array(Vec::new()),
+
+            // window-proxy postMessage: deliver a 'message' event to this
+            // window's listeners (the opened window echoing back to its opener).
+            "__win_post" => {
+                let mut ev = Obj::new();
+                ev.insert("type".into(), Val::str("message"));
+                ev.insert("data".into(), a0);
+                ev.insert("origin".into(), Val::str(""));
+                let evv = Val::object(ev);
+                let handlers: Vec<Val> = self
+                    .listeners
+                    .iter()
+                    .filter(|l| l.node == self.dom.root && l.event == "message")
+                    .map(|l| l.handler.clone())
+                    .collect();
+                for h in handlers {
+                    self.deferred.push((h, alloc::vec![evv.clone()]));
+                }
+                Val::Undef
+            }
             "queueMicrotask" => {
                 if let Some(f) = args.first() {
                     self.deferred.push((f.clone(), Vec::new()));

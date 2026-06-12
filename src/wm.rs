@@ -891,6 +891,18 @@ impl Wm {
         self.dirty = true;
     }
 
+    /// M42 step 5: open each `window.open(url)` request as a second browser
+    /// window, cascaded from the previous so both are visible side by side.
+    fn open_pending_windows(&mut self) {
+        for (i, url) in browser::take_new_windows().into_iter().enumerate() {
+            let off = (i as isize + 1) * 40;
+            self.add_window("browser", 40 + off, 30 + off, 480, 620, App::Browser(browser::BrowserState::new()));
+            let win = self.windows.last_mut().unwrap();
+            kprintln!("WM: window.open -> new browser window for {url}");
+            browser::navigate(win, &url, false);
+        }
+    }
+
     /// M29: open a FAT16 file in the app that handles its type (file
     /// manager dispatch). Raises the window if that file is already open.
     pub fn open_file(&mut self, name: &str) {
@@ -1474,6 +1486,9 @@ impl Wm {
         self.buttons = self.pend_buttons;
         if pressed & 1 != 0 {
             self.on_left_down();
+            // A page script may have called window.open(url) during click
+            // handling; open each queued URL as a second browser window.
+            self.open_pending_windows();
         }
         if released & 1 != 0 {
             self.on_left_up();

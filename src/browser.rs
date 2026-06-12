@@ -1524,6 +1524,22 @@ fn page_base() -> Option<String> {
     unsafe { (*core::ptr::addr_of!(PAGE_BASE)).clone() }
 }
 
+/// Queue of URLs that page JS asked to open in a new browser window
+/// (`window.open(url)`). The window manager drains this after running scripts
+/// and spawns a second browser window per request.
+static mut NEW_WINDOWS: Vec<String> = Vec::new();
+
+/// Called from the JS engine's `window.open(url)`.
+pub fn request_new_window(url: &str) {
+    kprintln!("BROWSER: window.open('{url}') -> queued a new browser window");
+    unsafe { (*core::ptr::addr_of_mut!(NEW_WINDOWS)).push(String::from(url)) };
+}
+
+/// The WM drains pending `window.open` requests (FIFO) and opens each.
+pub fn take_new_windows() -> Vec<String> {
+    unsafe { core::mem::take(&mut *core::ptr::addr_of_mut!(NEW_WINDOWS)) }
+}
+
 /// Join a possibly-relative URL against an absolute base (scheme://host/path).
 fn url_join(base: &str, href: &str) -> String {
     let href = href.split('#').next().unwrap_or("").trim(); // keep query, drop fragment

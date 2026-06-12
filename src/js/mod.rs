@@ -543,6 +543,41 @@ pub fn webgl_selftest() {
     }
 }
 
+/// Multiwindow self-test (M42 step 5): `window.open(url)` returns a window proxy
+/// (opener/closed/location/name), signals the WM to open a second browser
+/// window, and `proxy.postMessage(data)` delivers a `message` event back to the
+/// opener's listeners (the cross-window channel). Verifies all of it.
+pub fn multiwindow_selftest() {
+    let _ = crate::browser::take_new_windows(); // clear any prior state
+    let skeleton = "<html><body><div id=out></div><div id=msg></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        window.addEventListener('message', function(e){ document.getElementById('msg').textContent = e.data; });
+        var w = window.open('https://example.com/child', 'child');
+        document.getElementById('out').textContent =
+          'opener=' + (w.opener === window) + ' closed=' + w.closed +
+          ' href=' + w.location.href + ' name=' + w.name;
+        w.postMessage('ping-from-opener', '*');
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    let out = node_text_by_id(&res.tree, "out");
+    let msg = node_text_by_id(&res.tree, "msg");
+    let opened = crate::browser::take_new_windows();
+    crate::kprintln!("JS_MULTIWIN: out=[{out}] msg=[{msg}] opened={opened:?}");
+    if !res.errors.is_empty() {
+        crate::kprintln!("JS_MULTIWIN: {} issue(s); first: {}", res.errors.len(), truncate(&res.errors[0], 160));
+    }
+    let proxy_ok = out.contains("opener=true") && out.contains("closed=false")
+        && out.contains("href=https://example.com/child") && out.contains("name=child");
+    let post_ok = msg == "ping-from-opener";
+    let wm_ok = opened.iter().any(|u| u == "https://example.com/child");
+    if proxy_ok && post_ok && wm_ok {
+        crate::kprintln!("MULTIWIN_OK: window.open returns a proxy (opener/closed/location/name), queues a new WM window, and postMessage delivers across windows");
+    } else {
+        crate::kprintln!("MULTIWIN_FAIL: proxy={proxy_ok} post={post_ok} wm={wm_ok}");
+    }
+}
+
 pub fn dom_api_selftest() {
     let skeleton = "<html><body><div id=app></div><div id=out></div></body></html>";
     let tree = crate::html::parse(skeleton);

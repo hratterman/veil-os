@@ -2402,6 +2402,9 @@ impl Wm {
         draw_cursor(&back, self.mx, self.my, self.cursor);
 
         self.screen.copy_from(&self.back);
+        // M41 step 20: present the composed frame to the virtio-gpu display
+        // (no-op on the legacy ramfb path).
+        crate::gpu::present();
         self.dirty = false;
     }
 }

@@ -28,6 +28,7 @@ fi
 qemu-system-aarch64 \
     -machine virt -cpu cortex-a72 -smp 4 -m 512M \
     -global virtio-mmio.force-legacy=false \
+    -device virtio-gpu-device \
     -device ramfb \
     -device virtio-keyboard-device \
     -device virtio-tablet-device \

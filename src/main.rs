@@ -24,6 +24,7 @@ mod dtb;
 mod editor;
 mod exceptions;
 mod fb;
+mod gpu;
 mod harden;
 mod files;
 mod font;
@@ -441,6 +442,17 @@ fn milestone24(fdt: &dtb::Fdt) {
 fn milestone5(fdt: &dtb::Fdt) -> Option<(fb::Framebuffer, bool)> {
     const W: usize = 1024;
     const H: usize = 768;
+
+    // M41 step 20: prefer virtio-gpu. The compositor draws into the GPU's
+    // backing buffer and presents each frame via a host-side blit (gpu::present).
+    if gpu::init(fdt) {
+        if let Some((pa, w, h)) = gpu::framebuffer() {
+            let fb = unsafe { fb::Framebuffer::new(pa as *mut u32, w, h, w * 4) };
+            fb.clear(0xff10_1014);
+            gpu::present();
+            return Some((fb, false));
+        }
+    }
 
     let Some(fw) = fwcfg::FwCfg::from_dtb(fdt) else {
         kprintln!("FB_SKIP: no fw_cfg device in DTB");

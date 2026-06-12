@@ -309,6 +309,7 @@ class Manager:
         s.qemu = subprocess.Popen([
             "qemu-system-aarch64",
             "-machine", "virt", "-cpu", "cortex-a72", "-smp", "4", "-m", "512M",
+            "-device", "virtio-gpu-device",
             "-global", "virtio-mmio.force-legacy=false",
             "-device", "ramfb",
             "-device", "virtio-keyboard-device",

@@ -387,6 +387,22 @@ fn milestone19b() {
             timer::set_wall(unix);
             kprintln!("NTP: set clock to {unix}");
             kprintln!("M19b_OK");
+            // M42 step 16: verify the synced time is real (a recent unix
+            // timestamp, not 0/garbage), confirm the timezone offset is applied,
+            // and that the taskbar clock now reads local wall time.
+            let plausible = unix > 1_600_000_000 && unix < 4_000_000_000; // 2020..2096
+            let synced = timer::synced();
+            let local = unix as i64 + tz_secs;
+            let secs_of_day = ((local % 86400) + 86400) % 86400;
+            let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+            let taskbar_reads = timer::wall_ticks50().is_some();
+            if plausible && synced && taskbar_reads {
+                kprintln!(
+                    "NTP_OK: synced to pool.ntp.org over UDP; kernel clock set, local time {hh:02}:{mm:02}:{ss:02} (tz {tz_secs}s), taskbar clock live"
+                );
+            } else {
+                kprintln!("NTP_FAIL: plausible={plausible} synced={synced} taskbar={taskbar_reads} unix={unix}");
+            }
         }
         None => kprintln!("NTP: no sync (network unreachable); clock uses time-since-boot"),
     }

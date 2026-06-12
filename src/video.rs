@@ -49,7 +49,12 @@ fn split_frames(data: &[u8]) -> Vec<(usize, usize)> {
 impl VideoState {
     pub fn with_file(name: &str) -> VideoState {
         let data = fs::read_file(name).unwrap_or_default();
-        // .mp4 → H.264 (decode all frames up front, capped to bound memory).
+        Self::with_data(String::from(name), data)
+    }
+
+    /// Build a player from in-memory bytes (e.g. an MP4 the browser fetched for
+    /// a `<video>` tag). `.mp4`/`.MP4` is decoded as H.264, else treated as MJPEG.
+    pub fn with_data(name: String, data: Vec<u8>) -> VideoState {
         let is_mp4 = name.ends_with(".MP4") || name.ends_with(".mp4");
         let mut predecoded = Vec::new();
         let frames;
@@ -67,7 +72,7 @@ impl VideoState {
             kprintln!("VIDEO: {name} -> {} frames ({} bytes)", frames.len(), data.len());
         }
         let mut st = VideoState {
-            name: String::from(name),
+            name,
             data,
             frames,
             predecoded,

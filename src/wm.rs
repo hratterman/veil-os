@@ -36,6 +36,19 @@ fn drain_toasts() -> Vec<String> {
     unsafe { core::mem::take(&mut *core::ptr::addr_of_mut!(PENDING_TOASTS)) }
 }
 
+/// A `<video>` the browser fetched and wants opened in the video player. The WM
+/// drains this each `clock_tick` and launches a player window.
+static mut PENDING_VIDEO: Option<(String, Vec<u8>)> = None;
+
+/// Queue an in-memory video (8.3 name + bytes) for the WM to open in the player.
+pub fn queue_video(name: String, data: Vec<u8>) {
+    unsafe { *core::ptr::addr_of_mut!(PENDING_VIDEO) = Some((name, data)) };
+}
+
+fn drain_video() -> Option<(String, Vec<u8>)> {
+    unsafe { (*core::ptr::addr_of_mut!(PENDING_VIDEO)).take() }
+}
+
 pub const BORDER: isize = 2;
 pub const TITLE_H: isize = 22;
 /// Bottom launcher bar (UX overhaul): always composited on top; windows
@@ -1774,6 +1787,8 @@ impl Wm {
                             // address bar focused for editing
                         } else if browser::focus_field(win, rx, ry) {
                             // an on-page input field took focus
+                        } else if browser::click_video(win, rx, ry) {
+                            // a <video> placeholder -> fetch + open in the player
                         } else if let Some(href) = browser::link_at(win, rx, ry) {
                             if ctrl {
                                 kprintln!("BROWSER: ctrl+click -> new tab {href}");
@@ -2026,6 +2041,11 @@ impl Wm {
         let now = timer::ticks();
         for msg in drain_toasts() {
             self.notify(&msg);
+        }
+        if let Some((name, data)) = drain_video() {
+            kprintln!("WM: launch video '{name}' from browser ({} bytes)", data.len());
+            self.add_window(&name, 200, 80, 360, 300, App::Video(video::VideoState::with_data(name.clone(), data)));
+            self.dirty = true;
         }
         let before = self.toasts.len();
         self.toasts.retain(|(_, exp)| now < *exp);

@@ -97,6 +97,7 @@ pub struct BrowserState {
     imgs: Vec<Option<png::Image>>, // decoded images by slot; None = not fetched yet
     img_src: Vec<String>,          // source URL per slot, for lazy (on-scroll) loading
     links: Vec<LinkBox>,
+    videos: Vec<VideoBox>, // <video> placeholders (click to play)
     scroll: usize,
     page_bg: u32,
     // M39 tabs: each tab carries its own path + scroll + back/forward stacks +
@@ -192,6 +193,17 @@ struct LinkBox {
     href: String,
 }
 
+/// A `<video>` placeholder's hit box + its source URL. Clicking it fetches the
+/// MP4 and opens it in the video player.
+#[derive(Clone)]
+struct VideoBox {
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    src: String,
+}
+
 /// Per-tab navigable state. The active tab's rendered page lives in the
 /// BrowserState fields; this is the lightweight metadata for every tab.
 #[derive(Clone)]
@@ -221,6 +233,7 @@ impl BrowserState {
             imgs: Vec::new(),
             img_src: Vec::new(),
             links: Vec::new(),
+            videos: Vec::new(),
             scroll: 0,
             page_bg: 0xffff_ffff,
             tabs: alloc::vec![Tab::new("/")],
@@ -1606,6 +1619,7 @@ enum Frag {
     Word { s: String, color: u32, scale: usize, link: Option<String>, underline: bool, font: Font },
     Space { scale: usize, font: Font },
     Img { idx: usize, w: isize, h: isize },
+    Video { src: String, w: isize, h: isize },
     Input {
         name: String,
         value: String,
@@ -1633,7 +1647,7 @@ fn frag_w(f: &Frag) -> isize {
     match f {
         Frag::Word { s, scale, font, .. } => text_w(s, *scale, *font),
         Frag::Space { scale, font } => text_w(" ", *scale, *font),
-        Frag::Img { w, .. } | Frag::Input { w, .. } => *w,
+        Frag::Img { w, .. } | Frag::Input { w, .. } | Frag::Video { w, .. } => *w,
         Frag::Br => 0,
     }
 }
@@ -1641,7 +1655,7 @@ fn frag_w(f: &Frag) -> isize {
 fn frag_h(f: &Frag) -> isize {
     match f {
         Frag::Word { scale, font, .. } | Frag::Space { scale, font } => text_h(*scale, *font),
-        Frag::Img { h, .. } | Frag::Input { h, .. } => *h,
+        Frag::Img { h, .. } | Frag::Input { h, .. } | Frag::Video { h, .. } => *h,
         Frag::Br => 16,
     }
 }
@@ -1659,6 +1673,7 @@ struct Ctx<'a> {
     imgs: &'a [ImgSlot],
     items: Vec<Item>,
     links: Vec<LinkBox>,
+    videos: Vec<VideoBox>,                 // <video> placeholders found in layout
     img_spots: Vec<(usize, isize, isize)>, // (imgs idx, x, y) for the proof log
     fields: Vec<InputField>,               // on-page form fields, with positions
     forms: Vec<Form>,                      // forms encountered during layout
@@ -1803,6 +1818,25 @@ fn collect_inline(
                         buf.push(Frag::Img { idx, w: slot.w, h: slot.h });
                     }
                 }
+                "video" => {
+                    // src on <video> itself or on a child <source>.
+                    let src = node
+                        .attr("src")
+                        .map(resolve_href)
+                        .or_else(|| {
+                            node.children()
+                                .iter()
+                                .find(|c| c.tag() == Some("source"))
+                                .and_then(|c| c.attr("src"))
+                                .map(resolve_href)
+                        })
+                        .unwrap_or_default();
+                    if !src.is_empty() {
+                        let w = node.attr("width").and_then(|v| v.trim().parse::<isize>().ok()).unwrap_or(320).clamp(120, 640);
+                        let h = node.attr("height").and_then(|v| v.trim().parse::<isize>().ok()).unwrap_or(180).clamp(80, 480);
+                        buf.push(Frag::Video { src, w, h });
+                    }
+                }
                 _ => {
                     for c in children {
                         let cs = match c {
@@ -1846,6 +1880,24 @@ fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> is
             Frag::Img { idx, w: fw, h: fh } => {
                 ctx.img_spots.push((idx, x + dx, fy));
                 ctx.items.push(Item::Image { x: x + dx, y: fy, w: fw, h: fh, idx });
+            }
+            Frag::Video { src, w: fw, h: fh } => {
+                let (bx, by) = (x + dx, fy);
+                // Dark poster box with a centred play triangle + label.
+                ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff15_1518 });
+                ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: 1, color: 0xff3a_4048 });
+                ctx.items.push(Item::Rect { x: bx, y: by + fh - 1, w: fw, h: 1, color: 0xff3a_4048 });
+                // A play triangle built from horizontal scanlines.
+                let (cx, cy) = (bx + fw / 2 - 10, by + fh / 2 - 16);
+                for r in 0..32isize {
+                    let half = if r <= 16 { r } else { 32 - r };
+                    ctx.items.push(Item::Rect { x: cx, y: cy + r, w: half * 18 / 16, h: 1, color: 0xffe8_e8e8 });
+                }
+                ctx.items.push(Item::Text {
+                    x: bx + 8, y: by + fh - 22, s: String::from("click to play video"),
+                    color: 0xffb0_b8c0, scale: 1, font: Font { id: crate::freetype::FontId::Ui, px: 13 },
+                });
+                ctx.videos.push(VideoBox { x: bx, y: by, w: fw, h: fh, src });
             }
             Frag::Input { name, value, kind, checked, w: fw, h: fh, multiline, options } => {
                 let (bx, by) = (x + dx, fy);
@@ -2231,6 +2283,7 @@ fn measure_item(
         imgs: ctx.imgs,
         items: Vec::new(),
         links: Vec::new(),
+        videos: Vec::new(),
         img_spots: Vec::new(),
         fields: Vec::new(),
         forms: Vec::new(),
@@ -2972,7 +3025,7 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     let fetch_ahead = (view_h as isize) * 2;
     {
         let mut ctx1 = Ctx {
-            sheet: &sheet, imgs: &slots, items: Vec::new(), links: Vec::new(),
+            sheet: &sheet, imgs: &slots, items: Vec::new(), links: Vec::new(), videos: Vec::new(),
             img_spots: Vec::new(), fields: Vec::new(), forms: Vec::new(), cur_form: usize::MAX,
         };
         layout_block(&mut ctx1, body_node, &root, 0, view_w as isize, 0, None);
@@ -2997,7 +3050,7 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
 
     // Pass 2: final layout, now with decoded sizes for the fetched images.
     let mut ctx = Ctx {
-        sheet: &sheet, imgs: &slots, items: Vec::new(), links: Vec::new(),
+        sheet: &sheet, imgs: &slots, items: Vec::new(), links: Vec::new(), videos: Vec::new(),
         img_spots: Vec::new(), fields: Vec::new(), forms: Vec::new(), cur_form: usize::MAX,
     };
     let end_y = layout_block(&mut ctx, body_node, &root, 0, view_w as isize, 0, None);
@@ -3043,6 +3096,9 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
             );
         }
     }
+    for v in &ctx.videos {
+        kprintln!("BROWSER: video '{}' at ({}, {}) {}x{}", v.src, v.x, v.y, v.w, v.h);
+    }
     kprintln!(
         "BROWSER: rendered {path} - {} items, {} links, doc {}x{}",
         ctx.items.len(),
@@ -3066,6 +3122,7 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
     st.doc_h = doc_h;
     st.band_top = 0;
     st.links = ctx.links;
+    st.videos = ctx.videos;
     st.fields = ctx.fields;
     st.forms = ctx.forms;
     let mut text = String::new();
@@ -3146,6 +3203,7 @@ fn render_message(win: &mut Window, path: &str, msg: &str) {
         font: Font { id: crate::freetype::FontId::Ui, px: 15 },
     }];
     st.links = Vec::new();
+    st.videos = Vec::new();
     st.fields = Vec::new();
     st.forms = Vec::new();
     st.text_runs = Vec::new();
@@ -3482,6 +3540,37 @@ pub fn link_at(win: &Window, rx: isize, ry: isize) -> Option<String> {
         .iter()
         .find(|l| dx >= l.x && dx < l.x + l.w && dy >= l.y && dy < l.y + l.h)
         .map(|l| l.href.clone())
+}
+
+/// Click on a `<video>` placeholder: fetch the MP4 and hand it to the WM to open
+/// in the video player. Returns true if a video box was hit.
+pub fn click_video(win: &mut Window, rx: isize, ry: isize) -> bool {
+    let src = {
+        let crate::wm::App::Browser(st) = &win.app else { return false };
+        if (ry as usize) < CHROME {
+            return false;
+        }
+        let (dx, dy) = (rx, ry - CHROME as isize + st.scroll as isize);
+        st.videos
+            .iter()
+            .find(|v| dx >= v.x && dx < v.x + v.w && dy >= v.y && dy < v.y + v.h)
+            .map(|v| v.src.clone())
+    };
+    let Some(src) = src else { return false };
+    kprintln!("BROWSER: play video {src}");
+    crate::wm::queue_toast(String::from("Loading video…"));
+    match http_request(&src, None) {
+        Some((200, _, data)) => {
+            let name = download_name(&src, "video/mp4");
+            kprintln!("BROWSER: fetched video {src} ({} bytes) -> {name}", data.len());
+            crate::wm::queue_video(name, data);
+        }
+        other => {
+            kprintln!("BROWSER: video fetch failed for {src} ({other:?})");
+            crate::wm::queue_toast(String::from("Video failed to load"));
+        }
+    }
+    true
 }
 
 static SCROLL_DONE: AtomicBool = AtomicBool::new(false);

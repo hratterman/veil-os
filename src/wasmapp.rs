@@ -32,6 +32,7 @@ impl WasmState {
                 Ok(out) if !out.is_empty() => {
                     for l in out.lines() {
                         lines.push((String::from(l), TEXT));
+                        kprintln!("WASM_OUT: {l}");
                     }
                     ran = true;
                     kprintln!("WASMAPP: {name} _start printed {} bytes", out.len());

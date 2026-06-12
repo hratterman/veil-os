@@ -153,8 +153,69 @@ def compute():
             + section(1, types) + section(3, funcs) + section(7, exports) + section(10, code))
 
 
+I32_STORE = 0x36
+
+
+def netget():
+    # A WASM app that calls the Veil host's veil_http_get to fetch a URL over
+    # the kernel's HTTP/TLS stack, then prints the response via WASI fd_write.
+    # imports: 0 = env.veil_http_get(i32,i32,i32,i32)->i32, 1 = wasi.fd_write
+    url = b"http://example.com/"
+    URLP, OUT, CAP, NW = 64, 1024, 4096, 16
+    data = url  # placed at offset URLP via the data segment
+
+    types = vec([
+        bytes([0x60]) + vec([bytes([0x7F])] * 4) + vec([bytes([0x7F])]),  # type 0
+        bytes([0x60]) + vec([]) + vec([]),                                 # type 1 ()->()
+    ])
+    imports = vec([
+        name("env") + name("veil_http_get") + bytes([0x00]) + uleb(0),
+        name("wasi_snapshot_preview1") + name("fd_write") + bytes([0x00]) + uleb(0),
+    ])
+    funcs = vec([uleb(1)])  # _start : type 1
+    mems = vec([bytes([0x00]) + uleb(1)])  # 1 page
+    exports = vec([
+        name("_start") + bytes([0x00]) + uleb(2),   # func idx 2 (after 2 imports)
+        name("memory") + bytes([0x02]) + uleb(0),
+    ])
+
+    def store(addr_expr, val_expr):
+        return addr_expr + val_expr + bytes([I32_STORE]) + uleb(2) + uleb(0)
+
+    body = (
+        # mem[0] = OUT (iov.base)
+        store(i32c(0), i32c(OUT))
+        # result = veil_http_get(URLP, len, OUT, CAP)
+        + i32c(URLP) + i32c(len(url)) + i32c(OUT) + i32c(CAP)
+        + bytes([CALL]) + uleb(0)
+        + bytes([LOCAL_SET]) + uleb(0)
+        # clamp high: result = result < CAP ? result : CAP
+        + bytes([LOCAL_GET]) + uleb(0) + i32c(CAP) + bytes([I32_LT_S])
+        + bytes([IF, 0x7F]) + bytes([LOCAL_GET]) + uleb(0) + bytes([ELSE]) + i32c(CAP) + bytes([END])
+        + bytes([LOCAL_SET]) + uleb(0)
+        # clamp low: result = result < 0 ? 0 : result
+        + bytes([LOCAL_GET]) + uleb(0) + i32c(0) + bytes([I32_LT_S])
+        + bytes([IF, 0x7F]) + i32c(0) + bytes([ELSE]) + bytes([LOCAL_GET]) + uleb(0) + bytes([END])
+        + bytes([LOCAL_SET]) + uleb(0)
+        # mem[4] = result (iov.len)
+        + store(i32c(4), bytes([LOCAL_GET]) + uleb(0))
+        # fd_write(1, iov=0, 1, nwritten=NW)
+        + i32c(1) + i32c(0) + i32c(1) + i32c(NW) + bytes([CALL]) + uleb(1) + bytes([DROP])
+        + bytes([END])
+    )
+    code_entry = (uleb(1) + uleb(1) + bytes([0x7F])) + body  # 1 i32 local (result)
+    code = vec([uleb(len(code_entry)) + code_entry])
+    data_sec = vec([uleb(0) + i32c(URLP) + bytes([END]) + uleb(len(data)) + data])
+
+    return (b"\0asm" + struct.pack("<I", 1)
+            + section(1, types) + section(2, imports) + section(3, funcs)
+            + section(5, mems) + section(7, exports) + section(10, code)
+            + section(11, data_sec))
+
+
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "assets"
     open(f"{out}/hello.wasm", "wb").write(hello())
     open(f"{out}/compute.wasm", "wb").write(compute())
+    open(f"{out}/netget.wasm", "wb").write(netget())
     print(f"wrote {out}/hello.wasm ({len(hello())} B), {out}/compute.wasm ({len(compute())} B)")

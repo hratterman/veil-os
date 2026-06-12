@@ -3,20 +3,159 @@
 //! debug shims. Unknown imports are no-ops that return 0.
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub struct Host {
     pub output: String,
+    /// Open TCP sockets opened by `veil_tcp_connect`, indexed by the handle the
+    /// guest holds. (M41 step 11: network access for WASM apps.)
+    sockets: Vec<Option<crate::net::Handle>>,
+}
+
+/// Read a guest string given (ptr, len) i64 args.
+fn mem_str(mem: &[u8], ptr: i64, len: i64) -> Option<String> {
+    let (p, l) = (ptr as u32 as usize, len as u32 as usize);
+    mem.get(p..p + l).map(|s| String::from_utf8_lossy(s).into_owned())
+}
+
+/// Parse a dotted-quad IPv4, else None.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split('.');
+    for o in &mut out {
+        *o = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() { None } else { Some(out) }
 }
 
 impl Host {
     pub fn new() -> Host {
-        Host { output: String::new() }
+        Host { output: String::new(), sockets: Vec::new() }
     }
 
     /// Dispatch an imported function call. Returns its (single) i32/i64 result.
     pub fn call(&mut self, field: &str, args: &[i64], mem: &mut [u8]) -> Option<i64> {
         match field {
+            // ---- M41 step 11: Veil network host functions ----
+            // veil_http_get(url_ptr, url_len, out_ptr, out_cap) -> body length
+            // (full length even if truncated to out_cap; -1 on failure).
+            "veil_http_get" | "veil_http_post" => {
+                let url = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                let (out_ptr, out_cap, body);
+                if field == "veil_http_post" {
+                    let b = mem_str(mem, *args.get(2)?, *args.get(3)?)?;
+                    out_ptr = *args.get(4)? as u32 as usize;
+                    out_cap = *args.get(5)? as u32 as usize;
+                    body = crate::browser::shell_fetch(&url, Some(b.as_bytes()));
+                } else {
+                    out_ptr = *args.get(2)? as u32 as usize;
+                    out_cap = *args.get(3)? as u32 as usize;
+                    body = crate::browser::shell_fetch(&url, None);
+                }
+                match body {
+                    Some((status, data)) => {
+                        crate::kprintln!("WASM_NET: {field} {url} -> {status} ({} bytes)", data.len());
+                        let n = data.len().min(out_cap);
+                        if let Some(slot) = mem.get_mut(out_ptr..out_ptr + n) {
+                            slot.copy_from_slice(&data[..n]);
+                        }
+                        Some(data.len() as i64)
+                    }
+                    None => {
+                        crate::kprintln!("WASM_NET: {field} {url} failed (no network?)");
+                        Some(-1)
+                    }
+                }
+            }
+            // veil_dns_resolve(host_ptr, host_len) -> packed big-endian IPv4 (-1)
+            "veil_dns_resolve" => {
+                let host = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                match parse_ipv4(&host).or_else(|| crate::net::dns_resolve(&host)) {
+                    Some(ip) => Some(u32::from_be_bytes(ip) as i64),
+                    None => Some(-1),
+                }
+            }
+            // veil_tcp_connect(host_ptr, host_len, port) -> socket handle (-1)
+            "veil_tcp_connect" => {
+                let host = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                let port = *args.get(2)? as u16;
+                let ip = parse_ipv4(&host).or_else(|| crate::net::dns_resolve(&host))?;
+                match crate::net::tcp_connect(ip, port) {
+                    Some(h) => {
+                        self.sockets.push(Some(h));
+                        crate::kprintln!("WASM_NET: tcp_connect {host}:{port} -> sock {}", self.sockets.len() - 1);
+                        Some((self.sockets.len() - 1) as i64)
+                    }
+                    None => Some(-1),
+                }
+            }
+            // veil_tcp_send(sock, ptr, len) -> bytes written (-1)
+            "veil_tcp_send" => {
+                let sock = *args.first()? as usize;
+                let ptr = *args.get(1)? as u32 as usize;
+                let len = *args.get(2)? as u32 as usize;
+                let h = (*self.sockets.get(sock)?)?;
+                let data = mem.get(ptr..ptr + len)?;
+                Some(crate::net::tcp_write(h, data) as i64)
+            }
+            // veil_tcp_recv(sock, ptr, cap) -> bytes read (0 empty, -1 eof/err)
+            "veil_tcp_recv" => {
+                let sock = *args.first()? as usize;
+                let ptr = *args.get(1)? as u32 as usize;
+                let cap = *args.get(2)? as u32 as usize;
+                let h = (*self.sockets.get(sock)?)?;
+                let mut tmp = vec![0u8; cap];
+                // Wait briefly for data (the net stack runs on the same task).
+                for _ in 0..2000 {
+                    match crate::net::tcp_read(h, &mut tmp) {
+                        crate::net::TcpRead::Data(n) => {
+                            if let Some(slot) = mem.get_mut(ptr..ptr + n) {
+                                slot.copy_from_slice(&tmp[..n]);
+                            }
+                            return Some(n as i64);
+                        }
+                        crate::net::TcpRead::Empty => crate::scheduler::yield_now(),
+                        crate::net::TcpRead::Eof => return Some(-1),
+                    }
+                }
+                Some(0)
+            }
+            // veil_tcp_close(sock)
+            "veil_tcp_close" => {
+                let sock = *args.first()? as usize;
+                if let Some(Some(h)) = self.sockets.get(sock).copied() {
+                    crate::net::tcp_close(h);
+                    self.sockets[sock] = None;
+                }
+                Some(0)
+            }
+            // veil_ws_connect(url_ptr, url_len) -> ws handle (-1)
+            "veil_ws_connect" => {
+                let url = mem_str(mem, *args.first()?, *args.get(1)?)?;
+                match crate::browser::js_ws_open(&url) {
+                    Some(id) => Some(id as i64),
+                    None => Some(-1),
+                }
+            }
+            // veil_ws_send(id, msg_ptr, msg_len, out_ptr, out_cap) -> reply len
+            "veil_ws_send" => {
+                let id = *args.first()? as usize;
+                let msg = mem_str(mem, *args.get(1)?, *args.get(2)?)?;
+                let out_ptr = *args.get(3)? as u32 as usize;
+                let out_cap = *args.get(4)? as u32 as usize;
+                match crate::browser::js_ws_send_recv(id, &msg) {
+                    Some(reply) => {
+                        let b = reply.as_bytes();
+                        let n = b.len().min(out_cap);
+                        if let Some(slot) = mem.get_mut(out_ptr..out_ptr + n) {
+                            slot.copy_from_slice(&b[..n]);
+                        }
+                        Some(b.len() as i64)
+                    }
+                    None => Some(-1),
+                }
+            }
             // wasi_snapshot_preview1.fd_write(fd, iovs, iovs_len, nwritten) -> errno
             "fd_write" => {
                 let iovs = *args.get(1)? as u32 as usize;

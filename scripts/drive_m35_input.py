@@ -18,7 +18,7 @@ def boxes(s, kind):
     import re
     return [(m[0], int(m[1]), int(m[2]), int(m[3]), int(m[4]))
             for m in re.findall(
-                rf"BROWSER: {kind} '([^']+)' at \((-?\d+), (-?\d+)\) (\d+)x(\d+)", s)]
+                rf"BROWSER: {kind} '([^']+)'(?: name='[^']*')? at \((-?\d+), (-?\d+)\) (\d+)x(\d+)", s)]
 
 
 def click_link(d, href_sub):

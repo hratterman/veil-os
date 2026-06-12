@@ -725,3 +725,14 @@ The big one. Ten subsystems, 15 acceptance tests. All built from scratch, no cra
 **Acceptance tests:** 1 ✓(viewer+upload), 2 ~ (JPEG `<img>` renders — proven on photo.jpg; henryratterman's hero is JS-injected/CSS-bg, a JS limit not a JPEG one), 3 ✓ (Wikipedia QEMU — redirect-following added, 6463 items of article text), 4–15 ✓.
 
 Also added: Alt+Tab task switch, browser **redirect-following** (3xx Location), rgb()/text-decoration already from M34. Regressions green: boot self-tests (JPEG_OK/WASM_OK/WASM_JIT_FAST/CRYPTO/FONTS/HEAP), gui_test, m16, m23, m29, m34 nav/flex/cssvar, m32 table. (m34_img's gnu-logo remains external-network-flaky.)
+
+## M40 — Browser + OS capability push (2026-06-11, in progress)
+
+Driven by `.claude/btw.md` (8 steps, deploy after each).
+
+| # | Step | Status | Proof |
+|---|------|--------|-------|
+| 1 | **Form POST + cookies** | DONE | `<form method=POST>` submits `application/x-www-form-urlencoded`; cookie jar (`COOKIE_JAR`, parse `Set-Cookie`, per-domain `Cookie` header); follows 302/303 after POST. Kernel server gained `/login` (302 + Set-Cookie), `/welcome` (cookie-aware), `/echo` (query echo). `drive_m40_forms.py`: login POST → redirect → cookie sent → server logs LOGGED IN. |
+| 2 | **Input elements** | DONE | text/password/hidden/checkbox/radio/select/textarea/submit all render + submit. Checkbox toggles, radio is one-per-name-group, `<select>` cycles options and submits the `value` attr, GET form appends query string. Live state repainted via `paint_fields` (no re-fetch). `drive_m40_forms.py` submits all kinds: `t=hi&c1=yes&color=red&size=M&msg=note`. (Label-click focus is a remaining minor gap.) |
+
+Fixes along the way: redirect from a loopback page no longer fabricates `https:///path` (uses `resolve_href` for local); `resolve_href` keeps the query string for local paths (GET forms need it).

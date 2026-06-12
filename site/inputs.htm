@@ -1,0 +1,23 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<h1>All inputs</h1>
+<form method="GET" action="/echo">
+  <p>Name: <input type="text" name="t" value="hi"></p>
+  <p><input type="checkbox" name="c1" value="yes"> I agree</p>
+  <p>
+    <input type="radio" name="color" value="red"> Red
+    <input type="radio" name="color" value="blue" checked> Blue
+  </p>
+  <p>Size:
+    <select name="size">
+      <option value="S">Small</option>
+      <option value="M">Medium</option>
+      <option value="L">Large</option>
+    </select>
+  </p>
+  <p><textarea name="msg">note</textarea></p>
+  <p><input type="submit" value="Send"></p>
+</form>
+</body>
+</html>

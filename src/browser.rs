@@ -98,7 +98,8 @@ pub struct BrowserState {
     // M35 text input: an editable address bar and on-page form fields.
     editing: bool,           // address bar focused for editing
     edit_buf: String,        // address-bar contents while editing
-    fields: Vec<InputField>, // <input>/<textarea> on the current page
+    fields: Vec<InputField>, // <input>/<textarea>/<select> on the current page
+    forms: Vec<Form>,        // forms on the current page (method + action)
     focus: Option<usize>,    // index into `fields` of the focused field
     page_text: String,       // all visible text, for Ctrl+A / Ctrl+C
     // M36 find-in-page (Ctrl+F).
@@ -137,15 +138,39 @@ pub fn paste(win: &mut Window) -> bool {
     }
 }
 
+/// Kind of form control.
+#[derive(Clone, Copy, PartialEq)]
+enum InputKind {
+    Text,
+    Password,
+    Hidden,
+    Checkbox,
+    Radio,
+    Submit,
+    Textarea,
+    Select,
+}
+
 #[derive(Clone)]
 struct InputField {
     x: isize, // document coordinates of the field box
     y: isize,
     w: isize,
     h: isize,
+    name: String,
     value: String,
+    kind: InputKind,
+    checked: bool,
     multiline: bool,
-    action: String, // enclosing form's action (for Enter-to-submit)
+    form: usize, // index into BrowserState.forms (usize::MAX = no enclosing form)
+    options: Vec<String>, // for <select>
+}
+
+/// An HTML form's submission target.
+#[derive(Clone)]
+struct Form {
+    method: String, // "GET" or "POST"
+    action: String,
 }
 
 struct LinkBox {
@@ -190,6 +215,7 @@ impl BrowserState {
             editing: false,
             edit_buf: String::new(),
             fields: Vec::new(),
+            forms: Vec::new(),
             focus: None,
             page_text: String::new(),
             text_runs: Vec::new(),
@@ -212,18 +238,57 @@ fn paint_fields(win: &mut Window) {
         if let crate::wm::App::Browser(st) = &mut win.app {
             let pfb = unsafe { Framebuffer::new(st.page.as_mut_ptr(), pw, dh, pw * 4) };
             for (i, f) in fields.iter().enumerate() {
-                if f.x < 0 || f.y < 0 {
+                if f.x < 0 || f.y < 0 || f.kind == InputKind::Hidden {
                     continue;
                 }
                 let (x, y, w, h) = (f.x as usize, f.y as usize, f.w as usize, f.h as usize);
-                pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
-                let border = if focus == Some(i) { 0xff5b_8af0 } else { 0xff4a_5060 };
-                pfb.fill_rect(x, y, w, 1, border);
-                pfb.fill_rect(x, y + h - 1, w, 1, border);
-                pfb.fill_rect(x, y, 1, h, border);
-                pfb.fill_rect(x + w - 1, y, 1, h, border);
-                let txt = if focus == Some(i) { format!("{}_", f.value) } else { f.value.clone() };
-                pfb.draw_string(x + 4, y + 3, &txt, 0xffe8_e8e8, None);
+                let focused = focus == Some(i);
+                let border = if focused { 0xff5b_8af0 } else { 0xff4a_5060 };
+                let frame = |pfb: &Framebuffer, bc: u32| {
+                    pfb.fill_rect(x, y, w, 1, bc);
+                    pfb.fill_rect(x, y + h - 1, w, 1, bc);
+                    pfb.fill_rect(x, y, 1, h, bc);
+                    pfb.fill_rect(x + w - 1, y, 1, h, bc);
+                };
+                match f.kind {
+                    InputKind::Checkbox => {
+                        pfb.fill_rect(x, y, w, h, 0xff2a_2a2a);
+                        frame(&pfb, 0xff8a_90a0);
+                        if f.checked && w > 6 && h > 6 {
+                            pfb.fill_rect(x + 3, y + 3, w - 6, h - 6, 0xff5b_8af0);
+                        }
+                    }
+                    InputKind::Radio => {
+                        pfb.fill_rect(x, y, w, h, 0xff2a_2a2a);
+                        frame(&pfb, 0xff8a_90a0);
+                        if f.checked && w > 8 && h > 8 {
+                            pfb.fill_rect(x + 4, y + 4, w - 8, h - 8, 0xff5b_8af0);
+                        }
+                    }
+                    InputKind::Submit => {
+                        pfb.fill_rect(x, y, w, h, if focused { 0xff4a_82c5 } else { 0xff3a_6ea5 });
+                        pfb.draw_string(x + 10, y + 5, &f.value, 0xffff_ffff, None);
+                    }
+                    InputKind::Select => {
+                        pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
+                        frame(&pfb, border);
+                        pfb.draw_string(x + 4, y + 3, &f.value, 0xffe8_e8e8, None);
+                        if w > 14 {
+                            pfb.draw_string(x + w - 12, y + 3, "v", 0xff90_98a8, None);
+                        }
+                    }
+                    _ => {
+                        pfb.fill_rect(x, y, w, h, 0xff1f_1f1f);
+                        frame(&pfb, border);
+                        let shown = if f.kind == InputKind::Password {
+                            "*".repeat(f.value.chars().count())
+                        } else {
+                            f.value.clone()
+                        };
+                        let txt = if focused { format!("{shown}_") } else { shown };
+                        pfb.draw_string(x + 4, y + 3, &txt, 0xffe8_e8e8, None);
+                    }
+                }
             }
         }
     }
@@ -397,6 +462,109 @@ fn is_https(url: &str) -> bool {
     u == "https://"
 }
 
+/// Host portion of an absolute URL (no scheme/port/path), lowercased. For local
+/// paths returns "veil".
+fn url_host(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    match rest {
+        Some(r) => {
+            let hp = r.split(['/', '?', '#']).next().unwrap_or(r);
+            hp.split(':').next().unwrap_or(hp).to_ascii_lowercase()
+        }
+        None => String::from("veil"),
+    }
+}
+
+// --- cookie jar (session-scoped, not persisted) -----------------------------
+
+struct Cookie {
+    domain: String,
+    name: String,
+    value: String,
+}
+
+static mut COOKIE_JAR: Vec<Cookie> = Vec::new();
+
+/// Store cookies from one `Set-Cookie` header value for `req_host`.
+fn store_cookie(req_host: &str, set_cookie: &str) {
+    // "name=value; Domain=...; Path=...; HttpOnly; ..." — keep name=value + Domain.
+    let mut parts = set_cookie.split(';');
+    let Some(nv) = parts.next() else { return };
+    let Some((name, value)) = nv.split_once('=') else { return };
+    let (name, value) = (name.trim(), value.trim());
+    if name.is_empty() {
+        return;
+    }
+    let mut domain = req_host.to_ascii_lowercase();
+    for attr in parts {
+        let a = attr.trim();
+        if let Some(d) = a.strip_prefix("Domain=").or_else(|| a.strip_prefix("domain=")) {
+            domain = d.trim().trim_start_matches('.').to_ascii_lowercase();
+        }
+    }
+    let jar = unsafe { &mut *core::ptr::addr_of_mut!(COOKIE_JAR) };
+    if let Some(c) = jar.iter_mut().find(|c| c.domain == domain && c.name == name) {
+        c.value = String::from(value);
+    } else {
+        jar.push(Cookie { domain, name: String::from(name), value: String::from(value) });
+        if jar.len() > 200 {
+            jar.remove(0);
+        }
+    }
+}
+
+/// The `Cookie:` header value for a request to `host` ("a=1; b=2"), or empty.
+fn cookie_header(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    let jar = unsafe { &*core::ptr::addr_of!(COOKIE_JAR) };
+    let mut out = String::new();
+    for c in jar {
+        if host == c.domain || host.ends_with(&alloc::format!(".{}", c.domain)) {
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str(&c.name);
+            out.push('=');
+            out.push_str(&c.value);
+        }
+    }
+    out
+}
+
+/// Scan a raw HTTP response's header block for `Set-Cookie:` lines and store them.
+fn harvest_cookies(resp: &[u8], host: &str) {
+    let Some(end) = header_end(resp) else { return };
+    let head = core::str::from_utf8(&resp[..end]).unwrap_or("");
+    for line in head.split("\r\n") {
+        if let Some(v) = line.strip_prefix("Set-Cookie:").or_else(|| line.strip_prefix("set-cookie:")) {
+            store_cookie(host, v.trim());
+        }
+    }
+}
+
+/// Build a request (headers + optional body). `body` present ⇒ POST with
+/// `application/x-www-form-urlencoded`. Adds a matching `Cookie:` header.
+fn build_request(path: &str, host: &str, body: Option<&[u8]>) -> Vec<u8> {
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let mut h = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: VeilOS\r\nAccept: text/html\r\n");
+    let ck = cookie_header(host);
+    if !ck.is_empty() {
+        h.push_str(&format!("Cookie: {ck}\r\n"));
+    }
+    if let Some(b) = body {
+        h.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+        h.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    }
+    h.push_str("Connection: close\r\n\r\n");
+    let mut out = h.into_bytes();
+    if let Some(b) = body {
+        out.extend_from_slice(b);
+    }
+    out
+}
+
 static TLS_OK_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Decode HTTP/1.1 `Transfer-Encoding: chunked` bodies (Cloudflare et al. use
@@ -457,7 +625,7 @@ fn parse_response(resp: &[u8], path: &str) -> Option<(u32, String, Vec<u8>)> {
 
 /// Direct TLS 1.3 fetch of an `https://` URL (no proxy). Parses host/port/path,
 /// does the handshake, sends the GET, reads the decrypted response.
-fn tls_get(url: &str) -> Option<(u32, String, Vec<u8>)> {
+fn tls_get(url: &str, body: Option<&[u8]>) -> Option<(u32, String, Vec<u8>)> {
     let rest = url.get(8..)?; // strip "https://"
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -468,10 +636,8 @@ fn tls_get(url: &str) -> Option<(u32, String, Vec<u8>)> {
         None => (hostport, 443u16),
     };
     let mut conn = tls::tls_connect(host, port)?;
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: VeilOS\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
-    );
-    conn.write(req.as_bytes());
+    let req = build_request(path, host, body);
+    conn.write(&req);
     let deadline = timer::ticks() + 600;
     let mut resp = Vec::new();
     while let Some(chunk) = conn.read(deadline) {
@@ -487,6 +653,7 @@ fn tls_get(url: &str) -> Option<(u32, String, Vec<u8>)> {
         }
     }
     conn.close();
+    harvest_cookies(&resp, host);
     let parsed = parse_response(&resp, url)?;
     if parsed.0 == 200 && !TLS_OK_DONE.swap(true, Ordering::Relaxed) {
         kprintln!("TLS_OK");
@@ -499,7 +666,7 @@ static DIRECT_HTTP_DONE: AtomicBool = AtomicBool::new(false);
 /// Direct HTTP/1.1 fetch of an external `http://` URL over the kernel's own
 /// TCP/IP stack — no host proxy. DNS-resolves the host, connects to port 80,
 /// sends the GET, and reads until the response is complete (bounded).
-fn http_direct(url: &str) -> Option<(u32, String, Vec<u8>)> {
+fn http_direct(url: &str, body: Option<&[u8]>) -> Option<(u32, String, Vec<u8>)> {
     let rest = url.get(7..)?; // strip "http://"
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -512,11 +679,11 @@ fn http_direct(url: &str) -> Option<(u32, String, Vec<u8>)> {
     let ip = net::dns_resolve(host)?;
     kprintln!("BROWSER: direct TCP {host} -> {}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
     let h = net::tcp_connect(ip, port)?;
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: VeilOS\r\nConnection: close\r\n\r\n");
-    write_all(h, req.as_bytes());
+    let req = build_request(path, host, body);
+    write_all(h, &req);
     let resp = read_http(h, 1 << 20, FETCH_TIMEOUT, FETCH_TIMEOUT * 4);
     net::tcp_close(h);
+    harvest_cookies(&resp, host);
     let parsed = parse_response(&resp, url)?;
     if parsed.0 == 200 && !DIRECT_HTTP_DONE.swap(true, Ordering::Relaxed) {
         kprintln!("DIRECT_HTTP_OK: fetched {host} over kernel TCP (no host proxy)");
@@ -524,18 +691,28 @@ fn http_direct(url: &str) -> Option<(u32, String, Vec<u8>)> {
     Some(parsed)
 }
 
-/// GET `path`. Local paths ("/page.htm") hit our own HTTP server on loopback;
-/// `https://` URLs use the from-scratch TLS 1.3 stack directly; other external
-/// `http://` URLs go through the host proxy at 10.0.2.2:7779.
+/// GET `path` (no body).
 fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
+    http_request(path, None)
+}
+
+/// POST `body` to `path` as application/x-www-form-urlencoded.
+fn http_post(path: &str, body: &[u8]) -> Option<(u32, String, Vec<u8>)> {
+    http_request(path, Some(body))
+}
+
+/// Fetch `path`, optionally with a POST `body`. Local paths ("/page.htm") hit
+/// our own HTTP server on loopback; `https://` URLs use the from-scratch TLS 1.3
+/// stack directly; other external `http://` URLs go direct over our TCP stack,
+/// then the host proxy at 10.0.2.2:7779 as a fallback.
+fn http_request(path: &str, body: Option<&[u8]>) -> Option<(u32, String, Vec<u8>)> {
     if is_https(path) {
-        if let Some(r) = tls_get(path) {
+        if let Some(r) = tls_get(path, body) {
             return Some(r);
         }
         kprintln!("BROWSER: direct TLS failed for {path}, falling back to proxy");
     } else if is_external(path) {
-        // M35: external http:// goes direct via the kernel TCP stack first.
-        if let Some(r) = http_direct(path) {
+        if let Some(r) = http_direct(path, body) {
             return Some(r);
         }
         kprintln!("BROWSER: direct HTTP failed for {path}, falling back to proxy");
@@ -546,6 +723,7 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
     } else {
         (net::local_ip()?, 80u16, FETCH_TIMEOUT)
     };
+    let host = if external { url_host(path) } else { String::from("veil") };
     for attempt in 0..2 {
         if attempt > 0 {
             for _ in 0..10 {
@@ -553,14 +731,14 @@ fn http_get(path: &str) -> Option<(u32, String, Vec<u8>)> {
             }
         }
         let Some(h) = net::tcp_connect(ip, port) else { continue };
-        let host = if external { "proxy" } else { "veil" };
-        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        write_all(h, req.as_bytes());
-        // idle = stall timeout; hard = absolute backstop so a keep-alive peer
-        // that never closes can't hang the desktop. response_complete() returns
-        // us promptly once Content-Length / chunked says the body is done.
+        // The proxy expects an absolute-form request line for external URLs; the
+        // local server a normal path. build_request keeps Host = the real host
+        // so cookies are scoped correctly.
+        let req = build_request(path, &host, body);
+        write_all(h, &req);
         let resp = read_http(h, 1 << 20, timeout, timeout * 4);
         net::tcp_close(h);
+        harvest_cookies(&resp, &host);
         if let Some(r) = parse_response(&resp, path) {
             return Some(r);
         }
@@ -615,8 +793,9 @@ fn resolve_href(href: &str) -> String {
     if let Some(base) = page_base() {
         return url_join(&base, href);
     }
-    // Local site: strip fragment/query and normalise to an absolute path.
-    let href = href.split(['#', '?']).next().unwrap_or("");
+    // Local site: drop only the fragment (keep the query — GET forms need it)
+    // and normalise to an absolute path.
+    let href = href.split('#').next().unwrap_or("");
     if href.starts_with('/') {
         String::from(href)
     } else {
@@ -1042,7 +1221,7 @@ fn resolve(sheet: &[css::Rule], node: &html::Node, inherited: &Style) -> Style {
             s.margin = [8; 4];
         }
         "div" | "section" | "nav" | "header" | "footer" | "main" | "article" | "aside"
-        | "figure" | "figcaption" | "blockquote" => s.display = Display::Block,
+        | "figure" | "figcaption" | "blockquote" | "form" => s.display = Display::Block,
         "p" => {
             s.display = Display::Block;
             s.margin[0] = 8;
@@ -1136,7 +1315,16 @@ enum Frag {
     Word { s: String, color: u32, scale: usize, link: Option<String>, underline: bool, font: Font },
     Space { scale: usize, font: Font },
     Img { idx: usize, w: isize, h: isize },
-    Input { value: String, w: isize, h: isize, multiline: bool },
+    Input {
+        name: String,
+        value: String,
+        kind: InputKind,
+        checked: bool,
+        w: isize,
+        h: isize,
+        multiline: bool,
+        options: Vec<String>,
+    },
     Br,
 }
 
@@ -1174,6 +1362,8 @@ struct Ctx<'a> {
     links: Vec<LinkBox>,
     img_spots: Vec<(usize, isize, isize)>, // (imgs idx, x, y) for the proof log
     fields: Vec<InputField>,               // on-page form fields, with positions
+    forms: Vec<Form>,                      // forms encountered during layout
+    cur_form: usize,                       // current enclosing form (MAX = none)
 }
 
 /// Whitespace-collapsing text -> word/space frags.
@@ -1222,18 +1412,87 @@ fn collect_inline(
             match tag.as_str() {
                 "br" => buf.push(Frag::Br),
                 "input" => {
-                    // Render text-like inputs as editable boxes; skip the rest.
                     let ty = node.attr("type").unwrap_or("text").to_ascii_lowercase();
-                    if matches!(ty.as_str(), "text" | "search" | "email" | "url" | "password" | "tel" | "number" | "") {
-                        let value = node.attr("value").unwrap_or("").into();
-                        let chars = node.attr("size").and_then(|s| s.parse::<isize>().ok()).unwrap_or(20);
-                        buf.push(Frag::Input { value, w: (chars * 8 + 8).clamp(80, 360), h: 20, multiline: false });
+                    let name = node.attr("name").unwrap_or("").into();
+                    let value: String = node.attr("value").unwrap_or("").into();
+                    let checked = node.attr("checked").is_some();
+                    match ty.as_str() {
+                        "checkbox" => buf.push(Frag::Input {
+                            name, value: if value.is_empty() { "on".into() } else { value },
+                            kind: InputKind::Checkbox, checked, w: 16, h: 16, multiline: false, options: Vec::new(),
+                        }),
+                        "radio" => buf.push(Frag::Input {
+                            name, value: if value.is_empty() { "on".into() } else { value },
+                            kind: InputKind::Radio, checked, w: 16, h: 16, multiline: false, options: Vec::new(),
+                        }),
+                        "submit" | "button" => {
+                            let label = if value.is_empty() { String::from("Submit") } else { value };
+                            let bw = label.chars().count() as isize * 9 + 24;
+                            buf.push(Frag::Input {
+                                name, value: label, kind: InputKind::Submit, checked: false,
+                                w: bw, h: 26, multiline: false, options: Vec::new(),
+                            });
+                        }
+                        "hidden" => buf.push(Frag::Input {
+                            name, value, kind: InputKind::Hidden, checked: false, w: 0, h: 0, multiline: false, options: Vec::new(),
+                        }),
+                        // text-like (incl. unknown types)
+                        _ => {
+                            let kind = if ty == "password" { InputKind::Password } else { InputKind::Text };
+                            let chars = node.attr("size").and_then(|s| s.parse::<isize>().ok()).unwrap_or(20);
+                            buf.push(Frag::Input {
+                                name, value, kind, checked: false,
+                                w: (chars * 8 + 8).clamp(80, 360), h: 20, multiline: false, options: Vec::new(),
+                            });
+                        }
                     }
                 }
                 "textarea" => {
                     let mut value = String::new();
                     node.text(&mut value);
-                    buf.push(Frag::Input { value: value.trim().into(), w: 280, h: 64, multiline: true });
+                    buf.push(Frag::Input {
+                        name: node.attr("name").unwrap_or("").into(),
+                        value: value.trim().into(), kind: InputKind::Textarea, checked: false,
+                        w: 280, h: 64, multiline: true, options: Vec::new(),
+                    });
+                }
+                "select" => {
+                    // Collect <option> labels; selected = the one with `selected`,
+                    // else the first.
+                    let mut options = Vec::new();
+                    let mut value = String::new();
+                    for opt in node.children() {
+                        if opt.tag() == Some("option") {
+                            let mut label = String::new();
+                            opt.text(&mut label);
+                            let label = label.trim().to_string();
+                            let v = opt.attr("value").map(String::from).unwrap_or_else(|| label.clone());
+                            if opt.attr("selected").is_some() || value.is_empty() {
+                                value = v.clone();
+                            }
+                            // Store the submittable value; cycling/submission use it.
+                            options.push(v);
+                        }
+                    }
+                    buf.push(Frag::Input {
+                        name: node.attr("name").unwrap_or("").into(),
+                        value, kind: InputKind::Select, checked: false,
+                        w: 160, h: 22, multiline: false, options,
+                    });
+                }
+                "button" => {
+                    let ty = node.attr("type").unwrap_or("submit").to_ascii_lowercase();
+                    if ty != "button" {
+                        let mut label = String::new();
+                        node.text(&mut label);
+                        let label = if label.trim().is_empty() { String::from("Submit") } else { label.trim().into() };
+                        let bw = label.chars().count() as isize * 9 + 24;
+                        buf.push(Frag::Input {
+                            name: node.attr("name").unwrap_or("").into(),
+                            value: label, kind: InputKind::Submit, checked: false,
+                            w: bw, h: 26, multiline: false, options: Vec::new(),
+                        });
+                    }
                 }
                 "img" => {
                     let src = node.attr("src").map(resolve_href).unwrap_or_default();
@@ -1294,24 +1553,59 @@ fn place_line(ctx: &mut Ctx, line: Vec<(isize, Frag)>, x: isize, y: isize) -> is
                 ctx.img_spots.push((idx, x + dx, fy));
                 ctx.items.push(Item::Image { x: x + dx, y: fy, idx });
             }
-            Frag::Input { value, w: fw, h: fh, multiline } => {
+            Frag::Input { name, value, kind, checked, w: fw, h: fh, multiline, options } => {
                 let (bx, by) = (x + dx, fy);
-                // Field surface + a 1px muted border (focus ring drawn later).
-                ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff1f1f1f });
-                for (rx, ry, rw, rh) in
-                    [(bx, by, fw, 1), (bx, by + fh - 1, fw, 1), (bx, by, 1, fh), (bx + fw - 1, by, 1, fh)]
-                {
-                    ctx.items.push(Item::Rect { x: rx, y: ry, w: rw, h: rh, color: 0xff4a5060 });
+                let ui = Font { id: crate::freetype::FontId::Ui, px: 16 };
+                match kind {
+                    InputKind::Hidden => {} // not rendered, but submittable
+                    InputKind::Checkbox => {
+                        ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff2a2a2a });
+                        for (rx, ry, rw, rh) in [(bx, by, fw, 1), (bx, by + fh - 1, fw, 1), (bx, by, 1, fh), (bx + fw - 1, by, 1, fh)] {
+                            ctx.items.push(Item::Rect { x: rx, y: ry, w: rw, h: rh, color: 0xff8a90a0 });
+                        }
+                        if checked {
+                            ctx.items.push(Item::Rect { x: bx + 3, y: by + 3, w: fw - 6, h: fh - 6, color: 0xff5b8af0 });
+                        }
+                    }
+                    InputKind::Radio => {
+                        ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff2a2a2a });
+                        for (rx, ry, rw, rh) in [(bx, by, fw, 1), (bx, by + fh - 1, fw, 1), (bx, by, 1, fh), (bx + fw - 1, by, 1, fh)] {
+                            ctx.items.push(Item::Rect { x: rx, y: ry, w: rw, h: rh, color: 0xff8a90a0 });
+                        }
+                        if checked {
+                            ctx.items.push(Item::Rect { x: bx + 4, y: by + 4, w: fw - 8, h: fh - 8, color: 0xff5b8af0 });
+                        }
+                    }
+                    InputKind::Submit => {
+                        ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff3a6ea5 });
+                        ctx.items.push(Item::Text { x: bx + 10, y: by + 5, s: value.clone(), color: 0xffffffff, scale: 1, font: ui });
+                    }
+                    InputKind::Select => {
+                        ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff1f1f1f });
+                        for (rx, ry, rw, rh) in [(bx, by, fw, 1), (bx, by + fh - 1, fw, 1), (bx, by, 1, fh), (bx + fw - 1, by, 1, fh)] {
+                            ctx.items.push(Item::Rect { x: rx, y: ry, w: rw, h: rh, color: 0xff4a5060 });
+                        }
+                        ctx.items.push(Item::Text { x: bx + 4, y: by + 3, s: value.clone(), color: 0xffe8e8e8, scale: 1, font: ui });
+                        ctx.items.push(Item::Text { x: bx + fw - 14, y: by + 3, s: String::from("v"), color: 0xff9098a8, scale: 1, font: ui });
+                    }
+                    _ => {
+                        // text / password / textarea
+                        ctx.items.push(Item::Rect { x: bx, y: by, w: fw, h: fh, color: 0xff1f1f1f });
+                        for (rx, ry, rw, rh) in [(bx, by, fw, 1), (bx, by + fh - 1, fw, 1), (bx, by, 1, fh), (bx + fw - 1, by, 1, fh)] {
+                            ctx.items.push(Item::Rect { x: rx, y: ry, w: rw, h: rh, color: 0xff4a5060 });
+                        }
+                        let shown = if kind == InputKind::Password {
+                            "*".repeat(value.chars().count())
+                        } else {
+                            value.clone()
+                        };
+                        ctx.items.push(Item::Text { x: bx + 4, y: by + 3, s: shown, color: 0xffe8e8e8, scale: 1, font: ui });
+                    }
                 }
-                ctx.items.push(Item::Text {
-                    x: bx + 4,
-                    y: by + 3,
-                    s: value.clone(),
-                    color: 0xffe8e8e8,
-                    scale: 1,
-                    font: Font { id: crate::freetype::FontId::Ui, px: 16 },
+                ctx.fields.push(InputField {
+                    x: bx, y: by, w: fw, h: fh, name, value, kind, checked, multiline,
+                    form: ctx.cur_form, options,
                 });
-                ctx.fields.push(InputField { x: bx, y: by, w: fw, h: fh, value, multiline, action: String::new() });
             }
             Frag::Space { .. } | Frag::Br => {}
         }
@@ -1427,6 +1721,14 @@ fn layout_block(
     if style.display == Display::None {
         return y;
     }
+    // Entering a <form>: register it and scope its inputs to it.
+    let prev_form = ctx.cur_form;
+    if node.tag() == Some("form") {
+        let method = node.attr("method").unwrap_or("GET").to_ascii_uppercase();
+        let action = node.attr("action").map(resolve_href).unwrap_or_else(|| page_base().unwrap_or_else(|| String::from("/")));
+        ctx.cur_form = ctx.forms.len();
+        ctx.forms.push(Form { method, action });
+    }
     y += style.margin[0];
     let bx = x + style.margin[3];
     let bw = style
@@ -1434,7 +1736,9 @@ fn layout_block(
         .unwrap_or(w - style.margin[3] - style.margin[1])
         .max(16);
     if node.tag() == Some("table") {
-        return layout_table(ctx, node, &style, bx, bw, y) + style.margin[2];
+        let r = layout_table(ctx, node, &style, bx, bw, y) + style.margin[2];
+        ctx.cur_form = prev_form;
+        return r;
     }
     let bg_at = ctx.items.len();
     let cx = bx + style.padding[3];
@@ -1485,6 +1789,7 @@ fn layout_block(
             Item::Rect { x: bx, y: top, w: bw, h: bottom - top, color: bg },
         );
     }
+    ctx.cur_form = prev_form;
     bottom + style.margin[2]
 }
 
@@ -1634,6 +1939,8 @@ fn measure_item(
         links: Vec::new(),
         img_spots: Vec::new(),
         fields: Vec::new(),
+        forms: Vec::new(),
+        cur_form: usize::MAX,
     };
     let cstyle = resolve(ctx.sheet, node, parent);
     let bottom = if cstyle.display == Display::Inline {
@@ -2178,6 +2485,12 @@ fn collect_scripts(doc: &html::Node) -> Vec<String> {
 }
 
 pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
+    navigate_body(win, path, None, by_click);
+}
+
+/// Navigate, optionally POSTing `body` (form submission). The body is sent only
+/// on the first request; any 302/303 redirect is then followed with a GET.
+pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_click: bool) {
     let path = resolve_href(path);
     let was_external = is_external(&path);
     let path_for_log = path.clone();
@@ -2207,12 +2520,21 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     let mut path = path;
     let (status, ctype, body) = {
         let mut result = None;
+        let mut pending_body = body; // POST body for the first request only
         for _ in 0..6 {
-            let Some((s, c, b)) = http_get(&path) else { break };
+            let resp = http_request(&path, pending_body.as_deref());
+            pending_body = None; // redirects are followed with GET
+            let Some((s, c, b)) = resp else { break };
             if c == "text/redirect" {
                 let loc = String::from_utf8_lossy(&b);
                 let loc = loc.trim();
-                let next = if is_external(loc) { String::from(loc) } else { url_join(&path, loc) };
+                let next = if is_external(loc) {
+                    String::from(loc)
+                } else if is_external(&path) {
+                    url_join(&path, loc) // relative to the external page we're on
+                } else {
+                    resolve_href(loc) // local loopback path stays local
+                };
                 kprintln!("BROWSER: following redirect -> {next}");
                 set_page_base(if is_external(&next) { Some(next.clone()) } else { None });
                 path = next;
@@ -2349,6 +2671,8 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
         links: Vec::new(),
         img_spots: Vec::new(),
         fields: Vec::new(),
+        forms: Vec::new(),
+        cur_form: usize::MAX,
     };
     let end_y = layout_block(&mut ctx, body_node, &root, 0, view_w as isize, 0, None);
 
@@ -2444,6 +2768,7 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     st.doc_h = doc_h;
     st.links = ctx.links;
     st.fields = ctx.fields;
+    st.forms = ctx.forms;
     let mut text = String::new();
     for it in &ctx.items {
         if let Item::Text { s, .. } = it {
@@ -2462,7 +2787,20 @@ pub fn navigate(win: &mut Window, path: &str, by_click: bool) {
     st.page_bg = page_bg;
     let nfields = st.fields.len();
     for f in &st.fields {
-        kprintln!("BROWSER: field 'input' at ({}, {}) {}x{}", f.x, f.y, f.w, f.h);
+        let kind = match f.kind {
+            InputKind::Text => "text",
+            InputKind::Password => "password",
+            InputKind::Hidden => "hidden",
+            InputKind::Checkbox => "checkbox",
+            InputKind::Radio => "radio",
+            InputKind::Submit => "submit",
+            InputKind::Textarea => "textarea",
+            InputKind::Select => "select",
+        };
+        kprintln!(
+            "BROWSER: field '{kind}' name='{}' at ({}, {}) {}x{} checked={}",
+            f.name, f.x, f.y, f.w, f.h, f.checked
+        );
     }
     paint_view(win);
     if nfields > 0 {
@@ -2687,22 +3025,134 @@ pub fn find_is_open(win: &Window) -> bool {
 /// Canvas-relative click: focus an on-page input field if one was hit.
 /// Returns true if a field took focus.
 pub fn focus_field(win: &mut Window, rx: isize, ry: isize) -> bool {
-    let crate::wm::App::Browser(st) = &mut win.app else { return false };
-    if (ry as usize) < CHROME {
-        return false;
+    let i = {
+        let crate::wm::App::Browser(st) = &mut win.app else { return false };
+        if (ry as usize) < CHROME {
+            return false;
+        }
+        let (dx, dy) = (rx, ry - CHROME as isize + st.scroll as isize);
+        st.fields.iter().position(|f| {
+            f.kind != InputKind::Hidden && dx >= f.x && dx < f.x + f.w && dy >= f.y && dy < f.y + f.h
+        })
+    };
+    let Some(i) = i else { return false };
+
+    let kind = {
+        let crate::wm::App::Browser(st) = &win.app else { return false };
+        st.fields[i].kind
+    };
+    match kind {
+        InputKind::Text | InputKind::Password | InputKind::Textarea => {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                st.focus = Some(i);
+                st.editing = false;
+            }
+            paint_fields(win);
+        }
+        InputKind::Checkbox => {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                st.fields[i].checked = !st.fields[i].checked;
+            }
+            navigate_reflow(win);
+        }
+        InputKind::Radio => {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                let (name, form) = (st.fields[i].name.clone(), st.fields[i].form);
+                for f in st.fields.iter_mut() {
+                    if f.kind == InputKind::Radio && f.form == form && f.name == name {
+                        f.checked = false;
+                    }
+                }
+                st.fields[i].checked = true;
+            }
+            navigate_reflow(win);
+        }
+        InputKind::Select => {
+            if let crate::wm::App::Browser(st) = &mut win.app {
+                let f = &mut st.fields[i];
+                if !f.options.is_empty() {
+                    let cur = f.options.iter().position(|o| *o == f.value).unwrap_or(0);
+                    let next = (cur + 1) % f.options.len();
+                    f.value = f.options[next].clone();
+                }
+            }
+            navigate_reflow(win);
+        }
+        InputKind::Submit => {
+            let form = {
+                let crate::wm::App::Browser(st) = &win.app else { return true };
+                st.fields[i].form
+            };
+            submit_form(win, form, Some(i));
+        }
+        InputKind::Hidden => {}
     }
-    let (dx, dy) = (rx, ry - CHROME as isize + st.scroll as isize);
-    if let Some(i) = st
-        .fields
-        .iter()
-        .position(|f| dx >= f.x && dx < f.x + f.w && dy >= f.y && dy < f.y + f.h)
-    {
-        st.focus = Some(i);
-        st.editing = false;
-        paint_fields(win);
-        return true;
+    true
+}
+
+/// Repaint controls after a checkbox/radio/select state change (no re-fetch —
+/// `paint_fields` redraws live field state straight into the page buffer).
+fn navigate_reflow(win: &mut Window) {
+    paint_fields(win);
+}
+
+/// Build and send a form's submission. `clicked` is the submit button that
+/// triggered it (its name=value is included), if any.
+fn submit_form(win: &mut Window, form_idx: usize, clicked: Option<usize>) {
+    let (is_post, action, body) = {
+        let crate::wm::App::Browser(st) = &win.app else { return };
+        if form_idx >= st.forms.len() {
+            return;
+        }
+        let form = &st.forms[form_idx];
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (idx, f) in st.fields.iter().enumerate() {
+            if f.form != form_idx || f.name.is_empty() {
+                continue;
+            }
+            match f.kind {
+                InputKind::Checkbox | InputKind::Radio => {
+                    if f.checked {
+                        pairs.push((f.name.clone(), f.value.clone()));
+                    }
+                }
+                InputKind::Submit => {
+                    if Some(idx) == clicked {
+                        pairs.push((f.name.clone(), f.value.clone()));
+                    }
+                }
+                _ => pairs.push((f.name.clone(), f.value.clone())),
+            }
+        }
+        let body: String = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        (form.method == "POST", form.action.clone(), body)
+    };
+    if is_post {
+        kprintln!("BROWSER: POST {action} ({} bytes)", body.len());
+        navigate_body(win, &action, Some(body.into_bytes()), true);
+    } else {
+        let sep = if action.contains('?') { '&' } else { '?' };
+        let url = if body.is_empty() { action } else { format!("{action}{sep}{body}") };
+        kprintln!("BROWSER: GET-submit {url}");
+        navigate(win, &url, true);
     }
-    false
+}
+
+/// Percent-encode a form field name/value (x-www-form-urlencoded).
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Canvas-relative click -> link href, if one was hit.
@@ -2808,18 +3258,29 @@ pub fn key(win: &mut Window, code: u16) -> bool {
                 return true;
             }
             KEY_ENTER => {
-                let action = if let crate::wm::App::Browser(st) = &mut win.app {
-                    let a = st.focus.and_then(|i| st.fields.get(i)).map(|f| f.action.clone());
-                    st.focus = None;
-                    a
+                // Enter in a single-line text field submits its form.
+                let (form, multiline) = if let crate::wm::App::Browser(st) = &mut win.app {
+                    let f = st.focus.and_then(|i| st.fields.get(i));
+                    let r = (f.map(|f| f.form), f.map(|f| f.multiline).unwrap_or(false));
+                    if !r.1 {
+                        st.focus = None;
+                    }
+                    r
                 } else {
-                    None
+                    (None, false)
                 };
-                if let Some(a) = action.filter(|a| !a.is_empty()) {
-                    kprintln!("BROWSER: form submit -> {a}");
-                    navigate(win, &a, true);
+                if multiline {
+                    if let crate::wm::App::Browser(st) = &mut win.app {
+                        if let Some(f) = st.focus.and_then(|i| st.fields.get_mut(i)) {
+                            f.value.push('\n');
+                        }
+                    }
+                    paint_fields(win);
+                } else if let Some(fi) = form.filter(|&fi| fi != usize::MAX) {
+                    submit_form(win, fi, None);
+                } else {
+                    paint_fields(win);
                 }
-                paint_fields(win);
                 return true;
             }
             KEY_ESC => {

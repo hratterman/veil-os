@@ -803,6 +803,50 @@ fn resolve_href(href: &str) -> String {
     }
 }
 
+/// Derive a FAT16 8.3 filename for a downloaded resource from its URL and, as a
+/// fallback for the extension, its content type. e.g. "/docs/report.pdf?v=2" +
+/// "application/pdf" -> "REPORT.PDF"; "/dl" + "application/zip" -> "DL.ZIP".
+fn download_name(url: &str, ctype: &str) -> String {
+    let tail = url.split(['?', '#']).next().unwrap_or(url);
+    let seg = tail.rsplit('/').next().unwrap_or("").trim();
+    let (base, ext) = match seg.rsplit_once('.') {
+        Some((b, e)) if !b.is_empty() => (b, e),
+        _ => (seg, ""),
+    };
+    let clean = |s: &str, n: usize| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(n)
+            .collect::<String>()
+            .to_ascii_uppercase()
+    };
+    let mut b = clean(base, 8);
+    if b.is_empty() {
+        b = String::from("DOWNLOAD");
+    }
+    let mut e = clean(ext, 3);
+    if e.is_empty() {
+        // Map the content type's subtype to a sensible extension.
+        let sub = ctype.split(['/', ';', '+']).nth(1).unwrap_or("").trim();
+        e = match sub {
+            "pdf" => "PDF",
+            "zip" => "ZIP",
+            "json" => "JSN",
+            "jpeg" | "jpg" => "JPG",
+            "png" => "PNG",
+            "gif" => "GIF",
+            "plain" => "TXT",
+            "csv" => "CSV",
+            "xml" => "XML",
+            "mp4" => "MP4",
+            "mpeg" | "mp3" => "MP3",
+            _ => "BIN",
+        }
+        .into();
+    }
+    format!("{b}.{e}")
+}
+
 // --- style ----------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2552,7 +2596,24 @@ pub fn navigate_body(win: &mut Window, path: &str, body: Option<Vec<u8>>, by_cli
         }
     };
     if !ctype.to_ascii_lowercase().contains("text/html") {
-        render_message(win, &path, &format!("not html: {ctype} ({status})"));
+        // Non-renderable response (PDF, zip, image, binary, ...) -> save it to
+        // the filesystem as a download and toast, so it shows in the files app.
+        let fname = download_name(&path, &ctype);
+        match crate::fs::write_file(&fname, &body) {
+            Ok(()) => {
+                kprintln!("BROWSER: downloaded {path} ({} bytes) -> {fname}", body.len());
+                crate::wm::queue_toast(format!("Downloaded {fname}"));
+                render_message(
+                    win,
+                    &path,
+                    &format!("Downloaded {fname} ({} bytes). Saved to disk — open it in Files.", body.len()),
+                );
+            }
+            Err(()) => {
+                kprintln!("BROWSER: download of {path} failed (write error)");
+                render_message(win, &path, &format!("download failed: {fname} ({ctype})"));
+            }
+        }
         return;
     }
     let mut doc = html::parse(&String::from_utf8_lossy(&body));

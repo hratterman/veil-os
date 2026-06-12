@@ -97,6 +97,10 @@ fn content_type(name: &str) -> &'static str {
         Some("GIF") => "image/gif",
         Some("BMP") => "image/bmp",
         Some("TXT") => "text/plain",
+        Some("PDF") => "application/pdf",
+        Some("ZIP") => "application/zip",
+        Some("MP4") => "video/mp4",
+        Some("JSON") | Some("JSN") => "application/json",
         _ => "application/octet-stream",
     }
 }

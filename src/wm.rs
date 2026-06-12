@@ -18,6 +18,24 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// A toast requested from code that only has a `&mut Window` (e.g. the browser
+/// saving a download) — the WM drains this each `clock_tick` and shows it.
+static mut PENDING_TOASTS: Vec<String> = Vec::new();
+
+/// Queue a toast to be shown by the window manager on its next tick.
+pub fn queue_toast(msg: String) {
+    unsafe {
+        let q = &mut *core::ptr::addr_of_mut!(PENDING_TOASTS);
+        if q.len() < 8 {
+            q.push(msg);
+        }
+    }
+}
+
+fn drain_toasts() -> Vec<String> {
+    unsafe { core::mem::take(&mut *core::ptr::addr_of_mut!(PENDING_TOASTS)) }
+}
+
 pub const BORDER: isize = 2;
 pub const TITLE_H: isize = 22;
 /// Bottom launcher bar (UX overhaul): always composited on top; windows
@@ -1996,6 +2014,9 @@ impl Wm {
     /// wakeup. Marks the WM dirty only when a clock face actually redrew.
     pub fn clock_tick(&mut self) {
         let now = timer::ticks();
+        for msg in drain_toasts() {
+            self.notify(&msg);
+        }
         let before = self.toasts.len();
         self.toasts.retain(|(_, exp)| now < *exp);
         if self.toasts.len() != before {

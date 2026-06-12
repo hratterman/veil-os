@@ -50,7 +50,26 @@ pub struct Interp {
     /// Promise resolve/reject cells, indexed by the id baked into the
     /// `__resolve:N` / `__reject:N` native function name.
     resolvers: Vec<Rc<RefCell<(String, Val)>>>,
+    /// Profile-guided JIT: per-function call counts and compiled native code.
+    /// Keyed by the Rc<Func> address; the pinned Rc clone keeps that allocation
+    /// alive so the address can't be reused by a *different* function while it's
+    /// cached (which would otherwise alias a stale compile — an ABA bug).
+    jit: BTreeMap<usize, (Rc<Func>, JitSlot)>,
+    jit_enabled: bool,
 }
+
+/// Cap on distinct cached functions before the whole table is dropped (bounds
+/// memory for pages that mint many short-lived closures).
+const JIT_CACHE_CAP: usize = 4096;
+
+enum JitSlot {
+    Profiling(u32),
+    Bailed,
+    Compiled(Rc<super::jit::Code>),
+}
+
+/// Interpret first, then JIT after this many calls (profile-guided).
+const JIT_THRESHOLD: u32 = 1;
 
 impl Interp {
     pub fn new(dom: Dom) -> Interp {
@@ -64,6 +83,8 @@ impl Interp {
             errors: Vec::new(),
             steps: 0,
             resolvers: Vec::new(),
+            jit: BTreeMap::new(),
+            jit_enabled: true,
         };
         it.install_globals();
         it
@@ -619,9 +640,73 @@ impl Interp {
         Ok(out)
     }
 
+    /// If `f` is (or becomes) a JIT-compiled numeric function and every argument
+    /// is a number, run the native code and return its result. None = deopt to
+    /// the interpreter.
+    pub fn set_jit(&mut self, on: bool) {
+        self.jit_enabled = on;
+    }
+
+    /// Read a global binding (used by the JIT self-test to fetch a function).
+    pub fn global_val(&self, name: &str) -> Option<Val> {
+        self.global.borrow().vars.get(name).cloned()
+    }
+
+    fn try_jit(&mut self, f: &Rc<Func>, args: &[Val]) -> Option<Val> {
+        if !self.jit_enabled {
+            return None;
+        }
+        if self.jit.len() > JIT_CACHE_CAP {
+            self.jit.clear(); // drop all pins; functions will re-profile
+        }
+        let key = Rc::as_ptr(f) as *const () as usize;
+        enum Act {
+            Run(Rc<super::jit::Code>),
+            Compile,
+            Nothing,
+        }
+        let act = match &mut self.jit.entry(key).or_insert_with(|| (f.clone(), JitSlot::Profiling(0))).1 {
+            JitSlot::Compiled(c) => Act::Run(c.clone()),
+            JitSlot::Bailed => Act::Nothing,
+            JitSlot::Profiling(c) => {
+                *c += 1;
+                if *c >= JIT_THRESHOLD {
+                    Act::Compile
+                } else {
+                    Act::Nothing
+                }
+            }
+        };
+        let code = match act {
+            Act::Run(c) => Some(c),
+            Act::Nothing => None,
+            Act::Compile => {
+                let compiled = super::jit::compile(f).map(Rc::new);
+                let slot = match &compiled {
+                    Some(c) => JitSlot::Compiled(c.clone()),
+                    None => JitSlot::Bailed,
+                };
+                self.jit.insert(key, (f.clone(), slot));
+                compiled
+            }
+        };
+        let code = code?;
+        if args.len() < code.nparams || !args.iter().take(code.nparams).all(|a| matches!(a, Val::Num(_))) {
+            return None; // deopt: wrong arity or non-numeric arg
+        }
+        let fargs: Vec<f64> = (0..code.nparams).map(|i| args[i].as_num()).collect();
+        Some(Val::Num(code.run(&fargs)))
+    }
+
     pub fn call(&mut self, func: Val, this: Val, args: Vec<Val>) -> Result<Val, Val> {
         match func {
             Val::Func(f, captured) => {
+                // Profile-guided JIT: numeric, call-free hot functions run as
+                // native AArch64. We deopt to the interpreter for non-numeric
+                // args or functions outside the compilable subset.
+                if let Some(r) = self.try_jit(&f, &args) {
+                    return Ok(r);
+                }
                 let inner = new_scope(Some(captured));
                 if !f.arrow {
                     inner.borrow_mut().vars.insert("this".into(), this);

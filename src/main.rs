@@ -123,6 +123,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         milestone_h264(); // M37: prove the from-scratch H.264 baseline decoder
         js::selftest(); // M38: prove the from-scratch JS engine runs page render code
         js::es6_selftest(); // M41: ES6+ engine (classes/async/await/Map/Set/...)
+        js::jit_selftest(); // M41: native AArch64 JS JIT for numeric hot loops
     }
     milestone9();
     milestone10(&fdt);

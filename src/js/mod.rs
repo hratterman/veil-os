@@ -9,6 +9,7 @@
 mod ast;
 mod dom;
 mod interp;
+pub mod jit;
 mod lexer;
 mod mathf;
 mod parser;
@@ -151,6 +152,76 @@ pub fn es6_selftest() {
     } else {
         let missing: alloc::vec::Vec<&str> = checks.iter().copied().filter(|c| !out.contains(c)).collect();
         crate::kprintln!("JS_ES6_FAIL: missing {:?}", missing);
+    }
+}
+
+/// JIT self-test: compile a numeric hot-loop function to native AArch64 and
+/// confirm it (a) returns the same result as the interpreter and (b) is much
+/// faster, timed on the cycle counter. This is the from-scratch JS JIT.
+pub fn jit_selftest() {
+    use value::Val;
+    let src = r#"
+        function bench(n) {
+          let acc = 0;
+          for (let i = 0; i < n; i++) {
+            let x = i % 7;
+            acc = acc + x * x - (i % 3) + (i / 2 - x);
+            if (acc > 1000000) { acc = acc - 1000000; }
+          }
+          return acc;
+        }
+    "#;
+    let tree = crate::html::parse("<html><body></body></html>");
+    let dom = dom::Dom::from_tree(&tree);
+    let mut it = interp::Interp::new(dom);
+    it.run(src);
+    let func = match it.global_val("bench") {
+        Some(v @ Val::Func(..)) => v,
+        _ => {
+            crate::kprintln!("JS_JIT_FAIL: bench not defined");
+            return;
+        }
+    };
+    let rc = match &func {
+        Val::Func(rc, _) => rc.clone(),
+        _ => return,
+    };
+
+    let cyc = || -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
+        v
+    };
+    let n = 300_000.0f64;
+
+    // Interpreted baseline (JIT disabled).
+    it.set_jit(false);
+    let t0 = cyc();
+    let interp_res = it.call(func.clone(), Val::Undef, alloc::vec![Val::Num(n)]);
+    let t1 = cyc();
+    let interp_val = interp_res.map(|v| v.as_num()).unwrap_or(f64::NAN);
+
+    // JIT: compile directly and run native.
+    let Some(code) = jit::compile(&rc) else {
+        crate::kprintln!("JS_JIT_FAIL: bench did not compile (should fit the numeric subset)");
+        return;
+    };
+    let t2 = cyc();
+    let jit_val = code.run(&[n]);
+    let t3 = cyc();
+
+    let (ic, jc) = (t1.wrapping_sub(t0), t3.wrapping_sub(t2));
+    let speed = if jc > 0 { ic / jc } else { 0 };
+    let agree = (interp_val - jit_val).abs() < 1e-6;
+    crate::kprintln!(
+        "JS_JIT: bench(300000) interp={interp_val} ({ic} cyc), jit={jit_val} ({jc} cyc), ~{speed}x (agree={agree})"
+    );
+    if agree && speed >= 50 {
+        crate::kprintln!("JS_JIT_FAST: native AArch64 JS JIT is {speed}x faster than the interpreter (>=50x)");
+    } else if agree {
+        crate::kprintln!("JS_JIT_OK: native codegen agrees ({speed}x; wanted >=50x)");
+    } else {
+        crate::kprintln!("JS_JIT_FAIL: results disagree (interp={interp_val} jit={jit_val})");
     }
 }
 

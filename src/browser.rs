@@ -859,6 +859,48 @@ pub fn js_fetch(url: &str, body: Option<&str>) -> Option<(u32, String, Vec<u8>)>
     http_request(&resolved, body.map(|b| b.as_bytes()))
 }
 
+// --- JS WebSocket bindings --------------------------------------------------
+// A registry of open WebSocket connections, indexed by the id the JS WebSocket
+// object holds. `ws://veil/...` resolves to loopback.
+type WsConn = crate::websocket::WebSocket<alloc::boxed::Box<dyn crate::websocket::Stream>>;
+static mut WS_REGISTRY: Vec<Option<WsConn>> = Vec::new();
+
+fn ws_registry() -> &'static mut Vec<Option<WsConn>> {
+    unsafe { &mut *core::ptr::addr_of_mut!(WS_REGISTRY) }
+}
+
+/// Open a WebSocket to `url` (ws:// or wss://). Returns a registry id, or None.
+pub fn js_ws_open(url: &str) -> Option<usize> {
+    // Rewrite a bare host onto loopback for the local echo endpoint.
+    let ws = crate::websocket::connect(url)?;
+    let reg = ws_registry();
+    reg.push(Some(ws));
+    kprintln!("BROWSER: WebSocket open {url} -> id {}", reg.len() - 1);
+    Some(reg.len() - 1)
+}
+
+/// Send a text message and synchronously read the reply (echo-style servers).
+pub fn js_ws_send_recv(id: usize, msg: &str) -> Option<String> {
+    let reg = ws_registry();
+    let ws = reg.get_mut(id)?.as_mut()?;
+    ws.send_text(msg);
+    match ws.recv(4000) {
+        Some((crate::websocket::Opcode::Text, p)) | Some((crate::websocket::Opcode::Binary, p)) => {
+            Some(String::from_utf8_lossy(&p).into_owned())
+        }
+        _ => None,
+    }
+}
+
+pub fn js_ws_close(id: usize) {
+    let reg = ws_registry();
+    if let Some(slot) = reg.get_mut(id) {
+        if let Some(mut ws) = slot.take() {
+            ws.close();
+        }
+    }
+}
+
 /// Fetch `path`, optionally with a POST `body`. Local paths ("/page.htm") hit
 /// our own HTTP server on loopback; `https://` URLs use the from-scratch TLS 1.3
 /// stack directly; other external `http://` URLs go direct over our TCP stack,

@@ -69,6 +69,7 @@ mod viewer;
 mod virtio;
 mod wasm;
 mod wasmapp;
+mod websocket;
 mod wm;
 
 use core::panic::PanicInfo;
@@ -124,6 +125,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::selftest(); // M38: prove the from-scratch JS engine runs page render code
         js::es6_selftest(); // M41: ES6+ engine (classes/async/await/Map/Set/...)
         js::jit_selftest(); // M41: native AArch64 JS JIT for numeric hot loops
+        websocket::selftest(); // M41: WebSocket SHA-1/base64/accept (RFC 6455 vectors)
     }
     milestone9();
     milestone10(&fdt);

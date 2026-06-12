@@ -137,6 +137,48 @@ fn http_session(h: net::Handle) {
         })
     };
 
+    // WebSocket upgrade: any path with `Upgrade: websocket` becomes an echo
+    // endpoint (the M41 WS test target). Reply 101 with the computed accept,
+    // then frame-echo until close.
+    if hdr("upgrade").map(|u| u.eq_ignore_ascii_case("websocket")).unwrap_or(false) {
+        if let Some(key) = hdr("sec-websocket-key") {
+            let accept = crate::websocket::accept_key(&key);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            write_all(h, resp.as_bytes());
+            kprintln!("HTTP: WebSocket upgrade on {path} -> echo");
+            // Anything already read past the header terminator is the first frame.
+            let leftover = req
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|pos| req[pos + 4..].to_vec())
+                .unwrap_or_default();
+            let mut ws = crate::websocket::WebSocket::server(crate::websocket::TcpStream(h), leftover);
+            let mut echoed = 0u32;
+            for _ in 0..1000 {
+                match ws.recv(4000) {
+                    Some((crate::websocket::Opcode::Text, p)) => {
+                        ws.send_text(&String::from_utf8_lossy(&p));
+                        echoed += 1;
+                    }
+                    Some((crate::websocket::Opcode::Binary, p)) => {
+                        ws.send_binary(&p);
+                        echoed += 1;
+                    }
+                    Some((crate::websocket::Opcode::Close, _)) | None => break,
+                    _ => {}
+                }
+                if echoed >= 64 {
+                    break;
+                }
+            }
+            ws.close();
+            kprintln!("HTTP: WebSocket echo closed ({echoed} frames)");
+            return;
+        }
+    }
+
     // For POST, pull the body (after the header terminator), reading more if the
     // first segment didn't carry it all.
     let mut body_bytes = Vec::new();

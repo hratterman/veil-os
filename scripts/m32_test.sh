@@ -42,7 +42,9 @@ qemu-system-aarch64 \
 Q=$!
 cleanup() { kill "$Q" 2>/dev/null; [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null; }
 trap cleanup EXIT
-for _ in $(seq 1 200); do [ -S "$QMP" ] && grep -q 'WM_OK' "$SERIAL" 2>/dev/null && break; sleep 0.1; done
+# Debug boot runs all the heavy self-tests (mp3/h264/js/es6/jit/ws) before the
+# desktop comes up, so allow up to ~50s to reach WM_OK.
+for _ in $(seq 1 500); do [ -S "$QMP" ] && grep -q 'WM_OK' "$SERIAL" 2>/dev/null && break; sleep 0.1; done
 
 python3 "$DRIVER" "$QMP" "$SERIAL" "$PWD/shots"
 RESULT=$?

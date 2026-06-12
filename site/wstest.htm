@@ -1,0 +1,17 @@
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<h1>WebSocket test</h1>
+<div id="out">pending</div>
+<script>
+const ws = new WebSocket('ws://veil/ws');
+ws.onopen = () => { ws.send('hello veil'); };
+ws.onmessage = (e) => {
+  const msg = 'WS_MSG:' + e.data + ' rs=' + ws.readyState;
+  console.log(msg);
+  document.getElementById('out').textContent = msg;
+  ws.close();
+};
+</script>
+</body>
+</html>

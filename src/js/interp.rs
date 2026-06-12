@@ -112,7 +112,7 @@ impl Interp {
                   // get_member returning "Name.prop" natives).
                   "Promise", "Map", "Set", "WeakMap", "WeakSet", "Symbol", "Date",
                   "RegExp", "Error", "TypeError", "RangeError", "SyntaxError",
-                  "ReferenceError", "Reflect", "Proxy", "BigInt"] {
+                  "ReferenceError", "Reflect", "Proxy", "BigInt", "WebSocket"] {
             b.vars.insert(f.into(), Val::Native(Native::Global(Rc::from(f))));
         }
         b.vars.insert("NaN".into(), Val::Num(f64::NAN));
@@ -894,6 +894,7 @@ impl Interp {
             "Promise" => return self.construct_promise(args),
             "Map" | "WeakMap" => return self.construct_map(args),
             "Set" | "WeakSet" => return self.construct_set(args),
+            "WebSocket" => return self.construct_websocket(args),
             "Array" => return Ok(self.call_global("Array", args)?),
             "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
                 let mut o = Obj::new();
@@ -1143,6 +1144,72 @@ impl Interp {
         Ok(Val::object(o))
     }
 
+    fn construct_websocket(&mut self, args: Vec<Val>) -> Result<Val, Val> {
+        let url = args.first().map(|v| v.to_str()).unwrap_or_default();
+        let mut o = Obj::new();
+        o.insert("url".into(), Val::str(url.clone()));
+        match crate::browser::js_ws_open(&url) {
+            Some(id) => {
+                o.insert("__ws".into(), Val::Num(id as f64));
+                o.insert("readyState".into(), Val::Num(1.0)); // OPEN
+                let obj = Val::object(o);
+                // Fire onopen asynchronously (after the script sets the handler).
+                self.deferred.push((Val::Native(Native::Global(Rc::from("__ws_open"))), alloc::vec![obj.clone()]));
+                Ok(obj)
+            }
+            None => {
+                o.insert("readyState".into(), Val::Num(3.0)); // CLOSED
+                let obj = Val::object(o);
+                self.deferred.push((Val::Native(Native::Global(Rc::from("__ws_error"))), alloc::vec![obj.clone()]));
+                Ok(obj)
+            }
+        }
+    }
+
+    /// Methods on a WebSocket object (`__ws` present): send / close.
+    fn ws_method(&mut self, o: &Rc<RefCell<Obj>>, name: &str, args: &[Val]) -> Result<Val, Val> {
+        let id = o.borrow().get("__ws").map(|v| v.as_num() as usize);
+        let Some(id) = id else { return Ok(Val::Undef) };
+        match name {
+            "send" => {
+                let msg = args.first().map(|v| v.to_str()).unwrap_or_default();
+                if let Some(reply) = crate::browser::js_ws_send_recv(id, &msg) {
+                    // Deliver the reply to onmessage (event { data, type }).
+                    let onmsg = o.borrow().get("onmessage").cloned();
+                    if let Some(h) = onmsg {
+                        let mut ev = Obj::new();
+                        ev.insert("data".into(), Val::str(reply));
+                        ev.insert("type".into(), Val::str("message"));
+                        let this = Val::object(o.borrow().clone());
+                        self.call(h, this, alloc::vec![Val::object(ev)])?;
+                    }
+                }
+                Ok(Val::Undef)
+            }
+            "close" => {
+                crate::browser::js_ws_close(id);
+                o.borrow_mut().insert("readyState".into(), Val::Num(3.0));
+                let onclose = o.borrow().get("onclose").cloned();
+                if let Some(h) = onclose {
+                    let mut ev = Obj::new();
+                    ev.insert("type".into(), Val::str("close"));
+                    let this = Val::object(o.borrow().clone());
+                    self.call(h, this, alloc::vec![Val::object(ev)])?;
+                }
+                Ok(Val::Undef)
+            }
+            "addEventListener" => {
+                // map ('message'|'open'|'close', handler) onto on* properties
+                let ev = args.first().map(|v| v.to_str()).unwrap_or_default();
+                if let Some(h) = args.get(1) {
+                    o.borrow_mut().insert(alloc::format!("on{ev}"), h.clone());
+                }
+                Ok(Val::Undef)
+            }
+            _ => Ok(Val::Undef),
+        }
+    }
+
     fn map_entries(&self, o: &Rc<RefCell<Obj>>) -> Rc<RefCell<Vec<Val>>> {
         if let Some(Val::Array(a)) = o.borrow().get("__map") {
             return a.clone();
@@ -1272,6 +1339,8 @@ impl Interp {
                 3
             } else if b.contains_key("__body") {
                 4
+            } else if b.contains_key("__ws") {
+                5
             } else {
                 0
             }
@@ -1280,6 +1349,7 @@ impl Interp {
             1 => Ok(Some(self.promise_method(&o, name, args)?)),
             2 => Ok(Some(self.map_method(&o, name, args)?)),
             3 => Ok(Some(self.set_method(&o, name, args)?)),
+            5 => Ok(Some(self.ws_method(&o, name, args)?)),
             4 => {
                 // fetch() Response
                 let body = o.borrow().get("__body").map(|v| v.to_str()).unwrap_or_default();
@@ -1411,8 +1481,8 @@ impl Interp {
                         return Ok(c.clone());
                     }
                 }
-                // Special objects (Map/Set/Promise/Response) expose methods.
-                if map.borrow().keys().any(|k| matches!(k.as_str(), "__map" | "__set" | "__promise" | "__body")) {
+                // Special objects (Map/Set/Promise/Response/WebSocket) expose methods.
+                if map.borrow().keys().any(|k| matches!(k.as_str(), "__map" | "__set" | "__promise" | "__body" | "__ws")) {
                     return Ok(Val::Native(Native::Method(Box::new(o.clone()), Rc::from(prop))));
                 }
                 Ok(Val::Undef)
@@ -2221,6 +2291,28 @@ impl Interp {
             "fetch" => {
                 let url = a0.to_str();
                 self.do_fetch(&url, args.get(1).cloned())
+            }
+
+            // ---- WebSocket onopen/onerror dispatch (deferred) ----
+            "__ws_open" => {
+                if let Val::Object(o) = &a0 {
+                    let onopen = o.borrow().get("onopen").cloned();
+                    if let Some(h) = onopen {
+                        self.call(h, a0.clone(), Vec::new())?;
+                    }
+                }
+                Val::Undef
+            }
+            "__ws_error" => {
+                if let Val::Object(o) = &a0 {
+                    let onerr = o.borrow().get("onerror").cloned();
+                    if let Some(h) = onerr {
+                        let mut ev = Obj::new();
+                        ev.insert("type".into(), Val::str("error"));
+                        self.call(h, a0.clone(), alloc::vec![Val::object(ev)])?;
+                    }
+                }
+                Val::Undef
             }
 
             // ---- Promise resolve/reject closures (id baked into the name) ----

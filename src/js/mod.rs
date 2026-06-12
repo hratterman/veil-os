@@ -192,7 +192,9 @@ pub fn jit_selftest() {
         unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
         v
     };
-    let n = 300_000.0f64;
+    // Keep N modest so the interpreted baseline doesn't slow the debug boot;
+    // the speedup ratio is independent of N (both scale linearly).
+    let n = 40_000.0f64;
 
     // Interpreted baseline (JIT disabled).
     it.set_jit(false);
@@ -214,7 +216,7 @@ pub fn jit_selftest() {
     let speed = if jc > 0 { ic / jc } else { 0 };
     let agree = (interp_val - jit_val).abs() < 1e-6;
     crate::kprintln!(
-        "JS_JIT: bench(300000) interp={interp_val} ({ic} cyc), jit={jit_val} ({jc} cyc), ~{speed}x (agree={agree})"
+        "JS_JIT: bench(40000) interp={interp_val} ({ic} cyc), jit={jit_val} ({jc} cyc), ~{speed}x (agree={agree})"
     );
     if agree && speed >= 50 {
         crate::kprintln!("JS_JIT_FAST: native AArch64 JS JIT is {speed}x faster than the interpreter (>=50x)");

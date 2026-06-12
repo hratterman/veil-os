@@ -60,6 +60,7 @@ mod setup;
 mod shell;
 mod snake;
 mod snd;
+mod store;
 mod syscall;
 mod timer;
 mod tls;

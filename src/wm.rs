@@ -11,7 +11,8 @@
 use crate::fb::Framebuffer;
 use crate::{
     breakout, browser, calc, clipboard, clock, files, font, freetype::FontId, fs, gifplayer, keymap,
-    kprintln, net, netdev, repl, scheduler, settings, shell, snake, snd, timer, video, viewer, wasmapp,
+    kprintln, net, netdev, repl, scheduler, settings, shell, snake, snd, store, timer, video, viewer,
+    wasmapp,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -81,7 +82,7 @@ const TASKBAR_TEXT: u32 = 0xffe8_e8e8;
 /// out when no NIC is attached.
 // Viewer is appended last so adding it doesn't shift the existing button
 // indices (the proof drivers depend on edit=0..chat=5).
-const LAUNCHERS: [(&str, &str); 15] = [
+const LAUNCHERS: [(&str, &str); 16] = [
     ("edit", "Editor"),
     ("clock", "Clock"),
     ("browser", "Browser"),
@@ -97,10 +98,11 @@ const LAUNCHERS: [(&str, &str); 15] = [
     ("breakout", "Brick"),
     ("calc", "Calc"),
     ("settings", "Settings"),
+    ("store", "Apps"),
 ];
 // Per-app icon colours (modern, muted): browser blue, shell green, files amber,
 // lisp purple, games teal/orange, etc. Indexed by LAUNCHERS order.
-const ICON_COLORS: [u32; 15] = [
+const ICON_COLORS: [u32; 16] = [
     0xff4a62a0, // edit  - slate blue
     0xff3f99b0, // clock - cyan
     0xff5b8af0, // browser - blue
@@ -116,6 +118,7 @@ const ICON_COLORS: [u32; 15] = [
     0xffe07a44, // breakout - orange
     0xff5a8a8a, // calc - steel
     0xff80808c, // settings - gray
+    0xff4f9e6a, // store - green
 ];
 
 fn launchers() -> Vec<(&'static str, &'static str)> {
@@ -153,6 +156,7 @@ fn icon_abbrev(app: &str) -> &'static str {
         "breakout" => "Bk",
         "calc" => "Ca",
         "settings" => "St",
+        "store" => "Ap",
         _ => "Ap",
     }
 }
@@ -443,6 +447,7 @@ pub enum App {
     Breakout(breakout::BreakoutState),
     Calc(calc::CalcState),
     Settings(settings::SettingsState),
+    Store(store::StoreState),
 }
 
 /// One rendered chat log entry: the display text and its ink colour
@@ -512,6 +517,7 @@ pub fn render_window_content(win: &mut Window) {
         App::Browser(_) => browser::paint_view(win),
         App::Calc(_) => calc::render(win),
         App::Settings(_) => settings::render(win),
+        App::Store(_) => store::render(win),
         App::Paint(_) => {
             let (c, b) = if let App::Paint(p) = &win.app { (p.color, p.brush) } else { (0, 1) };
             let cw = win.cw;
@@ -808,6 +814,9 @@ impl Wm {
             "settings" => {
                 self.add_window("settings", 240, 110, 480, 360, App::Settings(settings::SettingsState::new()));
             }
+            "store" => {
+                self.add_window("App Store", 200, 70, 460, 420, App::Store(store::StoreState::new()));
+            }
             _ => {}
         }
         self.dirty = true;
@@ -838,7 +847,7 @@ impl Wm {
             App::Echo { .. } | App::Shell { .. } | App::Browser(_) | App::Editor(_)
             | App::Clock(_) | App::Chat(_) | App::Viewer(_) | App::Audio(_) | App::Files(_)
             | App::Gif(_) | App::Lisp(_) | App::Snake(_) | App::Video(_) | App::Wasm(_)
-            | App::Breakout(_) | App::Calc(_) | App::Settings(_) => {}
+            | App::Breakout(_) | App::Calc(_) | App::Settings(_) | App::Store(_) => {}
         }
         if matches!(win.app, App::Snake(_)) {
             snake::render(&mut win);
@@ -1151,6 +1160,20 @@ impl Wm {
                     files::Action::None => {}
                 }
             }
+            // M41: app store up/down/Enter (Enter installs or runs an app).
+            if matches!(win.app, App::Store(_)) {
+                match store::key(win, code) {
+                    store::Action::Redraw => {
+                        self.dirty = true;
+                        return;
+                    }
+                    store::Action::Run(name) => {
+                        self.open_file(&name);
+                        return;
+                    }
+                    store::Action::None => {}
+                }
+            }
         }
         let Some(ch) = keymap::translate(code, self.shift) else {
             return;
@@ -1189,6 +1212,10 @@ impl Wm {
                 }
                 App::Calc(_) => {
                     calc::key(win, ch);
+                    self.dirty = true;
+                }
+                App::Store(_) => {
+                    store::char_input(win, ch);
                     self.dirty = true;
                 }
                 _ => {}
@@ -1870,6 +1897,12 @@ impl Wm {
                     App::Wasm(_) => {
                         wasmapp::click(win, rx, ry);
                         self.dirty = true;
+                    }
+                    App::Store(_) => {
+                        match store::click(win, rx, ry) {
+                            store::Action::Run(name) => self.open_file(&name),
+                            _ => self.dirty = true,
+                        }
                     }
                     App::Clock(_) => {
                         clock::click(win, rx, ry);

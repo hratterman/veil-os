@@ -24,6 +24,7 @@ mod dtb;
 mod editor;
 mod exceptions;
 mod fb;
+mod harden;
 mod files;
 mod font;
 mod fonts_generated;
@@ -109,6 +110,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     let serial = unsafe { uart::Pl011::new(uart::UART0_BASE) };
     serial.init();
     serial.put_str("BOOT_OK: veil kernel alive\n");
+    harden::install_stack_canary(); // M41 step 18: boot-stack overflow guard
 
     let dtb_ptr = if dtb_ptr.is_null() { RAM_BASE as *const u8 } else { dtb_ptr };
     let fdt = unsafe { dtb::Fdt::new(dtb_ptr) }.expect("no DTB magic at RAM base");
@@ -117,6 +119,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
     let kernel_mapper = milestone3(&fdt, dtb_ptr as usize);
     milestone4();
     scheduler::init(kernel_mapper.root());
+    harden::selftest(); // M41 step 18: stack canary + W^X (needs MMU + kernel root)
     crypto::selftest(); // M33: prove SHA256/HKDF/ChaCha20-Poly1305/X25519 vectors
     font::selftest(); // M34: prove the generated bitmap fonts loaded
     milestone35_jpeg(); // M35: prove the baseline JPEG decoder
@@ -855,8 +858,14 @@ fn milestone4() {
     use core::fmt::Write;
 
     const HEAP_FRAMES: usize = 4096; // 16 MiB
-    let heap_pa = frames::alloc_contiguous(HEAP_FRAMES).expect("no contiguous heap region");
+    // M41 step 18 (ASLR): reserve a slack region and base the heap at a per-boot
+    // random page offset, so the kernel heap is at a different address each boot.
+    const SLACK_FRAMES: usize = 256; // 1 MiB of slide space
+    let region = frames::alloc_contiguous(HEAP_FRAMES + SLACK_FRAMES).expect("no contiguous heap region");
+    let slide = (harden::rand_u64() as usize) % SLACK_FRAMES;
+    let heap_pa = region + slide * frames::FRAME_SIZE;
     heap::init(heap_pa, HEAP_FRAMES * frames::FRAME_SIZE);
+    kprintln!("ASLR_OK: kernel heap based at {heap_pa:#x} (random slide {slide} pages)");
 
     let before = heap::free_bytes();
     let mut allocs: u64 = 0;

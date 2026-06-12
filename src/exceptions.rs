@@ -64,6 +64,16 @@ fn ec_name(ec: u64) -> &'static str {
 extern "C" fn handle_sync(tf: &mut TrapFrame) {
     let ec = (tf.esr >> 26) & 0x3f;
     let iss = tf.esr & 0x1ff_ffff;
+    // M41 step 18: a controlled W^X fault. When the kernel expects a fault
+    // (executing a non-exec page), recover by returning via LR instead of
+    // panicking — proving the page-table W^X enforcement works.
+    if matches!(ec, 0x21 | 0x25) && crate::harden::EXPECT_FAULT.load(core::sync::atomic::Ordering::SeqCst) {
+        crate::harden::EXPECT_FAULT.store(false, core::sync::atomic::Ordering::SeqCst);
+        crate::harden::FAULT_HIT.store(true, core::sync::atomic::Ordering::SeqCst);
+        kprintln!("HARDEN: caught expected {} at FAR={:#x} — recovering", ec_name(ec), tf.far);
+        tf.elr = tf.x[30]; // resume at the call's return address
+        return;
+    }
     match ec {
         // SVC: ELR already points past the instruction; just report.
         0x15 => {

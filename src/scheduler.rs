@@ -106,6 +106,11 @@ fn tasks() -> &'static mut Vec<Option<Task>> {
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
 
+/// The kernel page-table root (TTBR0), for cloning user address spaces.
+pub fn kernel_root() -> usize {
+    KERNEL_ROOT.load(Ordering::Relaxed)
+}
+
 /// Register the boot context as task 0 (pid 1), the kernel task.
 pub fn init(kernel_root: usize) {
     KERNEL_ROOT.store(kernel_root, Ordering::Relaxed);

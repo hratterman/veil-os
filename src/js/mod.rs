@@ -397,25 +397,36 @@ pub fn locate_desync(label: &str, src: &str) -> bool {
 /// see PROGRESS.md / btw.md). Not wired into the boot sequence yet (it is slow
 /// and does not pass); kept for the next session to finish `REACT_OK`.
 pub fn react_selftest() {
-    locate_desync("react.js", REACT_UMD);
-    locate_desync("react-dom.js", REACT_DOM_UMD);
+    use core::sync::atomic::Ordering;
     let skeleton = "<html><body><div id=root></div></body></html>";
     let tree = crate::html::parse(skeleton);
+    // Try the legacy synchronous path first (simpler reconciler entry).
+    // Concurrent path only (createRoot) — it doesn't loop, so it's bounded.
     let app = r#"
         var rd = document.getElementById('root');
         var root = ReactDOM.createRoot(rd);
         root.render(React.createElement('h1', null, 'Hello from React'));
+        window.__concurrent = rd.children.length;
     "#;
     let dom = dom::Dom::from_tree(&tree);
     let mut it = interp::Interp::new(dom);
+    interp::CE_COUNT.store(0, Ordering::Relaxed);
     it.run(REACT_UMD); it.run(REACT_DOM_UMD); it.run(app); it.drain_deferred();
-    let loaded = it.global.borrow().vars.contains_key("React") && it.global.borrow().vars.contains_key("ReactDOM");
+    let ce = interp::CE_COUNT.load(Ordering::Relaxed);
+    let rd = it.dom.get_by_id("root");
+    let root_kids = rd.map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
+    let mut tags: Vec<String> = Vec::new();
+    for n in &it.dom.nodes { if !n.is_text() && !tags.contains(&n.tag) { tags.push(n.tag.clone()); } }
+    let legacy = it.global_val("__legacy").map(|v| v.to_str()).unwrap_or_default();
+    let concurrent = it.global_val("__concurrent").map(|v| v.to_str()).unwrap_or_default();
+    for (i, e) in it.errors.iter().enumerate().take(5) { crate::kprintln!("  react-err[{i}] {}", truncate(e, 160)); }
+    crate::kprintln!("REACT_DIAG: createElement_calls={ce} root_kids={root_kids} legacy={legacy} concurrent={concurrent} tags=[{}]", tags.join(","));
     let res = JsResult { tree: it.dom.to_tree(), errors: it.errors, canvases: Vec::new() };
     let h1 = node_text_by_tag(&res.tree, "h1");
     if h1.contains("Hello from React") {
         crate::kprintln!("REACT_OK: React 18 mounted + rendered <h1>Hello from React</h1> into #root");
     } else {
-        crate::kprintln!("REACT_PARTIAL: React+ReactDOM loaded={loaded}; reconciler runs but host-commit not yet wired");
+        crate::kprintln!("REACT_PARTIAL: React+ReactDOM run; reconciler host-commit not appending (ce={ce} kids={root_kids})");
     }
 }
 

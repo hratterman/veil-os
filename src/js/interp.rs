@@ -76,6 +76,9 @@ pub struct Interp {
 /// memory for pages that mint many short-lived closures).
 const JIT_CACHE_CAP: usize = 4096;
 
+/// Diagnostic counter for `document.createElement` calls (React commit tracing).
+pub static CE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 enum JitSlot {
     Profiling(u32),
     Bailed,
@@ -2000,7 +2003,10 @@ impl Interp {
             "getElementsByTagName" => {
                 Ok(Val::array(self.dom.get_by_tag(&a0).map(Val::Node).collect()))
             }
-            "createElement" => Ok(Val::Node(self.dom.create_element(&a0))),
+            "createElement" => {
+                CE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                Ok(Val::Node(self.dom.create_element(&a0)))
+            }
             // createElementNS(ns, tag) — ignore the namespace, use the tag.
             "createElementNS" => {
                 let tag = args.get(1).map(|v| v.to_str()).unwrap_or_default();

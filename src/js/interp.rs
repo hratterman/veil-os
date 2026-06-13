@@ -520,7 +520,7 @@ impl Interp {
                     "!" => Val::Bool(!v.truthy()),
                     "-" => Val::Num(-v.as_num()),
                     "+" => Val::Num(v.as_num()),
-                    "~" => Val::Num(!(v.as_num() as i64) as f64),
+                    "~" => Val::Num(!to_int32(v.as_num()) as f64),
                     "void" => Val::Undef,
                     "delete" => Val::Bool(true),
                     _ => Val::Undef,
@@ -1972,6 +1972,11 @@ impl Interp {
                 "innerHeight" => Val::Num(768.0),
                 "devicePixelRatio" => Val::Num(1.0),
                 "scrollY" | "scrollX" | "pageYOffset" => Val::Num(0.0),
+                // `window.event` is the legacy global event; it is `undefined`
+                // outside of event dispatch. React's getCurrentEventPriority
+                // branches on `window.event === undefined`, so it MUST be a real
+                // undefined (not the phantom method-native the `_` arm returns).
+                "event" => Val::Undef,
                 // window.indexedDB resolves to the polyfilled global.
                 "indexedDB" => self.global_val("indexedDB").unwrap_or(Val::Undef),
                 // Reading window.<x> for any global that was defined (e.g. a UMD
@@ -3599,6 +3604,29 @@ fn type_of(v: &Val) -> &'static str {
     }
 }
 
+/// JS `ToInt32`: NaN/±Inf → 0; otherwise truncate toward zero and take the low
+/// 32 bits as a signed integer (wrapping mod 2^32).
+fn to_int32(x: f64) -> i32 {
+    to_uint32(x) as i32
+}
+
+/// JS `ToUint32`: NaN/±Inf → 0; otherwise truncate toward zero and take the low
+/// 32 bits as an unsigned integer (wrapping mod 2^32).
+fn to_uint32(x: f64) -> u32 {
+    if !x.is_finite() || x == 0.0 {
+        return 0;
+    }
+    // Truncate toward zero, then reduce mod 2^32 into [0, 2^32). No std/libm:
+    // mathf::trunc is frintz; the modulo is manual so negatives wrap correctly.
+    const TWO32: f64 = 4294967296.0;
+    let t = mathf::trunc(x);
+    let mut m = t - mathf::floor(t / TWO32) * TWO32;
+    if m < 0.0 {
+        m += TWO32;
+    }
+    m as u32
+}
+
 fn binop(op: &str, l: Val, r: Val) -> Val {
     match op {
         "+" => {
@@ -3623,12 +3651,16 @@ fn binop(op: &str, l: Val, r: Val) -> Val {
         ">" => cmp(l, r, |o| o > 0),
         "<=" => cmp(l, r, |o| o <= 0),
         ">=" => cmp(l, r, |o| o >= 0),
-        "&" => Val::Num(((l.as_num() as i64) & (r.as_num() as i64)) as f64),
-        "|" => Val::Num(((l.as_num() as i64) | (r.as_num() as i64)) as f64),
-        "^" => Val::Num(((l.as_num() as i64) ^ (r.as_num() as i64)) as f64),
-        "<<" => Val::Num((((l.as_num() as i64) << (r.as_num() as i64 & 31)) as i32) as f64),
-        ">>" => Val::Num((((l.as_num() as i32) >> (r.as_num() as i64 & 31)) as i32) as f64),
-        ">>>" => Val::Num((((l.as_num() as i64 as u32) >> (r.as_num() as i64 & 31)) as u32) as f64),
+        // Bitwise operators follow JS semantics: operands are coerced via
+        // ToInt32/ToUint32 (truncate toward zero, then take the low 32 bits),
+        // NOT a plain `as i64` cast — React's lane math (e.g. `lanes & -lanes`,
+        // `1 << index` wrapping at bit 31) depends on real 32-bit overflow.
+        "&" => Val::Num((to_int32(l.as_num()) & to_int32(r.as_num())) as f64),
+        "|" => Val::Num((to_int32(l.as_num()) | to_int32(r.as_num())) as f64),
+        "^" => Val::Num((to_int32(l.as_num()) ^ to_int32(r.as_num())) as f64),
+        "<<" => Val::Num((to_int32(l.as_num()).wrapping_shl(to_uint32(r.as_num()) & 31)) as f64),
+        ">>" => Val::Num((to_int32(l.as_num()) >> (to_uint32(r.as_num()) & 31)) as f64),
+        ">>>" => Val::Num((to_uint32(l.as_num()) >> (to_uint32(r.as_num()) & 31)) as f64),
         "instanceof" => Val::Bool(false),
         "in" => match &r {
             Val::Object(o) => Val::Bool(o.borrow().contains_key(&l.to_str())),

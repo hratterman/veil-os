@@ -367,6 +367,72 @@ pub fn indexeddb_selftest() {
 /// DOM node and reads it back. Emits DOMAPI_OK.
 pub const REACT_UMD: &str = include_str!("../../assets/js/vendor/react.production.min.js");
 pub const REACT_DOM_UMD: &str = include_str!("../../assets/js/vendor/react-dom.production.min.js");
+pub const REACT_DEV: &str = include_str!("../../assets/js/vendor/react.development.js");
+pub const REACT_DOM_DEV: &str = include_str!("../../assets/js/vendor/react-dom.development.js");
+
+/// TEMP (Step 17): run the React 18 *development* build (readable names +
+/// invariant/warning messages) and dump every console line React emits, so the
+/// reconciler-commit blocker can be diagnosed from React's own diagnostics.
+pub fn react_dev_diag() {
+    use core::sync::atomic::Ordering;
+    let skeleton = "<html><body><div id=root></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let app = r#"
+        var rd = document.getElementById('root');
+        try {
+          ReactDOM.render(React.createElement('h1', null, 'Legacy'), rd);
+          console.error('LEGACY kids=' + rd.children.length + ' txt=' + (rd.firstChild && rd.firstChild.textContent));
+        } catch (e) { console.error('LEGACY THREW: ' + (e && (e.message || e))); }
+    "#;
+    // DETERMINISTIC legacy-only trace, JIT OFF. The legacy lane is SyncLane(1)
+    // with no event-priority/JIT path, so this isolates the real failure:
+    // requestUpdateLane -> scheduleUpdateOnFiber -> markRootUpdated (pendingLanes)
+    // -> ensureRootIsScheduled (does it bail at getNextLanes===0?) ->
+    // scheduleLegacySyncCallback -> flushSyncCallbacks -> performSyncWorkOnRoot.
+    // Trace the legacy ENTRY chain + tag the throw sites. updateContainer never
+    // reached requestUpdateLane, yet React threw MOUNTING — find where.
+    let react_src = String::from(REACT_DEV);
+    let dom_src = String::from(REACT_DOM_DEV)
+        .replace("  function render(element, container, callback) {",
+                 "  function render(element, container, callback) {\n    console.error('E render');")
+        .replace("    } else {\n      // First clear any existing content.\n      var rootSibling;",
+                 "    } else {\n      console.error('E legacyCreate-initialMount');\n      var rootSibling;")
+        .replace("  function updateContainer(element, container, parentComponent, callback) {",
+                 "  function updateContainer(element, container, parentComponent, callback) {\n    console.error('E updateContainer');")
+        .replace("  function getPublicRootInstance(container) {\n    var containerFiber = container.current;",
+                 "  function getPublicRootInstance(container) {\n    var containerFiber = container.current;\n    console.error('E getPublicRootInstance childNull='+(!containerFiber.child));")
+        .replace("  function requestUpdateLane(fiber) {\n    // Special cases\n    var mode = fiber.mode;",
+                 "  function requestUpdateLane(fiber) {\n    console.error('E requestUpdateLane');\n    var mode = fiber.mode;")
+        .replace("  function scheduleUpdateOnFiber(root, fiber, lane, eventTime) {\n    checkForNestedUpdates();",
+                 "  function scheduleUpdateOnFiber(root, fiber, lane, eventTime) {\n    console.error('E scheduleUpdateOnFiber lane='+lane);\n    checkForNestedUpdates();")
+        .replace("  function findCurrentFiberUsingSlowPath(fiber) {\n    var alternate = fiber.alternate;",
+                 "  function findCurrentFiberUsingSlowPath(fiber) {\n    console.error('E findCurrentFiberUsingSlowPath altNull='+(!fiber.alternate));\n    var alternate = fiber.alternate;")
+        .replace("  function appendChildToContainer(container, child) {",
+                 "  function appendChildToContainer(container, child) {\n    console.error('T appendChildToContainer');")
+        .replace("  function flushSync(fn) {",
+                 "  function flushSync(fn) {\n    console.error('E flushSync hasFn='+(!!fn));");
+    let dom = dom::Dom::from_tree(&tree);
+    let mut it = interp::Interp::new(dom);
+    it.set_jit(false);
+    interp::CE_COUNT.store(0, Ordering::Relaxed);
+    crate::kprintln!("RDEV: parsing react.dev ({} bytes) + react-dom.dev ({} bytes, traced)...", react_src.len(), dom_src.len());
+    it.run(&react_src);
+    crate::kprintln!("RDEV: react.dev loaded, errors so far: {}", it.errors.len());
+    it.run(&dom_src);
+    crate::kprintln!("RDEV: react-dom.dev loaded, errors so far: {}", it.errors.len());
+    it.run(app);
+    it.drain_deferred();
+    let ce = interp::CE_COUNT.load(Ordering::Relaxed);
+    let kids = it.dom.get_by_id("root").map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
+    let kids3 = it.dom.get_by_id("root3").map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
+    crate::kprintln!("RDEV: async root3 kids(post-drain)={kids3}");
+    crate::kprintln!("RDEV: createElement={ce} root_kids={kids} total_console/err={}", it.errors.len());
+    // Dump every console/error line React emitted (these carry the diagnosis).
+    for (i, e) in it.errors.iter().enumerate().take(40) {
+        crate::kprintln!("RDEV[{i}] {}", truncate(e, 240));
+    }
+    crate::kprintln!("RDEV_DONE: kids={kids}");
+}
 
 /// Locate the first brace-nesting parser desync in `src` (or none). Prints the
 /// surrounding tokens so the breaking construct can be identified.

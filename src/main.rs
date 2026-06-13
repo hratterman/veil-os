@@ -148,10 +148,15 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::indexeddb_selftest(); // M41: IndexedDB polyfill round-trip
         js::dom_api_selftest(); // M42 step 1: full DOM API + engine fixes (React parses/loads/runs)
         js::v8_selftest(); // M42 step 18: V8-parity builtins (URL/TextEncoder/crypto/Reflect/...)
-        // M42 step 17: js::react_selftest() — React 18 parses/loads/runs; scheduler
-        // transport now fixed (linked MessageChannel) but the reconciler still
-        // doesn't commit (concurrent bails at getNextLanes=0; legacy work-loop
-        // loops). Unwired from boot (slow + not passing); see PROGRESS.md.
+        // M42 step 17: real React 18 PARSES + LOADS + RUNS (createElement/createRoot/
+        // render execute; lane computation is correct — DefaultLane=16, pendingLanes=16).
+        // The full reconciler COMMIT is a documented architectural blocker: React 18
+        // schedules work through host async primitives (queueMicrotask for the sync
+        // flush, a MessageChannel-backed Scheduler for concurrent work) and our
+        // synchronous interpreter's post-hoc drain_deferred can't reproduce the flush
+        // ordering React's state machine needs, so the host node never mounts. The
+        // dev-build reconciler diagnosis lives in js::react_dev_diag() (unwired —
+        // slow + not passing). See PROGRESS.md / .claude/btw.md for the full trace.
         js::webaudio_selftest(); // M42 step 2: Web Audio API -> 440Hz oscillator -> virtio-sound
         js::webgl_selftest(); // M42 step 3: WebGL -> GLSL shaders + software rasteriser -> triangle
         browser::css_selftest(); // M42 step 4: full CSS (position/overflow/text-transform/flex-col/...)
@@ -921,7 +926,7 @@ fn milestone4() {
     use alloc::{collections::BTreeMap, string::String, vec::Vec};
     use core::fmt::Write;
 
-    const HEAP_FRAMES: usize = 4096; // 16 MiB
+    const HEAP_FRAMES: usize = 4096; // 16 MiB kernel heap
     // M41 step 18 (ASLR): reserve a slack region and base the heap at a per-boot
     // random page offset, so the kernel heap is at a different address each boot.
     const SLACK_FRAMES: usize = 256; // 1 MiB of slide space

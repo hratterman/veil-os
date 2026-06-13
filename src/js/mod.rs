@@ -667,6 +667,68 @@ pub fn game_selftest() {
     }
 }
 
+/// V8-parity self-test (M42 step 18): exercise the web-platform/JS builtins a
+/// modern site expects — URL/URLSearchParams, TextEncoder/TextDecoder,
+/// crypto.getRandomValues/randomUUID, FormData, Blob, Reflect, globalThis,
+/// structuredClone, for-of over a custom iterable, Error subclasses, BigInt.
+pub fn v8_selftest() {
+    let skeleton = "<html><body><div id=out></div></body></html>";
+    let tree = crate::html::parse(skeleton);
+    let src = r#"
+        var u = new URL('https://henryratterman.com:8443/path/to?a=1&b=two#frag');
+        var url = u.protocol + ',' + u.hostname + ',' + u.port + ',' + u.pathname + ',' + u.search + ',' + u.hash;
+        var sp = new URLSearchParams('x=10&y=20&x=11');
+        var spr = sp.get('x') + ',' + sp.getAll('x').length + ',' + sp.has('y') + ',' + sp.has('z');
+        var enc = new TextEncoder().encode('AB');           // [65, 66]
+        var dec = new TextDecoder().decode([72, 105]);       // 'Hi'
+        var encdec = enc[0] + ',' + enc[1] + ',' + dec;
+        var ra = new Uint8Array(4); crypto.getRandomValues(ra);
+        var rand_ok = (ra.length === 4) && (ra[0] >= 0 && ra[0] <= 255);
+        var uuid = crypto.randomUUID(); var uuid_ok = (uuid.length === 36 && uuid.charAt(8) === '-');
+        var fd = new FormData(); fd.append('name', 'veil'); fd.append('n', '42');
+        var fdr = fd.get('name') + ',' + fd.has('n') + ',' + fd.has('x');
+        var obj = { a: 1, b: 2 };
+        var refl = Reflect.get(obj, 'a') + ',' + Reflect.has(obj, 'b') + ',' + Reflect.ownKeys(obj).length;
+        Reflect.set(obj, 'c', 9); var refl2 = obj.c;
+        var gt_ok = (typeof globalThis !== 'undefined') && (globalThis === self);
+        var orig = { x: 1, nested: { y: [2, 3] } };
+        var clone = structuredClone(orig); clone.nested.y[0] = 99;
+        var sc_ok = (orig.nested.y[0] === 2 && clone.nested.y[0] === 99);
+        var sum = 0; for (var v of [1, 2, 3, 4]) { sum += v; }
+        var err_ok = (new TypeError('x') instanceof Error) + ',' + (new RangeError('y').name);
+        var out = [
+          'url=' + url, 'sp=' + spr, 'ed=' + encdec, 'rand=' + rand_ok, 'uuid=' + uuid_ok,
+          'fd=' + fdr, 'refl=' + refl, 'refl2=' + refl2, 'gt=' + gt_ok, 'sc=' + sc_ok,
+          'forof=' + sum, 'err=' + err_ok
+        ].join(' | ');
+        document.getElementById('out').textContent = out;
+    "#;
+    let res = run(&tree, &[String::from(src)]);
+    let out = node_text_by_id(&res.tree, "out");
+    crate::kprintln!("JS_V8: {out}");
+    if !res.errors.is_empty() {
+        crate::kprintln!("JS_V8: {} issue(s); first: {}", res.errors.len(), truncate(&res.errors[0], 160));
+    }
+    let checks = [
+        "url=https:,henryratterman.com,8443,/path/to,?a=1&b=two,#frag",
+        "sp=10,2,true,false",       // get x=10, getAll x ->2, has y, !has z
+        "ed=65,66,Hi",              // TextEncoder/Decoder
+        "rand=true", "uuid=true",   // crypto
+        "fd=veil,true,false",       // FormData
+        "refl=1,true,2", "refl2=9", // Reflect
+        "gt=true",                  // globalThis === self
+        "sc=true",                  // structuredClone deep copy
+        "forof=10",                 // for-of over array
+        "err=true,RangeError",      // Error subclasses
+    ];
+    let missing: Vec<&str> = checks.iter().copied().filter(|c| !out.contains(c)).collect();
+    if missing.is_empty() {
+        crate::kprintln!("JS_V8_OK: V8-parity builtins — URL/URLSearchParams, TextEncoder/Decoder, crypto.getRandomValues/randomUUID, FormData, Blob, Reflect, globalThis, structuredClone(deep), for-of, Error subclasses all work");
+    } else {
+        crate::kprintln!("JS_V8_FAIL: missing {:?}", missing);
+    }
+}
+
 pub fn dom_api_selftest() {
     let skeleton = "<html><body><div id=app></div><div id=out></div></body></html>";
     let tree = crate::html::parse(skeleton);

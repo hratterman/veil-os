@@ -133,8 +133,18 @@ impl Interp {
                   // get_member returning "Name.prop" natives).
                   "Promise", "Map", "Set", "WeakMap", "WeakSet", "Symbol", "Date",
                   "RegExp", "Error", "TypeError", "RangeError", "SyntaxError",
-                  "ReferenceError", "Reflect", "Proxy", "BigInt", "WebSocket"] {
+                  "ReferenceError", "Reflect", "Proxy", "BigInt", "WebSocket",
+                  // M42 step 18 (V8-parity): web platform constructors/namespaces.
+                  "URL", "URLSearchParams", "TextEncoder", "TextDecoder", "FormData",
+                  "Blob", "File", "WeakRef", "FinalizationRegistry", "EvalError"] {
             b.vars.insert(f.into(), Val::Native(Native::Global(Rc::from(f))));
+        }
+        // crypto.getRandomValues / randomUUID.
+        {
+            let mut c = Obj::new();
+            c.insert("getRandomValues".into(), Val::Native(Native::Global(Rc::from("crypto.getRandomValues"))));
+            c.insert("randomUUID".into(), Val::Native(Native::Global(Rc::from("crypto.randomUUID"))));
+            b.vars.insert("crypto".into(), Val::object(c));
         }
         b.vars.insert("NaN".into(), Val::Num(f64::NAN));
         b.vars.insert("Infinity".into(), Val::Num(f64::INFINITY));
@@ -1030,6 +1040,52 @@ impl Interp {
                 o.insert("abort".into(), Val::Native(Native::Global(Rc::from("noop"))));
                 return Ok(Val::object(o));
             }
+            // M42 step 18: V8-parity web platform constructors.
+            "URL" => {
+                let u = args.first().map(|v| v.to_str()).unwrap_or_default();
+                return Ok(parse_url(&u));
+            }
+            "URLSearchParams" => {
+                return Ok(make_url_search_params(&args.first().map(|v| v.to_str()).unwrap_or_default()));
+            }
+            "TextEncoder" => {
+                let mut o = Obj::new();
+                o.insert("encoding".into(), Val::str("utf-8"));
+                o.insert("encode".into(), Val::Native(Native::Global(Rc::from("TextEncoder.encode"))));
+                return Ok(Val::object(o));
+            }
+            "TextDecoder" => {
+                let mut o = Obj::new();
+                o.insert("encoding".into(), Val::str("utf-8"));
+                o.insert("decode".into(), Val::Native(Native::Global(Rc::from("TextDecoder.decode"))));
+                return Ok(Val::object(o));
+            }
+            "FormData" => {
+                let mut o = Obj::new();
+                o.insert("__formdata".into(), Val::object(Obj::new()));
+                for m in ["append", "set"] { o.insert(m.into(), Val::Native(Native::Global(Rc::from("FormData.append")))); }
+                o.insert("get".into(), Val::Native(Native::Global(Rc::from("FormData.get"))));
+                o.insert("has".into(), Val::Native(Native::Global(Rc::from("FormData.has"))));
+                return Ok(Val::object(o));
+            }
+            "Blob" => {
+                let mut o = Obj::new();
+                // join the parts array for a size + text()
+                let text: String = match args.first() {
+                    Some(Val::Array(a)) => a.borrow().iter().map(|v| v.to_str()).collect(),
+                    _ => String::new(),
+                };
+                o.insert("size".into(), Val::Num(text.len() as f64));
+                o.insert("type".into(), Val::str(""));
+                o.insert("__blob".into(), Val::str(text.clone()));
+                return Ok(Val::object(o));
+            }
+            "WeakRef" => {
+                let mut o = Obj::new();
+                o.insert("__ref".into(), args.first().cloned().unwrap_or(Val::Undef));
+                o.insert("deref".into(), Val::Native(Native::Global(Rc::from("WeakRef.deref"))));
+                return Ok(Val::object(o));
+            }
             _ => {}
         }
         if Self::is_class(&ctor) {
@@ -1463,6 +1519,12 @@ impl Interp {
                 4
             } else if b.contains_key("__ws") {
                 5
+            } else if b.contains_key("__usp") {
+                6
+            } else if b.contains_key("__formdata") {
+                7
+            } else if b.contains_key("__blob") {
+                8
             } else {
                 0
             }
@@ -1472,6 +1534,57 @@ impl Interp {
             2 => Ok(Some(self.map_method(&o, name, args)?)),
             3 => Ok(Some(self.set_method(&o, name, args)?)),
             5 => Ok(Some(self.ws_method(&o, name, args)?)),
+            6 => {
+                // URLSearchParams: pairs in __usp = [[k,v],...].
+                let key = args.first().map(|v| v.to_str()).unwrap_or_default();
+                let pairs: Vec<(String, String)> = match o.borrow().get("__usp") {
+                    Some(Val::Array(a)) => a.borrow().iter().filter_map(|p| match p {
+                        Val::Array(kv) => { let kv = kv.borrow(); Some((kv.first()?.to_str(), kv.get(1)?.to_str())) }
+                        _ => None,
+                    }).collect(),
+                    _ => Vec::new(),
+                };
+                Ok(Some(match name {
+                    "get" => pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| Val::str(v.clone())).unwrap_or(Val::Null),
+                    "getAll" => Val::array(pairs.iter().filter(|(k, _)| *k == key).map(|(_, v)| Val::str(v.clone())).collect()),
+                    "has" => Val::Bool(pairs.iter().any(|(k, _)| *k == key)),
+                    "keys" => Val::array(pairs.iter().map(|(k, _)| Val::str(k.clone())).collect()),
+                    "toString" => Val::str(pairs.iter().map(|(k, v)| alloc::format!("{k}={v}")).collect::<Vec<_>>().join("&")),
+                    "append" | "set" => {
+                        if let Some(Val::Array(a)) = o.borrow().get("__usp") {
+                            a.borrow_mut().push(Val::array(alloc::vec![Val::str(key), args.get(1).cloned().unwrap_or(Val::str(""))]));
+                        }
+                        Val::Undef
+                    }
+                    _ => Val::Undef,
+                }))
+            }
+            7 => {
+                // FormData: __formdata is an object map.
+                let key = args.first().map(|v| v.to_str()).unwrap_or_default();
+                Ok(Some(match name {
+                    "append" | "set" => {
+                        if let Some(Val::Object(m)) = o.borrow().get("__formdata") {
+                            m.borrow_mut().insert(key, args.get(1).cloned().unwrap_or(Val::str("")));
+                        }
+                        Val::Undef
+                    }
+                    "get" => match o.borrow().get("__formdata") {
+                        Some(Val::Object(m)) => m.borrow().get(&key).cloned().unwrap_or(Val::Null),
+                        _ => Val::Null,
+                    },
+                    "has" => Val::Bool(matches!(o.borrow().get("__formdata"), Some(Val::Object(m)) if m.borrow().contains_key(&key))),
+                    _ => Val::Undef,
+                }))
+            }
+            8 => {
+                // Blob: text() returns the joined content as a resolved promise.
+                let body = o.borrow().get("__blob").map(|v| v.to_str()).unwrap_or_default();
+                Ok(Some(match name {
+                    "text" => self.make_promise("fulfilled", Val::str(body)),
+                    _ => Val::Undef,
+                }))
+            }
             4 => {
                 // fetch() Response
                 let body = o.borrow().get("__body").map(|v| v.to_str()).unwrap_or_default();
@@ -2851,6 +2964,68 @@ impl Interp {
             "Symbol" => Val::str(alloc::format!("Symbol({})", a0.to_str())),
             "structuredClone" => deep_clone(&a0),
 
+            // ---- V8-parity builtins (M42 step 18) ----
+            "TextEncoder.encode" => {
+                let s = a0.to_str();
+                Val::array(s.bytes().map(|b| Val::Num(b as f64)).collect())
+            }
+            "TextDecoder.decode" => {
+                let bytes: Vec<u8> = match &a0 {
+                    Val::Array(arr) => arr.borrow().iter().map(|v| v.as_num() as u8).collect(),
+                    _ => Vec::new(),
+                };
+                Val::str(String::from_utf8_lossy(&bytes).into_owned())
+            }
+            "crypto.getRandomValues" => {
+                // Fill the passed typed array with pseudo-random bytes (xorshift
+                // seeded by a counter — deterministic but non-trivial, fine for
+                // the no-real-entropy constraint). Returns the same array.
+                if let Val::Array(arr) = &a0 {
+                    let mut b = arr.borrow_mut();
+                    let mut x = RNG_STATE.fetch_add(0x9E37_79B9, core::sync::atomic::Ordering::Relaxed) | 1;
+                    for slot in b.iter_mut() {
+                        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                        *slot = Val::Num((x & 0xff) as f64);
+                    }
+                }
+                a0
+            }
+            "crypto.randomUUID" => {
+                let mut x = RNG_STATE.fetch_add(0x1234_5678, core::sync::atomic::Ordering::Relaxed) | 1;
+                let mut hex = String::new();
+                for i in 0..32 {
+                    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                    hex.push(core::char::from_digit((x & 0xf) as u32, 16).unwrap());
+                    if i == 7 || i == 11 || i == 15 || i == 19 { hex.push('-'); }
+                }
+                Val::str(hex)
+            }
+            "WeakRef.deref" => a0, // model: the ref never collected
+            // Reflect.* mirror Object operations.
+            "Reflect.get" => {
+                let key = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                match &a0 { Val::Object(o) => o.borrow().get(&key).cloned().unwrap_or(Val::Undef), _ => Val::Undef }
+            }
+            "Reflect.set" => {
+                if let Val::Object(o) = &a0 {
+                    let key = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                    o.borrow_mut().insert(key, args.get(2).cloned().unwrap_or(Val::Undef));
+                }
+                Val::Bool(true)
+            }
+            "Reflect.has" => {
+                let key = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                Val::Bool(matches!(&a0, Val::Object(o) if o.borrow().contains_key(&key)))
+            }
+            "Reflect.ownKeys" | "Reflect.keys" => Val::array(object_keys(&a0).into_iter().map(Val::str).collect()),
+            "Reflect.deleteProperty" => {
+                if let Val::Object(o) = &a0 {
+                    let key = args.get(1).map(|v| v.to_str()).unwrap_or_default();
+                    o.borrow_mut().remove(&key);
+                }
+                Val::Bool(true)
+            }
+
             // ---- Web Audio sink: float samples [-1,1] -> i16 PCM -> virtio-sound ----
             "__webaudio_play" => {
                 if let Val::Array(a) = &a0 {
@@ -3497,6 +3672,53 @@ fn norm_idx(v: Option<&Val>, default: i64, len: i64) -> i64 {
         }
         _ => default,
     }
+}
+
+/// PRNG state for crypto.getRandomValues/randomUUID (no real entropy source).
+static RNG_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
+
+/// Parse a URL into a WHATWG-ish object (href/protocol/host/pathname/search/...).
+fn parse_url(url: &str) -> Val {
+    let mut o = Obj::new();
+    o.insert("href".into(), Val::str(url));
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let protocol = if scheme.is_empty() { String::new() } else { alloc::format!("{scheme}:") };
+    // split rest into authority + path
+    let (authority, pathq) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let host = authority;
+    let hostname = host.split(':').next().unwrap_or(host);
+    let port = host.split_once(':').map(|(_, p)| p).unwrap_or("");
+    // path / search / hash
+    let (path_search, hash) = pathq.split_once('#').unwrap_or((pathq, ""));
+    let (pathname, search) = path_search.split_once('?').map(|(p, q)| (p, alloc::format!("?{q}"))).unwrap_or((path_search, String::new()));
+    let pathname = if pathname.is_empty() { "/" } else { pathname };
+    o.insert("protocol".into(), Val::str(protocol.clone()));
+    o.insert("host".into(), Val::str(host));
+    o.insert("hostname".into(), Val::str(hostname));
+    o.insert("port".into(), Val::str(port));
+    o.insert("pathname".into(), Val::str(pathname));
+    o.insert("search".into(), Val::str(search.clone()));
+    o.insert("hash".into(), Val::str(if hash.is_empty() { String::new() } else { alloc::format!("#{hash}") }));
+    o.insert("origin".into(), Val::str(if scheme.is_empty() { String::from("null") } else { alloc::format!("{protocol}//{host}") }));
+    o.insert("searchParams".into(), make_url_search_params(search.trim_start_matches('?')));
+    o.insert("toString".into(), Val::Native(Native::Global(Rc::from("noop")))); // href stored
+    Val::object(o)
+}
+
+/// Build a URLSearchParams object from a query string (`a=1&b=2`).
+fn make_url_search_params(query: &str) -> Val {
+    let q = query.trim_start_matches('?');
+    let mut pairs: Vec<Val> = Vec::new();
+    for kv in q.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        pairs.push(Val::array(alloc::vec![Val::str(k), Val::str(v)]));
+    }
+    let mut o = Obj::new();
+    o.insert("__usp".into(), Val::array(pairs));
+    Val::object(o)
 }
 
 /// WebGL 1.0 enum constants (the subset our software GL accepts/uses).

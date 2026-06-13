@@ -136,7 +136,10 @@ impl Interp {
                   "ReferenceError", "Reflect", "Proxy", "BigInt", "WebSocket",
                   // M42 step 18 (V8-parity): web platform constructors/namespaces.
                   "URL", "URLSearchParams", "TextEncoder", "TextDecoder", "FormData",
-                  "Blob", "File", "WeakRef", "FinalizationRegistry", "EvalError"] {
+                  "Blob", "File", "WeakRef", "FinalizationRegistry", "EvalError",
+                  // M42 step 17: registered so `typeof MessageChannel === 'function'`
+                  // (React's scheduler probes this to pick its work-loop transport).
+                  "MessageChannel", "Event", "CustomEvent", "MutationObserver"] {
             b.vars.insert(f.into(), Val::Native(Native::Global(Rc::from(f))));
         }
         // crypto.getRandomValues / randomUUID.
@@ -1015,20 +1018,28 @@ impl Interp {
                 o.insert("takeRecords".into(), Val::array(Vec::new()));
                 return Ok(Val::object(o));
             }
-            // MessageChannel: two ports with postMessage; React's scheduler probes
-            // for it. We return ports whose postMessage defers onmessage so the
-            // scheduler's work loop runs through the deferred queue.
+            // MessageChannel: two LINKED ports — port.postMessage(data) delivers
+            // a 'message' event to the *peer* port's onmessage on the next tick.
+            // React 18's scheduler drives its entire work loop through this
+            // (port1.onmessage = flushWork; port2.postMessage(null) schedules it),
+            // so the peer link is what makes the reconciler actually run + commit.
             "MessageChannel" => {
                 let mk_port = || {
                     let mut p = Obj::new();
-                    p.insert("postMessage".into(), Val::Native(Native::Global(Rc::from("__port_post"))));
+                    p.insert("__port".into(), Val::Bool(true));
                     p.insert("onmessage".into(), Val::Null);
                     p.insert("close".into(), Val::Native(Native::Global(Rc::from("noop"))));
-                    Val::object(p)
+                    p.insert("start".into(), Val::Native(Native::Global(Rc::from("noop"))));
+                    Rc::new(RefCell::new(p))
                 };
+                let p1 = mk_port();
+                let p2 = mk_port();
+                // cross-link the peers so postMessage can reach the other side.
+                p1.borrow_mut().insert("__peer".into(), Val::Object(p2.clone()));
+                p2.borrow_mut().insert("__peer".into(), Val::Object(p1.clone()));
                 let mut o = Obj::new();
-                o.insert("port1".into(), mk_port());
-                o.insert("port2".into(), mk_port());
+                o.insert("port1".into(), Val::Object(p1));
+                o.insert("port2".into(), Val::Object(p2));
                 return Ok(Val::object(o));
             }
             "AbortController" => {
@@ -1525,6 +1536,8 @@ impl Interp {
                 7
             } else if b.contains_key("__blob") {
                 8
+            } else if b.contains_key("__port") {
+                9
             } else {
                 0
             }
@@ -1582,6 +1595,29 @@ impl Interp {
                 let body = o.borrow().get("__blob").map(|v| v.to_str()).unwrap_or_default();
                 Ok(Some(match name {
                     "text" => self.make_promise("fulfilled", Val::str(body)),
+                    _ => Val::Undef,
+                }))
+            }
+            9 => {
+                // MessageChannel port: postMessage(data) -> defer the PEER port's
+                // onmessage({data}). This is what drives React's scheduler loop.
+                Ok(Some(match name {
+                    "postMessage" => {
+                        let peer = o.borrow().get("__peer").cloned();
+                        if let Some(Val::Object(peer)) = peer {
+                            let onmsg = peer.borrow().get("onmessage").cloned();
+                            if let Some(handler) = onmsg {
+                                if !matches!(handler, Val::Null | Val::Undef) {
+                                    let mut ev = Obj::new();
+                                    ev.insert("data".into(), args.first().cloned().unwrap_or(Val::Undef));
+                                    ev.insert("type".into(), Val::str("message"));
+                                    self.deferred.push((handler, alloc::vec![Val::object(ev)]));
+                                }
+                            }
+                        }
+                        Val::Undef
+                    }
+                    "start" | "close" => Val::Undef,
                     _ => Val::Undef,
                 }))
             }

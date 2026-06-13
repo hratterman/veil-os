@@ -148,9 +148,10 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         js::indexeddb_selftest(); // M41: IndexedDB polyfill round-trip
         js::dom_api_selftest(); // M42 step 1: full DOM API + engine fixes (React parses/loads/runs)
         js::v8_selftest(); // M42 step 18: V8-parity builtins (URL/TextEncoder/crypto/Reflect/...)
-        // M42 step 17: js::react_selftest() — React 18 parses/loads/runs; the
-        // reconciler host-commit doesn't append yet (lane-scheduling blocker).
-        // Kept unwired from boot (slow + not passing); see PROGRESS.md.
+        // M42 step 17: js::react_selftest() — React 18 parses/loads/runs; scheduler
+        // transport now fixed (linked MessageChannel) but the reconciler still
+        // doesn't commit (concurrent bails at getNextLanes=0; legacy work-loop
+        // loops). Unwired from boot (slow + not passing); see PROGRESS.md.
         js::webaudio_selftest(); // M42 step 2: Web Audio API -> 440Hz oscillator -> virtio-sound
         js::webgl_selftest(); // M42 step 3: WebGL -> GLSL shaders + software rasteriser -> triangle
         browser::css_selftest(); // M42 step 4: full CSS (position/overflow/text-transform/flex-col/...)

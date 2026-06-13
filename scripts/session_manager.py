@@ -449,6 +449,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "closed")
         if u.path == "/healthz":
             return self._send(200, "ok\n", "text/plain")
+        # M42 step 20 (persistent cloud sessions): the account login page. The
+        # account system (email/password in SQLite, persistent per-account disk
+        # images, session suspend/resume hibernation, plan limits) lives in
+        # scripts/veil_accounts.py; after login the session boots the account's
+        # PERSISTENT disk (vs the ephemeral visitor demo sessions on /).
+        if u.path in ("/login", "/register"):
+            return self.serve_login_page(u.path == "/register")
         # M42 step 10 (multiplayer): a "Share Desktop" link for an existing
         # session. A second visitor opening /share?session=<id> joins the SAME
         # running QEMU (get_or_create reuses the session), and because QEMU's VNC
@@ -542,6 +549,29 @@ class Handler(BaseHTTPRequestHandler):
             up.sendall(self.rfile.read(n))
         self.close_connection = True
         pump(self.connection, up)
+
+    def serve_login_page(self, register):
+        # M42 step 20: the os.henryratterman.com/login account page. POST to
+        # /login authenticates against scripts/veil_accounts.py and boots the
+        # account's persistent disk (resuming a hibernated session if present).
+        title = "Create your Veil account" if register else "Log in to Veil"
+        other = ("/login", "Log in") if register else ("/register", "Create account")
+        page = f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>{title}</title>
+<style>body{{background:#0a0a14;color:#e8e8f0;font-family:sans-serif;display:flex;
+min-height:100vh;align-items:center;justify-content:center;margin:0}}
+.card{{background:#14182e;padding:32px;border-radius:12px;width:320px}}
+h1{{color:#6ad6ff;font-size:22px;margin:0 0 16px}}input{{width:100%;box-sizing:border-box;
+padding:10px;margin:6px 0;border-radius:6px;border:1px solid #2a3050;background:#0e1124;color:#e8e8f0}}
+button{{width:100%;padding:11px;margin-top:10px;border:0;border-radius:6px;background:#5b8af0;color:#fff;font-size:15px;cursor:pointer}}
+a{{color:#9aa;font-size:13px}}</style></head><body><form class=card method=post action="{'/register' if register else '/login'}">
+<h1>{title}</h1>
+<input name=email type=email placeholder="email" required>
+<input name=password type=password placeholder="password" required>
+<button type=submit>{title}</button>
+<p style="text-align:center"><a href="{other[0]}">{other[1]}</a></p>
+<p style="text-align:center"><a href="/">try the demo without an account →</a></p>
+</form></body></html>"""
+        return self._send(200, page)
 
     def serve_landing(self):
         # M25 default: one-shot spawn + redirect. M30 overrides this with a

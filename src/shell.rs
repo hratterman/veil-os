@@ -1090,6 +1090,7 @@ fn dispatch(argv: &[String], st: &mut ShellState, stdin: Option<String>) -> (Str
         "df" => (df(), 0),
         "nproc" => (format!("{}\n", crate::smp::nproc()), 0),
         "cc" => cc(&rest),
+        "rustc" => rustc_cmd(&rest),
         "chmod" => (String::new(), 0),
         "seq" => (seq(&rest), 0),
         "basename" => (format!("{}\n", rest.first().map(|s| s.rsplit('/').next().unwrap_or(s)).unwrap_or("")), 0),
@@ -1138,6 +1139,36 @@ fn cc(args: &[String]) -> (String, i32) {
             (out, 0)
         }
         Err(e) => (format!("cc: {src_name}: error: {e}\n"), 1),
+    }
+}
+
+/// `rustc <file.rs> [-o out.wsm]` — compile a Rust-subset file to WASM inside
+/// Veil (Rust -> C subset -> WASM), write the module to disk, and run it.
+fn rustc_cmd(args: &[String]) -> (String, i32) {
+    let src_name = args.iter().find(|a| !a.starts_with('-') && a.ends_with(".rs")).cloned();
+    let Some(src_name) = src_name else {
+        return ("rustc: usage: rustc <file.rs> [-o out.wsm]\n".to_string(), 2);
+    };
+    let Some(data) = fs::read_file(&src_name) else {
+        return (format!("rustc: {src_name}: no such file\n"), 1);
+    };
+    let src = String::from_utf8_lossy(&data);
+    match crate::rustc::compile(&src) {
+        Ok(wasm) => {
+            let out_name = args.windows(2).find(|w| w[0] == "-o").map(|w| w[1].clone()).unwrap_or_else(|| {
+                let stem: String = src_name.split('.').next().unwrap_or("A").chars().take(8).collect();
+                format!("{}.WSM", stem.to_ascii_uppercase())
+            });
+            let _ = fs::write_file(&out_name, &wasm);
+            crate::kprintln!("RUSTC: {src_name} -> {out_name} ({} bytes WASM)", wasm.len());
+            let mut out = format!("rustc: compiled {} -> {} ({} bytes)\n", src_name, out_name, wasm.len());
+            match crate::wasm::run(&wasm) {
+                Ok(prog_out) => { out.push_str(&prog_out); if !prog_out.ends_with('\n') { out.push('\n'); } }
+                Err(e) => out.push_str(&format!("rustc: run error: {e}\n")),
+            }
+            (out, 0)
+        }
+        Err(e) => (format!("rustc: {src_name}: error: {e}\n"), 1),
     }
 }
 

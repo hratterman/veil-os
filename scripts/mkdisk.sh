@@ -48,6 +48,20 @@ int main() {
     return 0;
 }
 VEILC
+# M42 step 19: a Rust program to compile + run inside Veil with `rustc hello.rs`.
+cat > "$MNT/HELLO.RS" <<'VEILRS'
+// Hello, Veil — compiled inside Veil by the on-OS Rust-subset compiler.
+fn square(n: i32) -> i32 { n * n }
+fn main() -> i32 {
+    println!("Hello from Rust!");
+    let mut sum = 0;
+    for i in 1..=5 {
+        sum += square(i);
+    }
+    println!("sum = {}", sum);
+    0
+}
+VEILRS
 # M41 step 9: a non-trivial shell script (iterate files, pipe-transform, write
 # output) for the real-shell proof. Run with `sh test.sh`.
 cat > "$MNT/TEST.SH" <<'VEILSH'

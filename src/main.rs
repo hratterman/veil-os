@@ -62,6 +62,7 @@ mod pi4;
 mod png;
 mod repl;
 mod rsa;
+mod rustc;
 mod scheduler;
 mod semihosting;
 mod settings;
@@ -162,6 +163,7 @@ fn virt_main(dtb_ptr: *const u8) -> ! {
         x509::selftest(); // M41: X.509 parse + chain validation (self-signed/expired/hostname)
         cc::selftest(); // M41 step 21: compile + run a C program inside Veil
         cc::selftest2(); // M42 step 8: pointers/arrays/char/malloc/preprocessor/stdlib
+        rustc::selftest(); // M42 step 19: Rust-subset compiler (fn/let-mut/for/if + borrow check)
         browser::addrbar_selftest(); // address bar: bare host -> https://, dotless -> search
         browser::hsts_selftest(); // M41: HSTS record + http->https upgrade
     }

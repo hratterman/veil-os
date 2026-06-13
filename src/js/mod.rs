@@ -8,8 +8,8 @@
 
 mod ast;
 mod canvas;
-mod dom;
-mod interp;
+pub mod dom;
+pub mod interp;
 pub mod jit;
 mod lexer;
 mod mathf;
@@ -370,68 +370,79 @@ pub const REACT_DOM_UMD: &str = include_str!("../../assets/js/vendor/react-dom.p
 pub const REACT_DEV: &str = include_str!("../../assets/js/vendor/react.development.js");
 pub const REACT_DOM_DEV: &str = include_str!("../../assets/js/vendor/react-dom.development.js");
 
-/// TEMP (Step 17): run the React 18 *development* build (readable names +
-/// invariant/warning messages) and dump every console line React emits, so the
-/// reconciler-commit blocker can be diagnosed from React's own diagnostics.
-pub fn react_dev_diag() {
-    use core::sync::atomic::Ordering;
+/// M42 step 17 — REACT_FULL_OK. Load real React 18 + ReactDOM 18 (development
+/// build, for readable internals) and mount a *non-trivial* app through the
+/// React 18 concurrent root (`createRoot`): a function component with
+/// `useState`/`useEffect`, a keyed list rendered by a nested component, and an
+/// `onClick` handler. Then dispatch a real click and confirm the reconciler
+/// re-rendered the single changed text node (Count: 0 → Count: 1). This
+/// exercises the whole pipeline end-to-end: element creation, the concurrent
+/// scheduler (MessageChannel host callback drained post-hoc), lane scheduling,
+/// the work loop, completeWork/createInstance, the commit/placement phase,
+/// hooks, the synthetic-event delegation system, state updates, and the diffing
+/// reconciler on re-render.
+pub fn react_full_selftest() {
     let skeleton = "<html><body><div id=root></div></body></html>";
     let tree = crate::html::parse(skeleton);
     let app = r#"
         var rd = document.getElementById('root');
-        try {
-          ReactDOM.render(React.createElement('h1', null, 'Legacy'), rd);
-          console.error('LEGACY kids=' + rd.children.length + ' txt=' + (rd.firstChild && rd.firstChild.textContent));
-        } catch (e) { console.error('LEGACY THREW: ' + (e && (e.message || e))); }
+        var useState = React.useState, useEffect = React.useEffect;
+        function Item(p){ return React.createElement('li', null, p.text); }
+        function App(){
+          var s = useState(0); var n = s[0]; var setN = s[1];
+          useEffect(function(){ window.__fx = 'ran'; }, []);
+          return React.createElement('div', {className:'app'},
+            React.createElement('h1', null, 'Count: ' + n),
+            React.createElement('ul', null, ['a','b'].map(function(t,i){
+              return React.createElement(Item, {key:i, text:t}); })),
+            React.createElement('button', {onClick:function(){ setN(n+1); }}, '+'));
+        }
+        ReactDOM.createRoot(rd).render(React.createElement(App));
     "#;
-    // DETERMINISTIC legacy-only trace, JIT OFF. The legacy lane is SyncLane(1)
-    // with no event-priority/JIT path, so this isolates the real failure:
-    // requestUpdateLane -> scheduleUpdateOnFiber -> markRootUpdated (pendingLanes)
-    // -> ensureRootIsScheduled (does it bail at getNextLanes===0?) ->
-    // scheduleLegacySyncCallback -> flushSyncCallbacks -> performSyncWorkOnRoot.
-    // Trace the legacy ENTRY chain + tag the throw sites. updateContainer never
-    // reached requestUpdateLane, yet React threw MOUNTING — find where.
-    let react_src = String::from(REACT_DEV);
-    let dom_src = String::from(REACT_DOM_DEV)
-        .replace("  function render(element, container, callback) {",
-                 "  function render(element, container, callback) {\n    console.error('E render');")
-        .replace("    } else {\n      // First clear any existing content.\n      var rootSibling;",
-                 "    } else {\n      console.error('E legacyCreate-initialMount');\n      var rootSibling;")
-        .replace("  function updateContainer(element, container, parentComponent, callback) {",
-                 "  function updateContainer(element, container, parentComponent, callback) {\n    console.error('E updateContainer');")
-        .replace("  function getPublicRootInstance(container) {\n    var containerFiber = container.current;",
-                 "  function getPublicRootInstance(container) {\n    var containerFiber = container.current;\n    console.error('E getPublicRootInstance childNull='+(!containerFiber.child));")
-        .replace("  function requestUpdateLane(fiber) {\n    // Special cases\n    var mode = fiber.mode;",
-                 "  function requestUpdateLane(fiber) {\n    console.error('E requestUpdateLane');\n    var mode = fiber.mode;")
-        .replace("  function scheduleUpdateOnFiber(root, fiber, lane, eventTime) {\n    checkForNestedUpdates();",
-                 "  function scheduleUpdateOnFiber(root, fiber, lane, eventTime) {\n    console.error('E scheduleUpdateOnFiber lane='+lane);\n    checkForNestedUpdates();")
-        .replace("  function findCurrentFiberUsingSlowPath(fiber) {\n    var alternate = fiber.alternate;",
-                 "  function findCurrentFiberUsingSlowPath(fiber) {\n    console.error('E findCurrentFiberUsingSlowPath altNull='+(!fiber.alternate));\n    var alternate = fiber.alternate;")
-        .replace("  function appendChildToContainer(container, child) {",
-                 "  function appendChildToContainer(container, child) {\n    console.error('T appendChildToContainer');")
-        .replace("  function flushSync(fn) {",
-                 "  function flushSync(fn) {\n    console.error('E flushSync hasFn='+(!!fn));");
+    let click = r#"
+        var btn = document.querySelector('button');
+        btn.dispatchEvent({ type:'click', bubbles:true, cancelable:true, target:btn,
+                            preventDefault:function(){}, stopPropagation:function(){} });
+    "#;
     let dom = dom::Dom::from_tree(&tree);
     let mut it = interp::Interp::new(dom);
-    it.set_jit(false);
-    interp::CE_COUNT.store(0, Ordering::Relaxed);
-    crate::kprintln!("RDEV: parsing react.dev ({} bytes) + react-dom.dev ({} bytes, traced)...", react_src.len(), dom_src.len());
-    it.run(&react_src);
-    crate::kprintln!("RDEV: react.dev loaded, errors so far: {}", it.errors.len());
-    it.run(&dom_src);
-    crate::kprintln!("RDEV: react-dom.dev loaded, errors so far: {}", it.errors.len());
+    it.set_jit(false); // the lane/work-loop math runs in the interpreter (deterministic)
+    crate::kprintln!("REACT: loading React 18 ({} B) + ReactDOM 18 ({} B)...", REACT_DEV.len(), REACT_DOM_DEV.len());
+    it.run(REACT_DEV);
+    it.run(REACT_DOM_DEV);
     it.run(app);
     it.drain_deferred();
-    let ce = interp::CE_COUNT.load(Ordering::Relaxed);
-    let kids = it.dom.get_by_id("root").map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
-    let kids3 = it.dom.get_by_id("root3").map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
-    crate::kprintln!("RDEV: async root3 kids(post-drain)={kids3}");
-    crate::kprintln!("RDEV: createElement={ce} root_kids={kids} total_console/err={}", it.errors.len());
-    // Dump every console/error line React emitted (these carry the diagnosis).
-    for (i, e) in it.errors.iter().enumerate().take(40) {
-        crate::kprintln!("RDEV[{i}] {}", truncate(e, 240));
+    let tree0 = it.dom.to_tree();
+    let h1_initial = node_text_by_tag(&tree0, "h1");
+    let li_text = collect_tag_text(&tree0, "li");
+    let fx = it.global_val("__fx").map(|v| v.to_str()).unwrap_or_default();
+    // Fire a click — onClick -> setN -> schedule -> re-render -> patch the <h1>.
+    it.run(click);
+    it.drain_deferred();
+    let h1_after = node_text_by_tag(&it.dom.to_tree(), "h1");
+    let mounted = h1_initial.contains("Count: 0");
+    let listed = li_text == "ab"; // two keyed <li> from the nested component
+    let effect = fx == "ran";
+    let interactive = h1_after.contains("Count: 1");
+    crate::kprintln!("REACT: mount={mounted} h1_initial={h1_initial:?} list={li_text:?} useEffect={effect} click={interactive} h1_after={h1_after:?}");
+    if mounted && listed && effect && interactive {
+        crate::kprintln!("REACT_FULL_OK: React 18 createRoot mounted a stateful app (useState/useEffect + keyed list + nested components); a synthetic onClick re-rendered Count:0 -> Count:1 via the reconciler");
+    } else {
+        crate::kprintln!("REACT_FULL_FAIL: mount={mounted} list={listed} effect={effect} interactive={interactive}");
     }
-    crate::kprintln!("RDEV_DONE: kids={kids}");
+}
+
+/// Concatenate the text of every `<tag>` element in document order.
+fn collect_tag_text(n: &Node, tag: &str) -> String {
+    let mut out = String::new();
+    fn walk(n: &Node, tag: &str, out: &mut String) {
+        if let Node::Element { tag: t, .. } = n {
+            if t == tag { n.text(out); }
+        }
+        for c in n.children() { walk(c, tag, out); }
+    }
+    walk(n, tag, &mut out);
+    out
 }
 
 /// Locate the first brace-nesting parser desync in `src` (or none). Prints the
@@ -466,33 +477,59 @@ pub fn react_selftest() {
     use core::sync::atomic::Ordering;
     let skeleton = "<html><body><div id=root></div></body></html>";
     let tree = crate::html::parse(skeleton);
-    // Try the legacy synchronous path first (simpler reconciler entry).
-    // Concurrent path only (createRoot) — it doesn't loop, so it's bounded.
+    // Two mount paths: legacy `ReactDOM.render` (synchronous — commits inline via
+    // flushSyncCallbacks, which now works because Function.prototype.bind results
+    // are callable) into #root, and concurrent `createRoot().render()` into #root2
+    // (commits during drain_deferred via the scheduler). Each <h1> carries
+    // distinct text so we can tell which path mounted.
+    // Legacy synchronous mount: ReactDOM.render commits inline via
+    // flushSyncCallbacks (now reachable — Function.prototype.bind results are
+    // callable, and unset node expandos read as undefined so React doesn't think
+    // a fresh container is already mounted). The concurrent createRoot() path is
+    // intentionally left for REACT_FULL_OK — it relies on the host event loop
+    // (MessageChannel scheduler) re-entering during render, which our post-hoc
+    // drain doesn't yet reproduce.
     let app = r#"
         var rd = document.getElementById('root');
-        var root = ReactDOM.createRoot(rd);
-        root.render(React.createElement('h1', null, 'Hello from React'));
-        window.__concurrent = rd.children.length;
+        function __argf(){ return arguments.length + ':' + arguments[1]; }
+        try { window.__argTest = __argf('a','b','c'); } catch (e) { window.__argTest = 'THREW:' + (e && (e.message || e)); }
+        window.__euc = (typeof encodeURIComponent);
+        // Reproduce React's formatProdErrorMessage to see if it yields a string.
+        function __fpem(a){ for (var b='?inv='+a, c=1; c<arguments.length; c++) b+='&a='+arguments[c]; return 'err#'+a+' '+b; }
+        try { window.__fpem = '' + __fpem(200); } catch (e) { window.__fpem = 'THREW:' + (e && (e.message || e)); }
+        try {
+          ReactDOM.render(React.createElement('h1', null, 'Hello from React'), rd);
+        } catch (e) {
+          var msg = e && e.message;
+          var stk = e && e.stack;
+          var keys = '';
+          try { keys = e ? Object.keys(e).join(',') : ''; } catch (e2) {}
+          window.__legacyErr = 'msg=[' + msg + '] keys=[' + keys + '] stack=[' + (stk ? ('' + stk).slice(0, 220) : '') + ']';
+        }
+        window.__legacy = rd.children.length;
     "#;
     let dom = dom::Dom::from_tree(&tree);
     let mut it = interp::Interp::new(dom);
     interp::CE_COUNT.store(0, Ordering::Relaxed);
-    it.run(REACT_UMD); it.run(REACT_DOM_UMD); it.run(app); it.drain_deferred();
+    it.run(REACT_DEV); it.run(REACT_DOM_DEV); it.run(app); it.drain_deferred();
     let ce = interp::CE_COUNT.load(Ordering::Relaxed);
-    let rd = it.dom.get_by_id("root");
-    let root_kids = rd.map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
+    let root_kids = it.dom.get_by_id("root").map(|i| it.dom.nodes[i].children.len()).unwrap_or(0);
     let mut tags: Vec<String> = Vec::new();
     for n in &it.dom.nodes { if !n.is_text() && !tags.contains(&n.tag) { tags.push(n.tag.clone()); } }
     let legacy = it.global_val("__legacy").map(|v| v.to_str()).unwrap_or_default();
-    let concurrent = it.global_val("__concurrent").map(|v| v.to_str()).unwrap_or_default();
+    let legacy_err = it.global_val("__legacyErr").map(|v| v.to_str()).unwrap_or_default();
+    let arg_test = it.global_val("__argTest").map(|v| v.to_str()).unwrap_or_default();
+    let euc = it.global_val("__euc").map(|v| v.to_str()).unwrap_or_default();
+    let fpem = it.global_val("__fpem").map(|v| v.to_str()).unwrap_or_default();
     for (i, e) in it.errors.iter().enumerate().take(5) { crate::kprintln!("  react-err[{i}] {}", truncate(e, 160)); }
-    crate::kprintln!("REACT_DIAG: createElement_calls={ce} root_kids={root_kids} legacy={legacy} concurrent={concurrent} tags=[{}]", tags.join(","));
+    crate::kprintln!("REACT_PROBE: argTest={arg_test:?} encodeURIComponent={euc:?} fpem={fpem:?}");
+    crate::kprintln!("REACT_DIAG: createElement_calls={ce} root_kids={root_kids} legacy={legacy} legacyErr={legacy_err} tags=[{}]", tags.join(","));
     let res = JsResult { tree: it.dom.to_tree(), errors: it.errors, canvases: Vec::new() };
     let h1 = node_text_by_tag(&res.tree, "h1");
     if h1.contains("Hello from React") {
-        crate::kprintln!("REACT_OK: React 18 mounted + rendered <h1>Hello from React</h1> into #root");
+        crate::kprintln!("REACT_OK: real React 18 mounted + committed <h1>Hello from React</h1> into #root (kids={root_kids}, h1={h1:?})");
     } else {
-        crate::kprintln!("REACT_PARTIAL: React+ReactDOM run; reconciler host-commit not appending (ce={ce} kids={root_kids})");
+        crate::kprintln!("REACT_PARTIAL: React+ReactDOM run; reconciler host-commit not appending (ce={ce} kids={root_kids} h1={h1:?})");
     }
 }
 

@@ -295,9 +295,18 @@ impl Dom {
     }
 
     pub fn set_text_content(&mut self, idx: usize, t: &str) {
-        // drop children, add a single text node
-        let kids = core::mem::take(&mut self.nodes[idx].children);
-        let _ = kids; // orphaned (arena keeps them but unreferenced)
+        // Detach the existing children (the arena keeps the orphans, but they're
+        // no longer referenced from this subtree).
+        for c in core::mem::take(&mut self.nodes[idx].children) {
+            self.nodes[c].parent = None;
+        }
+        // `textContent = ""` clears the element to *no* children — it must NOT
+        // leave an empty text node behind. React's `resetTextContent` sets `""`
+        // before appending the real child; a stray empty text node corrupts the
+        // child list and the reconciler's sibling walk.
+        if t.is_empty() {
+            return;
+        }
         let tn = self.create_text(t);
         self.nodes[tn].parent = Some(idx);
         self.nodes[idx].children = vec![tn];

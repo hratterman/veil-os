@@ -225,25 +225,24 @@ impl Parser {
             let c = self.expr();
             self.expect_punct(")");
             self.eat_punct(";");
-            // run once then while: model as block + while
-            let mut stmts = body.clone();
-            stmts.push(Stmt::While(c, body));
-            return Stmt::Block(stmts);
+            return Stmt::DoWhile(c, body);
         }
         if self.eat_kw("break") {
-            // optional label: `break outer;` — consume and ignore the label
+            // optional label: `break outer;`
+            let mut label = None;
             if let Tok::Ident(n) = self.peek().clone() {
-                if !is_keyword(&n) { self.bump(); }
+                if !is_keyword(&n) { self.bump(); label = Some(n); }
             }
             self.eat_punct(";");
-            return Stmt::Break;
+            return Stmt::Break(label);
         }
         if self.eat_kw("continue") {
+            let mut label = None;
             if let Tok::Ident(n) = self.peek().clone() {
-                if !is_keyword(&n) { self.bump(); }
+                if !is_keyword(&n) { self.bump(); label = Some(n); }
             }
             self.eat_punct(";");
-            return Stmt::Continue;
+            return Stmt::Continue(label);
         }
         if self.eat_kw("throw") {
             let e = self.expr();
@@ -257,14 +256,13 @@ impl Parser {
             return self.switch_stmt();
         }
         // Labeled statement: `label: stmt` (e.g. minified `a:for(...){...}`).
-        // We don't model named break/continue targets, so the label is dropped
-        // and `break`/`continue` apply to the innermost loop — fine for the
-        // structured loops minifiers emit. The point is to not desync parsing.
+        // Modelled as `Stmt::Labeled` so `break label` / `continue label` can
+        // target the right loop — terser emits these to flatten control flow.
         if let Tok::Ident(n) = self.peek().clone() {
             if !is_keyword(&n) && matches!(self.peek2(), Tok::Punct(":")) {
                 self.bump(); // label
                 self.bump(); // :
-                return self.stmt();
+                return Stmt::Labeled(n, alloc::boxed::Box::new(self.stmt()));
             }
         }
         let e = self.expr();
@@ -498,8 +496,11 @@ impl Parser {
     }
 
     fn switch_stmt(&mut self) -> Stmt {
-        // Lower switch to if/else-if chain on the discriminant (no fallthrough
-        // support beyond the common one-case-per-branch shape).
+        // Parse into a real `Stmt::Switch` with C-style fall-through. The old
+        // lowering to an if/else chain dropped `break` and gave empty case
+        // labels their own (empty) body, so `case A: case B: { ... }` never ran
+        // the shared block when the discriminant matched A — which is exactly the
+        // shape React's reconciler uses (`case HostRoot: case HostPortal: { … }`).
         self.expect_punct("(");
         let disc = self.expr();
         self.expect_punct(")");
@@ -517,34 +518,16 @@ impl Parser {
                 self.bump();
                 continue;
             };
+            // Collect every statement up to the next case/default/}, KEEPING any
+            // `break` (the evaluator uses it to stop fall-through).
             let mut body = Vec::new();
             while !self.is_kw("case") && !self.is_kw("default") && !self.is_punct("}") && !self.at_eof() {
-                let s = self.stmt();
-                if matches!(s, Stmt::Break) {
-                    break;
-                }
-                body.push(s);
+                body.push(self.stmt());
             }
             arms.push((test, body));
         }
         self.expect_punct("}");
-        // build nested if/else
-        let mut chain: Vec<Stmt> = Vec::new();
-        let mut default: Vec<Stmt> = Vec::new();
-        for (test, body) in arms.iter() {
-            if test.is_none() {
-                default = body.clone();
-            }
-        }
-        let mut else_branch = default;
-        for (test, body) in arms.into_iter().rev() {
-            if let Some(t) = test {
-                let cond = Expr::Binary("===", Box::new(disc.clone()), Box::new(t));
-                else_branch = alloc::vec![Stmt::If(cond, body, core::mem::take(&mut else_branch))];
-            }
-        }
-        chain.extend(else_branch);
-        Stmt::Block(chain)
+        Stmt::Switch(disc, arms)
     }
 
     // ---- classes / modules -------------------------------------------------

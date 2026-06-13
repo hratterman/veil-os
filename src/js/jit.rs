@@ -403,7 +403,7 @@ fn emit_stmt(ctx: &mut Ctx, s: &Stmt) {
             }
         }
         Stmt::Block(b) => emit_block(ctx, b),
-        Stmt::Break => {
+        Stmt::Break(None) => {
             let at = ctx.a.b_placeholder();
             if let Some(l) = ctx.loops.last_mut() {
                 l.1.push(at);
@@ -411,7 +411,7 @@ fn emit_stmt(ctx: &mut Ctx, s: &Stmt) {
                 ctx.bail();
             }
         }
-        Stmt::Continue => {
+        Stmt::Continue(None) => {
             if let Some((target, _)) = ctx.loops.last() {
                 let t = *target;
                 ctx.a.b_to(t);
@@ -419,7 +419,8 @@ fn emit_stmt(ctx: &mut Ctx, s: &Stmt) {
                 ctx.bail();
             }
         }
-        _ => ctx.bail(), // throw/try/for-of/for-in/switch: deopt
+        // labeled break/continue, throw/try/for-of/for-in/switch: deopt
+        _ => ctx.bail(),
     }
 }
 

@@ -111,9 +111,22 @@ pub enum Stmt {
     ForOf(Pat, Expr, Vec<Stmt>),
     ForIn(Pat, Expr, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
+    /// do { ... } while (cond) — body runs at least once.
+    DoWhile(Expr, Vec<Stmt>),
+    /// switch (disc) { case e: stmts ... default: stmts }. Each arm is
+    /// (Some(test) | None for default, body). `break` is kept in the body so the
+    /// evaluator can implement C-style fall-through (an arm with no `break` runs
+    /// into the next arm).
+    Switch(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
     Block(Vec<Stmt>),
-    Break,
-    Continue,
+    /// `break` or `break label` (the label targets an enclosing labeled loop).
+    Break(Option<String>),
+    /// `continue` or `continue label`.
+    Continue(Option<String>),
+    /// `label: stmt` — names the (usually loop) statement so a labeled
+    /// break/continue can target it. Minifiers emit these to flatten control
+    /// flow, so getting them right matters for production React.
+    Labeled(String, Box<Stmt>),
     Throw(Expr),
     Try(Vec<Stmt>, Option<(Option<String>, Vec<Stmt>)>, Vec<Stmt>),
     Empty,

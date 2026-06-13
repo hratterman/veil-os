@@ -28,8 +28,11 @@ fn new_scope(parent: Option<Scope>) -> Scope {
 enum Flow {
     Normal,
     Return(Val),
-    Break,
-    Continue,
+    /// `break` (None) or `break label` (Some) — propagates up until a loop or
+    /// labeled statement whose label matches consumes it.
+    Break(Option<String>),
+    /// `continue` (None) or `continue label`.
+    Continue(Option<String>),
 }
 
 /// A registered event listener: (node, event-type, handler).
@@ -70,6 +73,18 @@ pub struct Interp {
     /// owns GL state + a GLSL software rasteriser; it renders into the canvas at
     /// `gl.canvas` (an index into `canvases`) so the result shows in layout.
     pub webgl: Vec<super::webgl::GlContext>,
+    /// Arbitrary expando properties assigned to DOM nodes from JS, keyed by
+    /// (node index, property name). The DOM tree itself can't hold `Val`s, but
+    /// frameworks stash live references on nodes — React in particular hangs the
+    /// fiber/root back-pointers off the host node (`_reactRootContainer`,
+    /// `__reactFiber$<key>`, `__reactProps$<key>`, event handlers). Reading an
+    /// unset expando MUST be `undefined` (not a phantom method native) or React
+    /// mistakes a fresh container for an already-mounted one.
+    node_expandos: BTreeMap<(usize, String), Val>,
+    /// The label of a `label:` statement, set just before its (loop) body runs so
+    /// the loop can match `break label` / `continue label`. Taken by the loop at
+    /// entry; `None` for unlabeled loops.
+    pending_label: Option<String>,
 }
 
 /// Cap on distinct cached functions before the whole table is dropped (bounds
@@ -78,6 +93,24 @@ const JIT_CACHE_CAP: usize = 4096;
 
 /// Diagnostic counter for `document.createElement` calls (React commit tracing).
 pub static CE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// DOM-node method names that `node_method` dispatches. Reading one of these as
+/// a property value (without immediately calling it) returns a callable native;
+/// any property NOT in this set, if unset, reads as `undefined` (JS semantics)
+/// rather than a phantom method — which is what lets framework expando probes
+/// like React's `node._reactRootContainer` correctly start out undefined.
+const NODE_METHODS: &[&str] = &[
+    "appendChild", "append", "insertBefore", "removeChild", "replaceChild",
+    "dispatchEvent", "remove", "setAttribute", "getAttribute", "hasAttribute",
+    "removeAttribute", "querySelector", "querySelectorAll", "closest", "contains",
+    "addEventListener", "removeEventListener", "focus", "blur", "click",
+    "scrollIntoView", "preventDefault", "stopPropagation", "setProperty",
+    "getBoundingClientRect", "matches", "cloneNode", "getContext",
+    "insertAdjacentHTML", "insertAdjacentElement", "getAttributeNode",
+    "setAttributeNS", "getAttributeNS", "removeAttributeNS", "hasAttributeNS",
+    "normalize", "getElementsByTagName", "getElementsByClassName",
+    "toggleAttribute", "compareDocumentPosition",
+];
 
 enum JitSlot {
     Profiling(u32),
@@ -105,6 +138,8 @@ impl Interp {
             func_props: BTreeMap::new(),
             canvases: Vec::new(),
             webgl: Vec::new(),
+            node_expandos: BTreeMap::new(),
+            pending_label: None,
         };
         it.install_globals();
         it
@@ -215,6 +250,11 @@ impl Interp {
     // ---- statement execution ----------------------------------------------
 
     fn exec_block(&mut self, stmts: &[Stmt], scope: &Scope) -> Result<Flow, Val> {
+        // A pending label only belongs to the loop that immediately follows the
+        // `label:`. By the time we run an arbitrary block, any loop that was the
+        // label's target has already claimed it; clearing here keeps a nested
+        // loop inside a labeled *block* from stealing the outer block's label.
+        self.pending_label = None;
         self.hoist(stmts, scope);
         for st in stmts {
             match self.exec(st, scope)? {
@@ -225,9 +265,25 @@ impl Interp {
         Ok(Flow::Normal)
     }
 
+    /// Interpret a loop body's resulting `Flow` against the loop's own `label`.
+    /// `None` → keep iterating (normal completion, or a `continue` that targets
+    /// this loop). `Some(flow)` → stop the loop and return `flow` (a matching
+    /// `break` becomes `Normal`; anything else — a labeled break/continue for an
+    /// outer loop, or a `return` — propagates unchanged).
+    fn loop_step(&self, f: Flow, label: &Option<String>) -> Option<Flow> {
+        match f {
+            Flow::Normal => None,
+            Flow::Continue(l) if l.is_none() || l.as_deref() == label.as_deref() => None,
+            Flow::Continue(l) => Some(Flow::Continue(l)),
+            Flow::Break(l) if l.is_none() || l.as_deref() == label.as_deref() => Some(Flow::Normal),
+            Flow::Break(l) => Some(Flow::Break(l)),
+            Flow::Return(v) => Some(Flow::Return(v)),
+        }
+    }
+
     fn exec(&mut self, st: &Stmt, scope: &Scope) -> Result<Flow, Val> {
         self.steps += 1;
-        if self.steps > 5_000_000 {
+        if self.steps > 50_000_000 {
             return Err(Val::str("script step limit"));
         }
         match st {
@@ -267,22 +323,86 @@ impl Interp {
                 self.exec_block(b, &inner)
             }
             Stmt::While(c, body) => {
+                let label = self.pending_label.take();
                 while self.eval(c, scope)?.truthy() {
                     let inner = new_scope(Some(scope.clone()));
-                    match self.exec_block(body, &inner)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                        _ => {}
+                    let f = self.exec_block(body, &inner)?;
+                    if let Some(out) = self.loop_step(f, &label) {
+                        return Ok(out);
                     }
                     self.steps += 1;
-                    if self.steps > 5_000_000 {
+                    if self.steps > 50_000_000 {
                         return Err(Val::str("loop limit"));
                     }
                 }
                 Ok(Flow::Normal)
             }
+            // do { body } while (cond): body runs once, THEN the condition is
+            // tested. A `break` in the body must terminate *this* loop (not
+            // escape the function) and `continue` jumps to the condition test —
+            // the desugaring this replaced inlined the body's first run outside
+            // any loop, so a first-iteration `break` unwound the whole call
+            // (which is exactly how React's `do { workLoopSync(); break; } …`
+            // render loop was failing).
+            Stmt::DoWhile(c, body) => {
+                let label = self.pending_label.take();
+                loop {
+                    let inner = new_scope(Some(scope.clone()));
+                    let f = self.exec_block(body, &inner)?;
+                    if let Some(out) = self.loop_step(f, &label) {
+                        return Ok(out);
+                    }
+                    if !self.eval(c, scope)?.truthy() {
+                        break;
+                    }
+                    self.steps += 1;
+                    if self.steps > 50_000_000 {
+                        return Err(Val::str("loop limit"));
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::Switch(disc, arms) => {
+                let d = self.eval(disc, scope)?;
+                let sc = new_scope(Some(scope.clone()));
+                // Pick the arm to start at: the first `case` strictly equal to the
+                // discriminant, else the `default` arm (which may sit anywhere).
+                // Then run arms in order from there, FALLING THROUGH until a
+                // `break` (Flow::Break) or the end.
+                let mut start = None;
+                for (i, (test, _)) in arms.iter().enumerate() {
+                    if let Some(t) = test {
+                        let tv = self.eval(t, &sc)?;
+                        if strict_eq(&d, &tv) {
+                            start = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if start.is_none() {
+                    start = arms.iter().position(|(t, _)| t.is_none());
+                }
+                if let Some(s) = start {
+                    for (_, body) in &arms[s..] {
+                        match self.exec_block(body, &sc)? {
+                            Flow::Break(None) => return Ok(Flow::Normal), // plain break exits the switch
+                            Flow::Normal => {}                            // fall through to the next arm
+                            other => return Ok(other),                    // labeled break / continue / return propagate
+                        }
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::For(init, cond, upd, body) => {
-                let outer = new_scope(Some(scope.clone()));
+                let label = self.pending_label.take();
+                // init/cond/update run in the ENCLOSING scope, not a throwaway
+                // child: a `var` in the init (`for (var i = …; …)`) is
+                // function-scoped and must outlive the loop. Without this,
+                // `for (var url = …; …) …; return … + url` (React's minified
+                // `formatProdErrorMessage`) read `url` as undefined after the loop,
+                // so every React invariant threw `Error(undefined)` and aborted the
+                // render. The body still gets its own per-iteration `inner` scope.
+                let outer = scope.clone();
                 if let Some(s) = init.as_ref() {
                     self.exec(s, &outer)?;
                 }
@@ -293,35 +413,36 @@ impl Interp {
                         }
                     }
                     let inner = new_scope(Some(outer.clone()));
-                    match self.exec_block(body, &inner)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                        _ => {}
+                    let f = self.exec_block(body, &inner)?;
+                    if let Some(out) = self.loop_step(f, &label) {
+                        return Ok(out);
                     }
+                    // `continue` (matching/unlabeled) falls through to the update.
                     if let Some(u) = upd {
                         self.eval(u, &outer)?;
                     }
                     self.steps += 1;
-                    if self.steps > 5_000_000 {
+                    if self.steps > 50_000_000 {
                         return Err(Val::str("loop limit"));
                     }
                 }
                 Ok(Flow::Normal)
             }
             Stmt::ForOf(pat, iter, body) => {
+                let label = self.pending_label.take();
                 let items = self.iterate(iter, scope)?;
                 for it in items {
                     let inner = new_scope(Some(scope.clone()));
                     self.bind_pat(pat, it, &inner)?;
-                    match self.exec_block(body, &inner)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                        _ => {}
+                    let f = self.exec_block(body, &inner)?;
+                    if let Some(out) = self.loop_step(f, &label) {
+                        return Ok(out);
                     }
                 }
                 Ok(Flow::Normal)
             }
             Stmt::ForIn(pat, iter, body) => {
+                let label = self.pending_label.take();
                 let obj = self.eval(iter, scope)?;
                 let keys: Vec<Val> = match obj {
                     Val::Object(o) => o.borrow().keys().map(|k| Val::str(k.clone())).collect(),
@@ -331,16 +452,29 @@ impl Interp {
                 for k in keys {
                     let inner = new_scope(Some(scope.clone()));
                     self.bind_pat(pat, k, &inner)?;
-                    match self.exec_block(body, &inner)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
-                        _ => {}
+                    let f = self.exec_block(body, &inner)?;
+                    if let Some(out) = self.loop_step(f, &label) {
+                        return Ok(out);
                     }
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::Break => Ok(Flow::Break),
-            Stmt::Continue => Ok(Flow::Continue),
+            Stmt::Break(l) => Ok(Flow::Break(l.clone())),
+            Stmt::Continue(l) => Ok(Flow::Continue(l.clone())),
+            // `label: stmt` — run the inner statement with `label` available to
+            // the loop it (usually) is, so `break label` / `continue label`
+            // resolve to it. A labeled break that bubbles back up here (the inner
+            // wasn't a loop, e.g. a labeled block) completes normally.
+            Stmt::Labeled(name, inner) => {
+                self.pending_label = Some(name.clone());
+                let r = self.exec(inner, scope);
+                self.pending_label = None;
+                match r? {
+                    Flow::Break(Some(l)) if l == *name => Ok(Flow::Normal),
+                    Flow::Continue(Some(l)) if l == *name => Ok(Flow::Normal),
+                    other => Ok(other),
+                }
+            }
             Stmt::Throw(e) => {
                 let v = self.eval(e, scope)?;
                 Err(v)
@@ -823,6 +957,26 @@ impl Interp {
                     Ok(Val::Undef)
                 }
             }
+            // A `Function.prototype.bind` result is an object carrying the target
+            // function, the bound `this`, and the partially-applied args. Calling
+            // it invokes the target with `boundThis` and `boundArgs ++ callArgs`.
+            // React schedules work via `performSyncWorkOnRoot.bind(null, root)`, so
+            // without this a bound callback returns `undefined` and React's
+            // `do { cb = cb() } while (cb !== null)` flush loop never terminates.
+            Val::Object(ref o) if o.borrow().get("__bound_fn").is_some() => {
+                let (bf, bthis, mut all) = {
+                    let b = o.borrow();
+                    let bf = b.get("__bound_fn").cloned().unwrap_or(Val::Undef);
+                    let bthis = b.get("__bound_this").cloned().unwrap_or(Val::Undef);
+                    let pre = match b.get("__bound_args") {
+                        Some(Val::Array(a)) => a.borrow().clone(),
+                        _ => Vec::new(),
+                    };
+                    (bf, bthis, pre)
+                };
+                all.extend(args);
+                self.call(bf, bthis, all)
+            }
             _ => Ok(Val::Undef),
         }
     }
@@ -933,6 +1087,38 @@ impl Interp {
                 "Function" => matches!(obj, Val::Func(..) | Val::Native(_)),
                 _ => false,
             };
+        }
+        // Pre-ES6 function constructor: `new F()` linked the instance's hidden
+        // `__proto__` to `F.prototype`; walk that chain looking for the same
+        // prototype object. Without this, `x instanceof F` was always false,
+        // which (among other things) broke React's `error instanceof Error`-style
+        // checks and led it to rethrow as `Error(undefined)` in the prod build.
+        if let Val::Func(rc, _) = ctor {
+            let key = Rc::as_ptr(rc) as usize;
+            let proto = self
+                .func_props
+                .get(&key)
+                .and_then(|(_, bag)| bag.borrow().get("prototype").cloned());
+            if let Some(Val::Object(proto_rc)) = proto {
+                let mut cur = obj.clone();
+                for _ in 0..100 {
+                    let next = if let Val::Object(m) = &cur {
+                        m.borrow().get("__proto__").cloned()
+                    } else {
+                        None
+                    };
+                    match next {
+                        Some(Val::Object(p)) => {
+                            if Rc::ptr_eq(&p, &proto_rc) {
+                                return true;
+                            }
+                            cur = Val::Object(p);
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            return false;
         }
         // class instance: compare the instance's class chain to `ctor`'s name.
         let target = if let Val::Object(m) = ctor {
@@ -1633,6 +1819,25 @@ impl Interp {
                     _ => Ok(Some(Val::Undef)),
                 }
             }
+            // Plain object: Object.prototype methods. `hasOwnProperty` MUST return
+            // a real boolean — React's `setInitialDOMProperties` does
+            // `if (!props.hasOwnProperty(key)) continue;`, so an `undefined`
+            // result skips every prop (including `children`), and the element's
+            // text is never set.
+            0 => match name {
+                "hasOwnProperty" => {
+                    let key = args.first().map(|v| v.to_str()).unwrap_or_default();
+                    let own = {
+                        let b = o.borrow();
+                        b.contains_key(&key) || b.contains_key(&alloc::format!("__get:{key}"))
+                    };
+                    Ok(Some(Val::Bool(own)))
+                }
+                "isPrototypeOf" | "propertyIsEnumerable" => Ok(Some(Val::Bool(false))),
+                "valueOf" => Ok(Some(Val::Object(o.clone()))),
+                "toString" => Ok(Some(Val::str("[object Object]"))),
+                _ => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -1804,12 +2009,19 @@ impl Interp {
             // Namespace/constructor objects: Object.keys, Array.from, Promise.all,
             // Number.isInteger, JSON.parse, ... resolve to a "Name.prop" native.
             Val::Native(Native::Global(name)) => {
-                match (&**name, prop) {
-                    ("Math", _) | ("Number", "MAX_SAFE_INTEGER") => {}
-                    _ => {}
-                }
                 if prop == "prototype" {
-                    return Ok(Val::object(Obj::new()));
+                    // `X.prototype` — keep it as a namespace native so a method
+                    // read off it (e.g. `Object.prototype.hasOwnProperty`) becomes
+                    // a borrowable Method, rather than vanishing into an empty {}.
+                    return Ok(Val::Native(Native::Global(Rc::from(alloc::format!("{name}.prototype").as_str()))));
+                }
+                // Borrowing a prototype method: `Object.prototype.hasOwnProperty`,
+                // `Array.prototype.slice`, etc. Return a Method with a placeholder
+                // receiver; the real `this` arrives when it is `.call`/`.apply`'d.
+                // React's `createElement` copies props via
+                // `hasOwnProperty.call(config, key)`, so this must be callable.
+                if name.ends_with(".prototype") {
+                    return Ok(Val::Native(Native::Method(Box::new(Val::Undef), Rc::from(prop))));
                 }
                 Ok(Val::Native(Native::Global(Rc::from(alloc::format!("{name}.{prop}").as_str()))))
             }
@@ -1904,8 +2116,21 @@ impl Interp {
             "childElementCount" => Val::Num(n.children.len() as f64),
             "offsetWidth" | "offsetHeight" | "scrollTop" | "scrollHeight" | "clientWidth"
             | "clientHeight" => Val::Num(0.0),
-            // methods
-            _ => Val::Native(Native::Method(Box::new(Val::Node(idx)), Rc::from(prop))),
+            _ => {
+                // An expando previously assigned from JS wins (this is how React
+                // reads back the fiber/root references it stashed on the node).
+                if let Some(v) = self.node_expandos.get(&(idx, prop.to_string())) {
+                    return v.clone();
+                }
+                // A known DOM method name resolves to a callable native (for the
+                // rare `var f = el.method` read; calls go via builtin_method).
+                if NODE_METHODS.contains(&prop) {
+                    Val::Native(Native::Method(Box::new(Val::Node(idx)), Rc::from(prop)))
+                } else {
+                    // Any other unset property is `undefined`, per JS semantics.
+                    Val::Undef
+                }
+            }
         }
     }
 
@@ -1941,7 +2166,12 @@ impl Interp {
                     self.dom.nodes[idx].attrs.retain(|(k, _)| k != "hidden");
                 }
             }
-            _ => {}
+            // Any other property is an expando: stash the live `Val` so a later
+            // read returns it. React hangs fiber/root/props/event references off
+            // host nodes this way, and reconciliation depends on reading them back.
+            _ => {
+                self.node_expandos.insert((idx, prop.to_string()), v);
+            }
         }
     }
 
@@ -2086,6 +2316,34 @@ impl Interp {
                         o.insert("__bound_fn".into(), recv.clone());
                         o.insert("__bound_this".into(), this_arg);
                         o.insert("__bound_args".into(), Val::array(pre));
+                        Ok(Some(Val::object(o)))
+                    }
+                }
+            }
+            // A borrowed builtin method (e.g. `Object.prototype.hasOwnProperty`,
+            // `Array.prototype.slice`) invoked via call/apply/bind: re-dispatch
+            // the named method onto the supplied `this`. `Object.prototype.
+            // hasOwnProperty.call(obj, key)` is the canonical case React uses.
+            Val::Native(Native::Method(_recv, mname)) if matches!(name, "call" | "apply" | "bind") => {
+                let new_this = args.first().cloned().unwrap_or(Val::Undef);
+                match name {
+                    "apply" => {
+                        let rest = match args.get(1) {
+                            Some(Val::Array(a)) => a.borrow().clone(),
+                            _ => Vec::new(),
+                        };
+                        Ok(Some(self.builtin_method(&new_this, mname, &rest)?.unwrap_or(Val::Undef)))
+                    }
+                    "call" => {
+                        let rest: Vec<Val> = args.iter().skip(1).cloned().collect();
+                        Ok(Some(self.builtin_method(&new_this, mname, &rest)?.unwrap_or(Val::Undef)))
+                    }
+                    _ => {
+                        // bind: wrap so a later call re-dispatches onto `new_this`.
+                        let mut o = Obj::new();
+                        o.insert("__bound_fn".into(), Val::Native(Native::Method(Box::new(new_this), mname.clone())));
+                        o.insert("__bound_this".into(), Val::Undef);
+                        o.insert("__bound_args".into(), Val::array(args.iter().skip(1).cloned().collect()));
                         Ok(Some(Val::object(o)))
                     }
                 }
@@ -2954,6 +3212,14 @@ impl Interp {
 
     fn call_global(&mut self, name: &str, args: Vec<Val>) -> Result<Val, Val> {
         let a0 = args.first().cloned().unwrap_or(Val::Undef);
+        // The Error constructors behave the same called with or without `new`
+        // (per spec). Minifiers drop the `new`, so the *production* React build
+        // does `throw Error(formatProdErrorMessage(n))`; without this, `Error(…)`
+        // returned `undefined` and React threw `undefined`, losing the message
+        // and aborting every render before it began.
+        if matches!(name, "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError") {
+            return self.construct(Val::Native(Native::Global(Rc::from(name))), name, args);
+        }
         Ok(match name {
             "noop" => Val::Undef,
             "setTimeout" | "setInterval" | "requestAnimationFrame" => {
@@ -3600,6 +3866,13 @@ fn type_of(v: &Val) -> &'static str {
         Val::Num(_) => "number",
         Val::Str(_) => "string",
         Val::Func(..) | Val::Native(_) => "function",
+        // A `Function.prototype.bind` result is an object carrying `__bound_fn`,
+        // but it IS callable, so `typeof` must report "function". React's
+        // scheduler `workLoop` gates on `typeof task.callback === 'function'`,
+        // and the task callback is `performConcurrentWorkOnRoot.bind(null, root)`
+        // — reporting "object" makes every concurrent (createRoot) render
+        // silently skip its work and never commit.
+        Val::Object(o) if o.borrow().contains_key("__bound_fn") => "function",
         _ => "object",
     }
 }
